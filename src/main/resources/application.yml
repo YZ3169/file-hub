@@ -1,0 +1,38 @@
+server:
+  port: 8081
+  tomcat:
+    max-swallow-size: -1          # 大文件上传中断时不要把连接直接掐掉
+
+spring:
+  application:
+    name: file-hub
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 512MB        # 单个分片其实只有几 MB，这里给足余量
+      max-request-size: 512MB
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/file_hub?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true
+    username: ${MYSQL_USER:root}
+    # 数据库口令不落盘：启动前先设好环境变量 MYSQL_PWD（本机实测用 set MYSQL_PWD=... 即可）
+    password: ${MYSQL_PWD}
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+
+file-hub:
+  # 存储根目录。files/ 放合并后的成品，chunks/ 放上传中的临时分片
+  root: D:/Projects/file-hub-data
+  # 单个分片大小（字节）。前端按这个值切片，服务端只做校验，不相信前端算出来的数量
+  chunk-size: 5242880            # 5MB
+  # 上传任务多久没动静就认为可以清理（分钟）
+  upload-expire-minutes: 1440
+
+logging:
+  level:
+    com.yuzhuo.filehub: debug

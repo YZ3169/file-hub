@@ -1,0 +1,11 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.log
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# 存储根目录在 D:/Projects/file-hub-data，不在工程内，
+# 但如果有人改了配置指向工程内，别把上传的文件提交上去
+file-hub-data/

@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>file-hub · 分片上传 / 秒传 / 断点续传</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+               max-width: 900px; margin: 0 auto; padding: 24px; color: #1f2937; background: #f8fafc; }
+        h1 { font-size: 22px; margin: 0 0 4px; }
+        .sub { color: #6b7280; font-size: 13px; margin-bottom: 20px; }
+        .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+        .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        button { padding: 8px 16px; border: 1px solid #d1d5db; background: #fff; border-radius: 6px;
+                 cursor: pointer; font-size: 14px; }
+        button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+        button.primary:disabled { background: #93c5fd; border-color: #93c5fd; cursor: not-allowed; }
+        button.danger { color: #b91c1c; border-color: #fca5a5; }
+        .bar { height: 10px; background: #e5e7eb; border-radius: 5px; overflow: hidden; margin: 10px 0 6px; }
+        .bar > i { display: block; height: 100%; width: 0; background: #2563eb; transition: width .15s; }
+        .bar.hash > i { background: #8b5cf6; }
+        .stat { font-size: 13px; color: #4b5563; font-variant-numeric: tabular-nums; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #f1f5f9; }
+        th { color: #6b7280; font-weight: 500; }
+        code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+        .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; }
+        .tag.ok { background: #dcfce7; color: #166534; }
+        .tag.mid { background: #fef3c7; color: #92400e; }
+        .tag.instant { background: #ede9fe; color: #5b21b6; }
+        .empty { color: #9ca3af; font-size: 13px; }
+    </style>
+</head>
+<body>
+
+<h1>file-hub</h1>
+<div class="sub">分片上传 · 秒传 · 断点续传　<span id="cfg" class="stat"></span></div>
+
+<div class="card">
+    <div class="row">
+        <input type="file" id="file"/>
+        <button class="primary" id="btnUpload">开始上传</button>
+        <button id="btnAbort">中断</button>
+    </div>
+    <div class="bar hash"><i id="hashBar"></i></div>
+    <div class="stat" id="hashStat">选一个文件，先算它的 SHA-256</div>
+    <div class="bar"><i id="upBar"></i></div>
+    <div class="stat" id="upStat">—</div>
+    <div class="stat" id="msg" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+    <div class="row"><strong style="font-size:14px">已存文件</strong>
+        <button id="btnRefresh">刷新</button></div>
+    <table>
+        <thead><tr><th>文件名</th><th>大小</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="list"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+    </table>
+</div>
+
+<script>
+/* ------------------------------------------------------------------
+ * 增量 SHA-256。
+ * 为什么不用 crypto.subtle.digest()：它要求把整个文件读成一个 ArrayBuffer，
+ * 一个 2GB 的文件就是 2GB 内存，浏览器直接崩。这里手写一份支持 update() 的增量实现，
+ * 每次只喂 4MB 切片进去，内存恒定。算法就是 FIPS 180-4 的标准流程，没有取巧。
+ * ------------------------------------------------------------------ */
+const K = new Uint32Array([
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+
+const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+class Sha256 {
+    constructor() {
+        this.h = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                  0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+        this.buf = new Uint8Array(64);
+        this.bufLen = 0;
+        this.total = 0;
+        this.w = new Uint32Array(64);
+    }
+    processBlock(b) {
+        const w = this.w;
+        for (let i = 0; i < 16; i++) {
+            w[i] = ((b[i*4] << 24) | (b[i*4+1] << 16) | (b[i*4+2] << 8) | b[i*4+3]) >>> 0;
+        }
+        for (let i = 16; i < 64; i++) {
+            const s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >>> 3);
+            const s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >>> 10);
+            w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+        }
+        let a = this.h[0], b2 = this.h[1], c = this.h[2], d = this.h[3],
+            e = this.h[4], f = this.h[5], g = this.h[6], hh = this.h[7];
+        for (let i = 0; i < 64; i++) {
+            const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const ch = (e & f) ^ (~e & g);
+            const t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
+            const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const maj = (a & b2) ^ (a & c) ^ (b2 & c);
+            const t2 = (S0 + maj) >>> 0;
+            hh = g; g = f; f = e; e = (d + t1) >>> 0;
+            d = c; c = b2; b2 = a; a = (t1 + t2) >>> 0;
+        }
+        this.h[0] = (this.h[0] + a) >>> 0; this.h[1] = (this.h[1] + b2) >>> 0;
+        this.h[2] = (this.h[2] + c) >>> 0; this.h[3] = (this.h[3] + d) >>> 0;
+        this.h[4] = (this.h[4] + e) >>> 0; this.h[5] = (this.h[5] + f) >>> 0;
+        this.h[6] = (this.h[6] + g) >>> 0; this.h[7] = (this.h[7] + hh) >>> 0;
+    }
+    update(bytes) {
+        this.total += bytes.length;
+        let off = 0;
+        if (this.bufLen > 0) {
+            const need = Math.min(64 - this.bufLen, bytes.length);
+            this.buf.set(bytes.subarray(0, need), this.bufLen);
+            this.bufLen += need;
+            off = need;
+            if (this.bufLen === 64) { this.processBlock(this.buf); this.bufLen = 0; }
+        }
+        while (off + 64 <= bytes.length) {
+            this.processBlock(bytes.subarray(off, off + 64));
+            off += 64;
+        }
+        if (off < bytes.length) {
+            this.buf.set(bytes.subarray(off), 0);
+            this.bufLen = bytes.length - off;
+        }
+    }
+    digestHex() {
+        const total = this.total;
+        const hi = Math.floor(total / 536870912);   // 总比特数的高 32 位
+        const lo = (total * 8) >>> 0;               // 低 32 位
+        const tail = new Uint8Array(this.bufLen + 1);
+        tail.set(this.buf.subarray(0, this.bufLen));
+        tail[this.bufLen] = 0x80;
+        const zeros = (56 - (tail.length % 64) + 64) % 64;
+        const full = new Uint8Array(tail.length + zeros + 8);
+        full.set(tail);
+        const dv = new DataView(full.buffer);
+        dv.setUint32(full.length - 8, hi);
+        dv.setUint32(full.length - 4, lo);
+        // 在状态副本上收尾：这样 digestHex() 可以重复调用（打日志、做断言时很有用），
+        // 不会因为"第二次调用把填充块又算了一遍"而返回不一样的结果。
+        // this.w 只是临时数组，随便覆盖无所谓。
+        const original = this.h;
+        this.h = original.slice();
+        try {
+            for (let i = 0; i < full.length; i += 64) this.processBlock(full.subarray(i, i + 64));
+            return Array.from(this.h).map(x => x.toString(16).padStart(8, '0')).join('');
+        } finally {
+            this.h = original;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
+const $ = id => document.getElementById(id);
+let abortFlag = false;
+
+const api = {
+    async json(url, opt) {
+        const r = await fetch(url, opt);
+        const body = await r.json();
+        if (body.code !== 0) throw new Error(body.msg);
+        return body.data;
+    },
+    check: (hash, size) => api.json(`/api/file/check?hash=${hash}&size=${size}`),
+    init: (payload) => api.json('/api/file/init', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)}),
+    chunk: (fileId, index, blob) => {
+        const fd = new FormData();
+        fd.append('fileId', fileId);
+        fd.append('index', index);
+        fd.append('chunk', blob);
+        return api.json('/api/file/chunk', {method: 'POST', body: fd});
+    },
+    complete: (fileId) => api.json(`/api/file/${fileId}/complete`, {method: 'POST'}),
+    list: () => api.json('/api/file/list'),
+    remove: (fileId) => api.json(`/api/file/${fileId}`, {method: 'DELETE'}),
+};
+
+function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+}
+
+/** 分片读文件算 hash，每 4MB 让出一次主线程，进度条才动得起来 */
+async function hashFile(file, onProgress) {
+    const h = new Sha256();
+    const STEP = 4 * 1024 * 1024;
+    for (let off = 0; off < file.size; off += STEP) {
+        const buf = await file.slice(off, off + STEP).arrayBuffer();
+        h.update(new Uint8Array(buf));
+        onProgress(Math.min(off + STEP, file.size) / file.size);
+        await new Promise(r => setTimeout(r, 0));
+    }
+    return h.digestHex();
+}
+
+/** 固定并发度的任务执行器——一次甩 300 个请求出去会把浏览器和 Tomcat 一起打死 */
+async function runPool(tasks, concurrency, onDone, isAborted) {
+    let next = 0, done = 0;
+    const workers = Array.from({length: Math.min(concurrency, tasks.length)}, async () => {
+        while (true) {
+            if (isAborted()) return;
+            const i = next++;
+            if (i >= tasks.length) return;
+            await tasks[i]();
+            done++;
+            onDone(done, tasks.length);
+        }
+    });
+    await Promise.all(workers);
+    return done;
+}
+
+async function startUpload() {
+    const file = $('file').files[0];
+    if (!file) { $('msg').textContent = '请先选择一个文件'; return; }
+    abortFlag = false;
+    $('btnUpload').disabled = true;
+    $('msg').textContent = '';
+
+    try {
+        // 1) 算 hash
+        $('hashStat').textContent = '计算 SHA-256…';
+        const t0 = performance.now();
+        const hash = await hashFile(file, p => { $('hashBar').style.width = (p * 100) + '%'; });
+        const hashMs = performance.now() - t0;
+        $('hashStat').textContent =
+            `SHA-256 = ${hash}　（${hashMs.toFixed(0)} ms，${fmtSize(file.size)}）`;
+
+        // 2) 秒传预检
+        const pre = await api.check(hash, file.size);
+        if (pre.exists) {
+            $('upBar').style.width = '100%';
+            $('upStat').textContent = '0 个分片上传';
+            $('msg').innerHTML = `⚡ <span class="tag instant">秒传命中</span> 库里已有同样内容的文件
+                （fileId <code>${pre.fileId}</code>），<b>一个字节都没传</b>`;
+            await refresh();
+            return;
+        }
+
+        // 3) 初始化，拿回已传分片（断点续传的关键）
+        const init = await api.init({fileName: file.name, fileSize: file.size, fileHash: hash});
+        const skipped = new Set(init.uploadedIndexes);
+        if (skipped.size > 0) {
+            $('msg').innerHTML = `↻ 发现未完成的旧任务，已传 <b>${skipped.size}/${init.chunkTotal}</b> 片，
+                只补传剩下的（断点续传）`;
+        }
+
+        // 4) 只传缺失的分片
+        const pending = [];
+        for (let i = 0; i < init.chunkTotal; i++) {
+            if (skipped.has(i)) continue;
+            const start = i * init.chunkSize;
+            const blob = file.slice(start, Math.min(start + init.chunkSize, file.size));
+            pending.push(() => api.chunk(init.fileId, i, blob));
+        }
+
+        let okCount = 0;
+        const t1 = performance.now();
+        const uploaded = await runPool(pending, 3, (done, total) => {
+            $('upBar').style.width = (done / total * 100) + '%';
+            $('upStat').textContent = `已传 ${done}/${total} 片（跳过 ${skipped.size} 片）`;
+        }, () => abortFlag);
+        okCount = uploaded;
+
+        if (abortFlag) {
+            $('msg').innerHTML = `⏸ 已中断，本次传了 ${okCount} 片。
+                再点一次「开始上传」即可续传——去数据库看看 <code>file_chunk</code> 里记着哪些片。`;
+            return;
+        }
+
+        // 5) 合并
+        $('upStat').textContent = `${init.chunkTotal} 片全部就绪，正在合并…`;
+        const t2 = performance.now();
+        const vo = await api.complete(init.fileId);
+        const totalMs = performance.now() - t1;
+        $('upBar').style.width = '100%';
+        $('upStat').textContent = `${init.chunkTotal} 片 · 上传+合并 ${(totalMs / 1000).toFixed(2)} s`;
+        $('msg').innerHTML = `✅ <span class="tag ok">上传完成</span>
+            <code>${vo.fileName}</code> ${fmtSize(vo.fileSize)}，服务端已用 SHA-256 校验内容一致`;
+        await refresh();
+    } catch (e) {
+        $('msg').innerHTML = `<span style="color:#b91c1c">✗ ${e.message}</span>`;
+    } finally {
+        $('btnUpload').disabled = false;
+    }
+}
+
+async function refresh() {
+    try {
+        const rows = await api.list();
+        const tb = $('list');
+        if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">还没有文件</td></tr>'; return; }
+        tb.innerHTML = rows.map(f => `
+            <tr>
+                <td>${escapeHtml(f.fileName)}</td>
+                <td>${fmtSize(f.fileSize)}</td>
+                <td>${f.status === 1 ? '<span class="tag ok">已完成</span>'
+                                     : '<span class="tag mid">上传中</span>'}</td>
+                <td>
+                    ${f.status === 1 ? `<a href="/api/file/${f.fileId}/download">下载</a>` : '—'}
+                    <button class="danger" data-del="${f.fileId}" style="margin-left:8px;padding:2px 8px">删除</button>
+                </td>
+            </tr>`).join('');
+        tb.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+            await api.remove(b.dataset.del);
+            await refresh();
+        });
+    } catch (e) {
+        $('list').innerHTML = `<tr><td colspan="4" class="empty">加载失败：${e.message}</td></tr>`;
+    }
+}
+
+function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+$('btnUpload').onclick = startUpload;
+$('btnAbort').onclick = () => { abortFlag = true; };
+$('btnRefresh').onclick = refresh;
+
+(async () => {
+    try {
+        const c = await api.json('/api/file/config');
+        $('cfg').textContent = `分片大小 ${fmtSize(c.chunkSize)} · 存储后端 ${c.backend}`;
+    } catch (e) {
+        $('cfg').textContent = '（读取服务配置失败）';
+    }
+    refresh();
+})();
+</script>
+</body>
+</html>
