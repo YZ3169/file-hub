@@ -41,12 +41,7 @@ function onDrop(event) {
   <section
     class="dropzone"
     :class="{ dragging }"
-    role="button"
-    tabindex="0"
-    aria-label="选择或拖拽文件上传"
     @click="pick"
-    @keydown.enter.prevent="pick"
-    @keydown.space.prevent="pick"
     @dragenter.prevent="onDragEnter"
     @dragover.prevent
     @dragleave.prevent="onDragLeave"

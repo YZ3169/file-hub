@@ -93,7 +93,15 @@ function download() {
 
 <template>
   <article class="task-card" :class="[`tone-${tone}`, { active: isActive }]">
-    <div class="ring" :class="{ spinning: isActive }">
+    <div
+      class="ring"
+      :class="{ spinning: isActive }"
+      role="progressbar"
+      :aria-label="`${task.name} · ${stateLabel}`"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      :aria-valuenow="Math.round(progress)"
+    >
       <svg viewBox="0 0 64 64">
         <circle class="ring-track" cx="32" cy="32" r="26" />
         <circle

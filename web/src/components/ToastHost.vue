@@ -11,7 +11,7 @@ const icons = {
 </script>
 
 <template>
-  <div class="toasts" aria-live="polite">
+  <div class="toasts" role="status" aria-live="polite">
     <TransitionGroup name="toast">
       <div v-for="t in state.toasts" :key="t.id" class="toast" :class="`is-${t.type}`">
         <span class="toast-icon">

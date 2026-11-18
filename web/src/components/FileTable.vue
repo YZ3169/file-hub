@@ -1,13 +1,31 @@
 <script setup>
+import { computed, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import {
   deleteServerFile,
   downloadFile,
+  goFilePage,
   refreshFiles,
   refreshStats,
   state,
+  updateFileQuery,
 } from '../stores/uploader'
 import { formatBytes, formatDate, shortHash } from '../lib/format'
+
+const keyword = ref(state.filePage.keyword)
+const sort = ref(state.filePage.sort)
+const statusFilter = ref(state.filePage.status === null ? '' : String(state.filePage.status))
+
+const totalPages = computed(() =>
+  Math.max(1, Math.ceil(state.filePage.total / state.filePage.size)),
+)
+const pageStart = computed(() =>
+  state.filePage.total === 0 ? 0 : (state.filePage.page - 1) * state.filePage.size + 1,
+)
+const pageEnd = computed(() =>
+  Math.min(state.filePage.total, state.filePage.page * state.filePage.size),
+)
+const hasFilters = computed(() => Boolean(state.filePage.keyword) || statusFilter.value !== '')
 
 function extension(name) {
   const dot = name.lastIndexOf('.')
@@ -18,6 +36,30 @@ function extension(name) {
 async function refresh() {
   await Promise.all([refreshFiles(), refreshStats()])
 }
+
+function applySearch() {
+  updateFileQuery({ keyword: keyword.value.trim() })
+}
+
+function clearSearch() {
+  keyword.value = ''
+  updateFileQuery({ keyword: '' })
+}
+
+function applyStatus() {
+  updateFileQuery({ status: statusFilter.value === '' ? null : Number(statusFilter.value) })
+}
+
+function applySort() {
+  updateFileQuery({ sort: sort.value })
+}
+
+function resetFilters() {
+  keyword.value = ''
+  sort.value = 'time_desc'
+  statusFilter.value = ''
+  updateFileQuery({ keyword: '', status: null, sort: 'time_desc' })
+}
 </script>
 
 <template>
@@ -25,7 +67,11 @@ async function refresh() {
     <div class="section-head">
       <div>
         <h2>云端文件</h2>
-        <span>共 {{ state.files.length }} 条记录 · 秒传产生的多条记录共享同一份物理文件</span>
+        <span>
+          共 {{ state.filePage.total }} 条记录
+          <template v-if="state.filePage.total"> · 第 {{ pageStart }}–{{ pageEnd }} 条</template>
+          · 秒传产生的多条记录共享同一份物理文件
+        </span>
       </div>
       <button class="btn btn-ghost btn-sm" type="button" @click="refresh">
         <BaseIcon name="refresh" :size="14" />
@@ -33,10 +79,62 @@ async function refresh() {
       </button>
     </div>
 
+    <div class="file-toolbar">
+      <form class="search-box" role="search" @submit.prevent="applySearch">
+        <BaseIcon name="search" :size="15" />
+        <input
+          v-model="keyword"
+          type="search"
+          placeholder="搜索文件名 / SHA-256"
+          aria-label="搜索文件"
+        />
+        <button
+          v-if="keyword"
+          class="clear-btn"
+          type="button"
+          aria-label="清空搜索"
+          @click="clearSearch"
+        >
+          ×
+        </button>
+        <button class="btn btn-ghost btn-sm" type="submit">搜索</button>
+      </form>
+
+      <div class="filters">
+        <label class="field">
+          <span>状态</span>
+          <select v-model="statusFilter" aria-label="按状态筛选" @change="applyStatus">
+            <option value="">全部</option>
+            <option value="1">已完成</option>
+            <option value="0">上传中</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>排序</span>
+          <select v-model="sort" aria-label="排序方式" @change="applySort">
+            <option value="time_desc">最新优先</option>
+            <option value="time_asc">最早优先</option>
+            <option value="size_desc">大文件优先</option>
+            <option value="size_asc">小文件优先</option>
+            <option value="name_asc">文件名升序</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
     <div v-if="!state.files.length" class="empty-files">
       <div class="empty-icon"><BaseIcon name="archive" :size="26" /></div>
-      <strong>还没有文件</strong>
-      <span>上传第一个文件，或者拖一份大文件试试断点续传</span>
+      <strong>{{ hasFilters ? '没有匹配的文件' : '还没有文件' }}</strong>
+      <span v-if="hasFilters">换个关键字，或者清除筛选条件</span>
+      <span v-else>上传第一个文件，或者拖一份大文件试试断点续传</span>
+      <button
+        v-if="hasFilters"
+        class="btn btn-ghost btn-sm"
+        type="button"
+        @click="resetFilters"
+      >
+        清除筛选
+      </button>
     </div>
 
     <div v-else class="table-wrap">
@@ -76,6 +174,7 @@ async function refresh() {
                   class="icon-link"
                   type="button"
                   title="下载（支持 Range 断点续传）"
+                  :aria-label="`下载 ${file.fileName}`"
                   @click="downloadFile(file)"
                 >
                   <BaseIcon name="download" :size="15" />
@@ -84,6 +183,7 @@ async function refresh() {
                   class="icon-link danger"
                   type="button"
                   title="删除"
+                  :aria-label="`删除 ${file.fileName}`"
                   @click="deleteServerFile(file)"
                 >
                   <BaseIcon name="trash" :size="15" />
@@ -93,6 +193,31 @@ async function refresh() {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="state.filePage.total > 0" class="pager">
+      <span>第 {{ pageStart }}–{{ pageEnd }} 条，共 {{ state.filePage.total }} 条</span>
+      <div v-if="totalPages > 1" class="pager-controls">
+        <button
+          class="btn btn-ghost btn-sm"
+          type="button"
+          :disabled="state.filePage.page <= 1"
+          aria-label="上一页"
+          @click="goFilePage(state.filePage.page - 1)"
+        >
+          上一页
+        </button>
+        <span class="page-indicator">{{ state.filePage.page }} / {{ totalPages }}</span>
+        <button
+          class="btn btn-ghost btn-sm"
+          type="button"
+          :disabled="state.filePage.page >= totalPages"
+          aria-label="下一页"
+          @click="goFilePage(state.filePage.page + 1)"
+        >
+          下一页
+        </button>
+      </div>
     </div>
   </section>
 </template>
@@ -124,6 +249,100 @@ async function refresh() {
 .section-head span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.file-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 20px 14px;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 260px;
+  max-width: 430px;
+  padding: 5px 7px 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--muted);
+  transition: border-color 0.18s ease;
+}
+
+.search-box:focus-within {
+  border-color: color-mix(in srgb, var(--brand-2) 45%, transparent);
+}
+
+.search-box input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.search-box input::placeholder {
+  color: var(--muted-2);
+}
+
+.clear-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.clear-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.field select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.field select:focus-visible,
+.search-box input:focus-visible,
+.icon-link:focus-visible,
+.pager button:focus-visible {
+  outline: 2px solid var(--brand-2);
+  outline-offset: 1px;
 }
 
 .table-wrap {
@@ -304,6 +523,40 @@ tbody tr:hover {
   color: var(--muted-2);
 }
 
+.empty-files .btn {
+  margin-top: 10px;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pager-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pager button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.page-indicator {
+  min-width: 48px;
+  text-align: center;
+  color: var(--muted);
+}
+
 .empty-icon {
   display: grid;
   place-items: center;
@@ -320,6 +573,23 @@ tbody tr:hover {
   th:nth-child(4),
   td:nth-child(4) {
     display: none;
+  }
+
+  .file-toolbar {
+    padding: 0 16px 12px;
+  }
+
+  .search-box {
+    max-width: none;
+  }
+
+  .filters {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .pager {
+    padding: 12px 16px;
   }
 }
 </style>

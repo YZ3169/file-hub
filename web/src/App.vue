@@ -101,6 +101,8 @@ onMounted(() => {
           class="icon-btn"
           type="button"
           :title="state.theme === 'dark' ? '切换浅色' : '切换深色'"
+          :aria-label="state.theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'"
+          :aria-pressed="state.theme === 'light'"
           @click="toggleTheme"
         >
           <BaseIcon :name="state.theme === 'dark' ? 'sun' : 'moon'" :size="17" />

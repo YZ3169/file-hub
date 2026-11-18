@@ -42,6 +42,14 @@ export const state = reactive({
   config: { chunkSize: 5 * 1024 * 1024, backend: '' },
   tasks: [],
   files: [],
+  filePage: {
+    page: 1,
+    size: 10,
+    total: 0,
+    keyword: '',
+    status: null,
+    sort: 'time_desc',
+  },
   stats: emptyStats(),
   concurrency: 4,
   toasts: [],
@@ -182,8 +190,54 @@ function persistProgress(task) {
   refreshPending()
 }
 
+function createHashWorker() {
+  if (typeof Worker === 'undefined') return null
+  try {
+    return new Worker(new URL('../workers/hashWorker.js', import.meta.url), { type: 'module' })
+  } catch (e) {
+    console.warn('当前环境不支持 Worker，哈希回退到主线程', e)
+    return null
+  }
+}
+
+/** 把 Worker 的 progress/done/error 消息包装成 Promise，并在暂停/取消时立即中断 */
+function hashFileInWorker(task, worker) {
+  return new Promise((resolve, reject) => {
+    const signal = task.controller?.signal
+    let settled = false
+
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', onAbort)
+      worker.terminate()
+      fn(value)
+    }
+    const onAbort = () => finish(reject, stopError(task))
+
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    worker.onmessage = (event) => {
+      const msg = event.data || {}
+      if (msg.type === 'progress') {
+        task.hashProgress = Math.min(1, Number(msg.value) || 0)
+      } else if (msg.type === 'done') {
+        task.hashProgress = 1
+        finish(resolve, { hash: msg.hash, ms: msg.ms })
+      }
+    }
+    worker.onerror = (event) => {
+      event.preventDefault?.()
+      finish(reject, new Error(`哈希线程失败：${event.message || '未知错误'}`))
+    }
+    worker.postMessage({ type: 'hash', file: task.file, step: 4 * 1024 * 1024 })
+  })
+}
+
 async function hashFile(task) {
-  const hasher = new Sha256()
   const step = 4 * 1024 * 1024
   task.state = 'hashing'
   task.hashProgress = 0
@@ -191,9 +245,24 @@ async function hashFile(task) {
 
   if (task.size === 0) {
     task.hashProgress = 1
-    return hasher.digestHex()
+    return new Sha256().digestHex()
   }
 
+  // 优先放到 Worker：主线程只收进度，不读盘、不算哈希，页面不会卡住
+  const worker = createHashWorker()
+  if (worker) {
+    try {
+      const { hash, ms } = await hashFileInWorker(task, worker)
+      task.hashMs = ms || 0
+      return hash
+    } catch (e) {
+      if (isStopError(e)) throw e
+      // Worker 自身异常（浏览器限制/CSP 等）时退回主线程，别让整个上传失败
+      console.warn('Worker 哈希失败，回退主线程', e)
+    }
+  }
+
+  const hasher = new Sha256()
   const started = performance.now()
   for (let offset = 0; offset < task.size; offset += step) {
     if (isStopped(task)) throw stopError(task)
@@ -208,15 +277,20 @@ async function hashFile(task) {
   return hasher.digestHex()
 }
 
-async function sha256OfBlob(blob) {
+function toHex(bytes) {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+/** 直接对已经读进内存的分片字节算摘要，避免再把 Blob 读一遍 */
+async function sha256OfBuffer(buffer) {
   if (globalThis.crypto?.subtle) {
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
-    return Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('')
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer)
+    return toHex(new Uint8Array(digest))
   }
   const hasher = new Sha256()
-  hasher.update(new Uint8Array(await blob.arrayBuffer()))
+  hasher.update(new Uint8Array(buffer))
   return hasher.digestHex()
 }
 
@@ -242,17 +316,31 @@ async function uploadOneChunk(task, index) {
   const end = Math.min(start + task.chunkSize, task.size)
   const expectedBytes = end - start
 
+  // 只从文件读一次：把分片读成 ArrayBuffer，摘要和上传都用这一份字节。
+  // 之前是「slice 算摘要 → 再把同一个 Blob 交给 FormData」，同一片要读两遍盘。
+  let uploadBlob
+  let chunkHash
+  try {
+    const blob = task.file.slice(start, end)
+    const buffer = await blob.arrayBuffer()
+    chunkHash = await sha256OfBuffer(buffer)
+    uploadBlob = new Blob([buffer])
+  } catch (e) {
+    task.chunkStates[index] = 'failed'
+    const err = new Error(`分片 ${index + 1} 读取失败：${e.message}`)
+    err.code = 0
+    throw err
+  }
+
   for (let attempt = 0; attempt <= MAX_CHUNK_RETRIES; attempt++) {
     if (isStopped(task)) throw stopError(task)
     task.chunkStates[index] = attempt === 0 ? 'uploading' : 'retrying'
 
     try {
-      const blob = task.file.slice(start, end)
-      const chunkHash = await sha256OfBlob(blob)
       await api.uploadChunk({
         fileId: task.fileId,
         index,
-        blob,
+        blob: uploadBlob,
         chunkHash,
         signal: task.controller?.signal,
       })
@@ -447,6 +535,7 @@ async function runTask(task) {
       removePendingTask(task.fingerprint)
       refreshPending()
       toast(`⚡ ${task.name} 秒传完成，0 字节上传`, 'success')
+      state.filePage.page = 1
       refreshFiles()
       refreshStats()
       return
@@ -485,6 +574,8 @@ async function runTask(task) {
     removePendingTask(task.fingerprint)
     refreshPending()
     toast(`✅ ${task.name} 上传完成`, 'success')
+    // 新文件按时间排在最新一页，回到第 1 页让用户能立刻看到
+    state.filePage.page = 1
     refreshFiles()
     refreshStats()
   } catch (e) {
@@ -617,11 +708,39 @@ export function clearAllTasks() {
 
 export async function refreshFiles() {
   try {
-    state.files = await api.listFiles()
+    const res = await api.listFiles(state.filePage)
+    state.files = res.items
+    state.filePage.total = res.total
+    state.filePage.page = res.page
+    state.filePage.size = res.size
     state.online = true
+
+    // 删掉最后一页的最后一条后，当前页会空掉：自动退到新的最后一页
+    const maxPage = Math.max(1, Math.ceil(res.total / res.size))
+    if (res.page > maxPage) {
+      state.filePage.page = maxPage
+      return refreshFiles()
+    }
   } catch (e) {
     state.online = false
   }
+}
+
+/** 改搜索词/状态/排序时回到第 1 页 */
+export async function updateFileQuery(patch = {}) {
+  if ('keyword' in patch) state.filePage.keyword = patch.keyword || ''
+  if ('status' in patch) state.filePage.status = patch.status
+  if ('sort' in patch) state.filePage.sort = patch.sort
+  state.filePage.page = 1
+  await refreshFiles()
+}
+
+export async function goFilePage(page) {
+  const maxPage = Math.max(1, Math.ceil(state.filePage.total / state.filePage.size))
+  const next = Math.min(maxPage, Math.max(1, page))
+  if (next === state.filePage.page) return
+  state.filePage.page = next
+  await refreshFiles()
 }
 
 export async function refreshStats() {

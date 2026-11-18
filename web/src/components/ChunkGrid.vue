@@ -43,7 +43,11 @@ const labels = {
 
 <template>
   <div class="chunk-wrap">
-    <div class="chunk-grid" :style="{ '--chunk-cols': Math.min(48, info.groups.length) }">
+    <div
+      class="chunk-grid"
+      aria-hidden="true"
+      :style="{ '--chunk-cols': Math.min(48, info.groups.length) }"
+    >
       <span
         v-for="g in info.groups"
         :key="g.key"

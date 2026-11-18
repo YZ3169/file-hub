@@ -48,6 +48,7 @@ const paths = {
   hash: ['M4 9h16', 'M4 15h16', 'M10 3 8 21', 'M16 3l-2 18'],
   gauge: ['M12 14l4-4', 'M3.5 18a9 9 0 1 1 17 0'],
   archive: ['M3 4h18v4H3z', 'M5 8v12h14V8', 'M10 12h4'],
+  search: ['M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z', 'm21 21-4.35-4.35'],
 }
 
 const iconPaths = computed(() => paths[props.name] || paths.file)
