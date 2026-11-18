@@ -21,12 +21,39 @@ trap 'rm -rf "$WORK"' EXIT
 now_ms() { date +%s%N | cut -c1-13; }
 jget() { python -c "import sys,json; d=json.loads(sys.argv[1]); print(d$2)" "$1" "$2" 2>/dev/null; }
 
-post_json() {
+TOKEN=""
+RUN_ID="$(date +%s)$RANDOM"
+BENCH_USER="${FILE_HUB_BENCH_USER:-bench$RUN_ID}"
+BENCH_PASS="${FILE_HUB_BENCH_PASSWORD:-filehub-bench-pass}"
+
+# 匿名 JSON 请求（注册/登录用）
+post_json_anon() {
     local path="$1" body="$2" f="$WORK/p.$$.json"
     printf '%s' "$body" > "$f"
     curl -s -X POST "$BASE$path" -H 'Content-Type: application/json' --data-binary "@$f"
     rm -f "$f"
 }
+
+post_json() {
+    local path="$1" body="$2" f="$WORK/p.$$.json"
+    printf '%s' "$body" > "$f"
+    curl -s -X POST "$BASE$path" -H "Authorization: Bearer $TOKEN" \
+        -H 'Content-Type: application/json' --data-binary "@$f"
+    rm -f "$f"
+}
+
+api() { curl -s -H "Authorization: Bearer $TOKEN" "$@"; }
+
+echo "登录基准测试账号…"
+R="$(post_json_anon /api/auth/register \
+    "{\"username\":\"$BENCH_USER\",\"password\":\"$BENCH_PASS\"}")"
+TOKEN="$(jget "$R" "['data']['token']")"
+if [ -z "$TOKEN" ]; then
+    R="$(post_json_anon /api/auth/login \
+        "{\"username\":\"$BENCH_USER\",\"password\":\"$BENCH_PASS\"}")"
+    TOKEN="$(jget "$R" "['data']['token']")"
+fi
+[ -n "$TOKEN" ] || { echo "登录失败：$R"; exit 1; }
 
 echo "生成 ${SIZE_MB}MB 随机数据…"
 head -c $((SIZE_MB * 1024 * 1024)) /dev/urandom > "$WORK/data.bin"
@@ -53,7 +80,8 @@ while [ "$i" -lt "$TOTAL" ]; do
         idx=$((i + j))
         [ "$idx" -ge "$TOTAL" ] && continue
         part="$(printf '%s/c.%04d' "$WORK" "$idx")"
-        curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$ID" -F "index=$idx" -F "chunk=@$part" > /dev/null &
+        curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+            -F "fileId=$ID" -F "index=$idx" -F "chunk=@$part" > /dev/null &
         pids+=($!)
     done
     for p in "${pids[@]}"; do wait "$p"; done
@@ -62,28 +90,28 @@ done
 UP_MS=$(( $(now_ms) - UP_T0 ))
 
 T=$(now_ms)
-R="$(curl -s -X POST "$BASE/api/file/$ID/complete")"
+R="$(api -X POST "$BASE/api/file/$ID/complete")"
 MERGE_MS=$(( $(now_ms) - T ))
 [ "$(jget "$R" "['code']")" = "0" ] || { echo "合并失败：$R"; exit 1; }
 
-curl -s -o "$WORK/dl.bin" "$BASE/api/file/$ID/download"
+api -o "$WORK/dl.bin" "$BASE/api/file/$ID/download"
 DL_OK=$([ "$(sha256sum "$WORK/dl.bin" | cut -d' ' -f1)" = "$HASH" ] && echo yes || echo NO)
 
 # 秒传：同一个文件再传一次。
 # 注意测量口径——Windows 上每次拉起 curl.exe 自己就要 ~75ms，单个请求的 wall-clock
 # 量出来的是"客户端进程启动 + 网络 + 服务端"，不是接口性能。所以服务端耗时用
 # "同一个 curl 进程连打 N 次"来量，把进程启动摊掉。
-curl -s "$BASE/api/file/check?hash=$HASH&size=$SIZE" > /dev/null   # 预热 JIT 与连接池
+api "$BASE/api/file/check?hash=$HASH&size=$SIZE" > /dev/null   # 预热 JIT 与连接池
 
 N=20
 urls=""
 for _ in $(seq 1 $N); do urls="$urls $BASE/api/file/check?hash=$HASH&size=$SIZE"; done
 # 注意：curl 的 -o 只作用于第一个 URL，多 URL 时其余会把响应体吐到 stdout，
 # 所以这里直接重定向整个进程的输出。
-T=$(now_ms); curl -s $urls > /dev/null; CHECK_MS=$(( ($(now_ms) - T) / N ))
+T=$(now_ms); api $urls > /dev/null; CHECK_MS=$(( ($(now_ms) - T) / N ))
 
 T=$(now_ms)
-R="$(curl -s "$BASE/api/file/check?hash=$HASH&size=$SIZE")"
+R="$(api "$BASE/api/file/check?hash=$HASH&size=$SIZE")"
 INSTANT_ID="$(jget "$R" "['data']['fileId']")"
 CHECK_WALL_MS=$(( $(now_ms) - T ))
 T=$(now_ms)
@@ -120,7 +148,7 @@ cat <<EOF
 EOF
 
 # 清理掉这次压测产生的记录，别把库撑大
-curl -s -X DELETE "$BASE/api/file/$ID" > /dev/null
-[ -n "$INSTANT_2" ] && curl -s -X DELETE "$BASE/api/file/$INSTANT_2" > /dev/null
-[ -n "$INSTANT_ID" ] && [ "$INSTANT_ID" != "None" ] && curl -s -X DELETE "$BASE/api/file/$INSTANT_ID" > /dev/null
+api -X DELETE "$BASE/api/file/$ID" > /dev/null
+[ -n "$INSTANT_2" ] && api -X DELETE "$BASE/api/file/$INSTANT_2" > /dev/null
+[ -n "$INSTANT_ID" ] && [ "$INSTANT_ID" != "None" ] && api -X DELETE "$BASE/api/file/$INSTANT_ID" > /dev/null
 echo "（压测数据已清理）"

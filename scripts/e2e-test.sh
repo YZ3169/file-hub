@@ -28,6 +28,15 @@ WORK="$(mktemp -d)"
 PASS=0
 FAIL=0
 
+# 每次运行注册独立用户，避免不同脚本/CI 任务之间互相污染
+RUN_ID="$(date +%s)$RANDOM"
+USER_A="alice$RUN_ID"
+USER_B="bob$RUN_ID"
+PASSWORD="filehub-e2e-pass"
+TOKEN=""
+TOKEN_B=""
+TOKEN_ADMIN=""
+
 trap 'rm -rf "$WORK"' EXIT
 
 # ---------------------------------------------------------------- 工具函数
@@ -49,24 +58,42 @@ check_contains() {  # check_contains 文本 子串 说明
 
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-api() {  # api METHOD PATH [curl args...]
-    local method="$1" path="$2"; shift 2
-    curl -s -X "$method" "$BASE$path" "$@"
+api_as() {  # api_as TOKEN METHOD PATH [curl args...]
+    local tok="$1" method="$2" path="$3"; shift 3
+    if [ -n "$tok" ]; then
+        curl -s -X "$method" -H "Authorization: Bearer $tok" "$BASE$path" "$@"
+    else
+        curl -s -X "$method" "$BASE$path" "$@"
+    fi
+}
+
+api() { api_as "$TOKEN" "$@"; }
+
+# 浏览器下载（这里用 curl 模拟）带 Bearer；票据下载则不带
+dl() {  # dl [curl args...] URL
+    if [ -n "$TOKEN" ]; then curl -s -H "Authorization: Bearer $TOKEN" "$@"; else curl -s "$@"; fi
 }
 
 # 发 JSON 一律走文件，不用 `-d '{...}'` 内联。
 # 原因：Windows 上 curl.exe 是原生程序，命令行参数会被按系统 ANSI 代码页（本机是 GBK）转换，
 # 而 JSON 必须是 UTF-8 —— 内联中文文件名会让服务端报 "Invalid UTF-8 start byte 0xb2"。
 # 写进文件再 --data-binary @ 读，是字节透传，不受 argv 编码影响。
-post_json() {  # post_json PATH JSON
-    local path="$1" body="$2"
+post_json_as() {  # post_json_as TOKEN PATH JSON
+    local tok="$1" path="$2" body="$3"
     local f="$WORK/payload.$$.$RANDOM.json"
     printf '%s' "$body" > "$f"
     local out
-    out="$(curl -s -X POST "$BASE$path" -H 'Content-Type: application/json' --data-binary "@$f")"
+    if [ -n "$tok" ]; then
+        out="$(curl -s -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+            --data-binary "@$f" "$BASE$path")"
+    else
+        out="$(curl -s -X POST -H 'Content-Type: application/json' --data-binary "@$f" "$BASE$path")"
+    fi
     rm -f "$f"
     printf '%s' "$out"
 }
+
+post_json() { post_json_as "$TOKEN" "$@"; }
 
 # ---------------------------------------------------------------- 前置检查
 
@@ -76,6 +103,74 @@ check_contains "$CONFIG" '"code":0' "GET /api/file/config 返回成功"
 CFG_CHUNK="$(jget "$CONFIG" "['data']['chunkSize']")"
 check_eq "$CHUNK" "$CFG_CHUNK" "服务端分片大小与脚本一致"
 [ "$FAIL" -gt 0 ] && { echo "服务没起来，后面的用例没意义，先退出"; exit 1; }
+
+# ---------------------------------------------------------------- 0.5 认证
+
+section "0.5 注册、登录、限流与鉴权"
+
+# 受保护接口没有 Token 时必须 401，而不是返回数据
+CODE="$(curl -s -o "$WORK/anon.json" -w '%{http_code}' "$BASE/api/file/list")"
+check_eq "401" "$CODE" "未登录访问 /api/file/list 返回 HTTP 401"
+check_eq "40001" "$(jget "$(cat "$WORK/anon.json")" "['code']")" "401 响应仍是统一的 Result 结构"
+
+R="$(post_json_as "" /api/auth/register "{\"username\":\"$USER_A\",\"password\":\"$PASSWORD\"}")"
+TOKEN="$(jget "$R" "['data']['token']")"
+check_eq "0" "$(jget "$R" "['code']")" "用户 A 注册成功"
+check_eq "$USER_A" "$(jget "$R" "['data']['user']['username']")" "注册响应带用户信息"
+echo "  ↳ 用户 A = $USER_A（每次运行随机，避免数据串台）"
+
+R="$(post_json_as "" /api/auth/register "{\"username\":\"$USER_B\",\"password\":\"$PASSWORD\"}")"
+TOKEN_B="$(jget "$R" "['data']['token']")"
+check_eq "0" "$(jget "$R" "['code']")" "用户 B 注册成功"
+
+# 密码错误：HTTP 401 + 40004，不能区分「用户不存在」和「密码错」
+CODE="$(curl -s -o "$WORK/wrong.json" -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    --data-binary "$(printf '{"username":"%s","password":"wrong-password"}' "$USER_A")" \
+    "$BASE/api/auth/login")"
+check_eq "401" "$CODE" "错误密码登录返回 HTTP 401"
+check_eq "40004" "$(jget "$(cat "$WORK/wrong.json")" "['code']")" "错误密码返回 40004"
+
+R="$(post_json_as "" /api/auth/login "{\"username\":\"$USER_A\",\"password\":\"$PASSWORD\"}")"
+TOKEN="$(jget "$R" "['data']['token']")"
+check_eq "0" "$(jget "$R" "['code']")" "用户 A 用正确密码重新登录"
+
+R="$(api GET /api/auth/me)"
+check_eq "$USER_A" "$(jget "$R" "['data']['username']")" "GET /api/auth/me 返回当前用户"
+
+# 退出必须让旧 Token 立即失效
+OLD_TOKEN="$TOKEN"
+api POST /api/auth/logout > /dev/null
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $OLD_TOKEN" "$BASE/api/auth/me")"
+check_eq "401" "$CODE" "退出后旧 Token 访问 /me 返回 401"
+
+R="$(post_json_as "" /api/auth/login "{\"username\":\"$USER_A\",\"password\":\"$PASSWORD\"}")"
+TOKEN="$(jget "$R" "['data']['token']")"
+check_eq "0" "$(jget "$R" "['code']")" "重新登录拿回 Token，继续后续用例"
+
+# ---------------------------------------------------------------- 0.9 运维端点
+
+section "0.9 运维端点与请求 ID"
+CODE="$(curl -s -o "$WORK/health.json" -w '%{http_code}' "$BASE/actuator/health")"
+check_eq "200" "$CODE" "GET /actuator/health 返回 HTTP 200"
+check_contains "$(cat "$WORK/health.json")" '"status":"UP"' "健康检查状态为 UP"
+
+CODE="$(curl -s -o "$WORK/metrics-anon.json" -w '%{http_code}' "$BASE/actuator/prometheus")"
+check_eq "401" "$CODE" "未登录访问 /actuator/prometheus 返回 401"
+check_eq "40001" "$(jget "$(cat "$WORK/metrics-anon.json")" "['code']")" "401 响应仍是统一的 Result 结构"
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+    "$BASE/actuator/prometheus")"
+check_eq "403" "$CODE" "普通用户读取 Prometheus 指标返回 403"
+
+REQ_ID="e2e-rid-$RUN_ID"
+curl -s -D "$WORK/rid-headers.txt" -o /dev/null -H "X-Request-Id: $REQ_ID" \
+    "$BASE/api/file/config"
+check_contains "$(tr -d '\r' < "$WORK/rid-headers.txt")" "X-Request-Id: $REQ_ID" \
+    "响应头回传调用方的 X-Request-Id"
+
+R="$(curl -s "$BASE/v3/api-docs")"
+check_contains "$R" '"title":"file-hub API"' "OpenAPI 文档可读取且标题正确"
 
 # ---------------------------------------------------------------- 1. 全量上传
 
@@ -117,6 +212,7 @@ while [ "$i" -lt "$CHUNK_TOTAL" ]; do
         part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
         (
             r="$(curl -s -X POST "$BASE/api/file/chunk" \
+                    -H "Authorization: Bearer $TOKEN" \
                     -F "fileId=$FILE_ID" -F "index=$idx" \
                     -F "chunkHash=$part_hash" -F "chunk=@$part")"
             echo "$r" | grep -q '"code":0' || echo "分片 $idx 上传失败: $r" >&2
@@ -132,7 +228,8 @@ check_eq "$CHUNK_TOTAL" "$uploaded" "所有分片都提交了"
 
 # 1.5 重复上传同一个分片，应当幂等（不报错、不产生第二片）
 DUP_HASH="$(sha256sum "$WORK/big.part.000" | cut -d' ' -f1)"
-R="$(curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$FILE_ID" -F "index=0" \
+R="$(curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$FILE_ID" -F "index=0" \
         -F "chunkHash=$DUP_HASH" -F "chunk=@$WORK/big.part.000")"
 check_eq "0" "$(jget "$R" "['code']")" "重复上传同一分片被幂等处理"
 
@@ -149,12 +246,12 @@ R="$(api POST "/api/file/$FILE_ID/complete")"
 check_eq "0" "$(jget "$R" "['code']")" "重复合并是幂等的"
 
 # 1.8 下载回来比对摘要 —— 这是"文件真的没坏"的唯一硬证据
-curl -s -o "$WORK/out.bin" "$BASE/api/file/$FILE_ID/download"
+dl -o "$WORK/out.bin" "$BASE/api/file/$FILE_ID/download"
 OUT_HASH="$(sha256sum "$WORK/out.bin" | cut -d' ' -f1)"
 check_eq "$BIG_HASH" "$OUT_HASH" "下载回来的文件与原文件 SHA-256 一致"
 
 # 1.9 Range 下载：只取前 100 字节，应返回 206 + Content-Range，且字节完全一致
-RANGE_CODE="$(curl -s -D "$WORK/range.headers" -o "$WORK/range.bin" \
+RANGE_CODE="$(dl -D "$WORK/range.headers" -o "$WORK/range.bin" \
     -H 'Range: bytes=0-99' -w '%{http_code}' "$BASE/api/file/$FILE_ID/download")"
 check_eq "206" "$RANGE_CODE" "Range 请求返回 206 Partial Content"
 check_contains "$(cat "$WORK/range.headers")" "Content-Range: bytes 0-99/$BIG_SIZE" \
@@ -163,14 +260,62 @@ check_eq "$(head -c 100 "$WORK/big.bin" | sha256sum | cut -d' ' -f1)" \
     "$(sha256sum "$WORK/range.bin" | cut -d' ' -f1)" "Range 返回的前 100 字节与原文件一致"
 
 # 1.10 后缀 Range：最后 100 字节
-curl -s -o "$WORK/tail.bin" -H 'Range: bytes=-100' "$BASE/api/file/$FILE_ID/download"
+dl -o "$WORK/tail.bin" -H 'Range: bytes=-100' "$BASE/api/file/$FILE_ID/download"
 check_eq "$(tail -c 100 "$WORK/big.bin" | sha256sum | cut -d' ' -f1)" \
     "$(sha256sum "$WORK/tail.bin" | cut -d' ' -f1)" "后缀 Range 取到最后 100 字节"
 
 # 1.11 不可满足的 Range 应返回 416，而不是 200 或 500
-RANGE_BAD="$(curl -s -o /dev/null -w '%{http_code}' \
+RANGE_BAD="$(dl -o /dev/null -w '%{http_code}' \
     -H 'Range: bytes=999999999999-' "$BASE/api/file/$FILE_ID/download")"
 check_eq "416" "$RANGE_BAD" "越界 Range 返回 416"
+
+# 1.12 多段 Range：multipart/byteranges，每段字节必须和原文件对应区间一致
+MULTI_CODE="$(dl -D "$WORK/multi.headers" -o "$WORK/multi.bin" -w '%{http_code}' \
+    -H 'Range: bytes=0-9,1000-1009' "$BASE/api/file/$FILE_ID/download")"
+check_eq "206" "$MULTI_CODE" "多段 Range 返回 206"
+check_contains "$(cat "$WORK/multi.headers")" "multipart/byteranges; boundary=" \
+    "多段 Range 响应类型是 multipart/byteranges"
+if python - "$WORK/multi.bin" "$WORK/multi.headers" "$WORK/big.bin" <<'PY'
+import re
+import sys
+
+body = open(sys.argv[1], 'rb').read()
+headers = open(sys.argv[2], 'r', encoding='latin-1').read()
+original = open(sys.argv[3], 'rb').read()
+
+m = re.search(r'boundary=([^\s;]+)', headers)
+if not m:
+    sys.exit('响应头里没有 boundary')
+boundary = m.group(1).encode()
+
+spans = []
+for part in body.split(b'--' + boundary):
+    if b'Content-Range:' not in part:
+        continue
+    head, _, data = part.partition(b'\r\n\r\n')
+    rng = re.search(rb'Content-Range: bytes (\d+)-(\d+)/(\d+)', head)
+    if not rng:
+        sys.exit('段头缺少 Content-Range')
+    start, end = int(rng.group(1)), int(rng.group(2))
+    data = data[:-2] if data.endswith(b'\r\n') else data
+    if original[start:end + 1] != data:
+        sys.exit(f'区间 {start}-{end} 的字节与原文件不一致')
+    spans.append((start, end))
+
+if spans != [(0, 9), (1000, 1009)]:
+    sys.exit(f'段区间解析错误：{spans}')
+PY
+then
+    ok "多段 Range 的每一段都与原文件字节一致"
+else
+    bad "多段 Range 内容校验失败"
+fi
+
+# 1.13 多段 Range 超过 64MB 总量：明确 416，而不是悄悄回退整文件
+TOO_BIG="$(dl -o /dev/null -w '%{http_code}' \
+    -H 'Range: bytes=0-33554431,33554432-67108863,67108864-100663295' \
+    "$BASE/api/file/$FILE_ID/download")"
+check_eq "416" "$TOO_BIG" "多段总量超限返回 416"
 
 # 1.12 统计接口
 R="$(api GET /api/file/stats)"
@@ -189,8 +334,79 @@ SECOND_ID="$(jget "$R" "['data']['fileId']")"
 echo "  ↳ 秒传得到新的 fileId=$SECOND_ID，一个字节都没传"
 
 # 命中文件应当能正常下载（说明它确实指向了已有的物理文件）
-curl -s -o "$WORK/instant.bin" "$BASE/api/file/$SECOND_ID/download"
+dl -o "$WORK/instant.bin" "$BASE/api/file/$SECOND_ID/download"
 check_eq "$BIG_HASH" "$(sha256sum "$WORK/instant.bin" | cut -d' ' -f1)" "秒传文件能下载且内容正确"
+
+# ---------------------------------------------------------------- 2.5 多用户隔离
+
+section "2.5 多用户隔离（B 看不到、改不了 A 的文件）"
+
+R="$(api_as "$TOKEN_B" GET "/api/file/list?size=100")"
+check_eq "0" "$(jget "$R" "['data']['total']")" "B 的文件列表为空，看不到 A 的文件"
+
+R="$(api_as "$TOKEN_B" GET "/api/file/check?hash=$BIG_HASH&size=$BIG_SIZE")"
+check_eq "False" "$(jget "$R" "['data']['exists']")" "B 的秒传预检不命中 A 的文件"
+
+R="$(api_as "$TOKEN_B" GET "/api/file/$FILE_ID/status")"
+check_eq "10005" "$(jget "$R" "['code']")" "B 查 A 的 fileId 状态返回 10005"
+
+R="$(api_as "$TOKEN_B" POST "/api/file/$FILE_ID/complete")"
+check_eq "10005" "$(jget "$R" "['code']")" "B 不能合并 A 的上传任务"
+
+R="$(api_as "$TOKEN_B" DELETE "/api/file/$FILE_ID")"
+check_eq "10005" "$(jget "$R" "['code']")" "B 不能删除 A 的文件"
+
+R="$(curl -s -H "Authorization: Bearer $TOKEN_B" "$BASE/api/file/$FILE_ID/download")"
+check_eq "10005" "$(jget "$R" "['code']")" "B 不能用 Bearer 下载 A 的文件"
+
+# 秒传仍可全局复用物理文件，但必须给 B 发一条属于 B 的新记录，不能把 A 的 fileId 给 B
+R="$(post_json_as "$TOKEN_B" /api/file/init \
+    "{\"fileName\":\"B-秒传.bin\",\"fileSize\":$BIG_SIZE,\"fileHash\":\"$BIG_HASH\"}")"
+B_ID="$(jget "$R" "['data']['fileId']")"
+check_eq "True" "$(jget "$R" "['data']['instant']")" "B 对同样内容可以秒传"
+if [ -n "$B_ID" ] && [ "$B_ID" != "$FILE_ID" ]; then
+    ok "B 拿到的是自己的 fileId（没有复用 A 的记录）"
+else
+    bad "B 拿到了 A 的 fileId" "B_ID=$B_ID"
+fi
+B_HASH="$(curl -s -H "Authorization: Bearer $TOKEN_B" "$BASE/api/file/$B_ID/download" | sha256sum | cut -d' ' -f1)"
+check_eq "$BIG_HASH" "$B_HASH" "B 可以下载自己的秒传文件，内容正确"
+
+if [ -n "${FILE_HUB_ADMIN_PASSWORD:-}" ]; then
+    R="$(post_json_as "" /api/auth/login \
+        "{\"username\":\"${FILE_HUB_ADMIN_USER:-admin}\",\"password\":\"$FILE_HUB_ADMIN_PASSWORD\"}")"
+    TOKEN_ADMIN="$(jget "$R" "['data']['token']")"
+    check_eq "0" "$(jget "$R" "['code']")" "管理员账号可以登录"
+    R="$(api_as "$TOKEN_ADMIN" GET "/api/file/list?scope=all&size=100")"
+    check_contains "$R" "\"fileId\":\"$FILE_ID\"" "管理员 scope=all 能看到用户 A 的文件"
+else
+    echo "  ↳ 未设置 FILE_HUB_ADMIN_PASSWORD，跳过管理员可见性用例"
+fi
+
+# 删掉 B 的引用，避免影响后面的物理文件引用计数用例
+R="$(api_as "$TOKEN_B" DELETE "/api/file/$B_ID")"
+check_eq "0" "$(jget "$R" "['code']")" "B 删除自己的秒传记录"
+R="$(api_as "$TOKEN_B" GET "/api/file/list?size=100")"
+check_eq "0" "$(jget "$R" "['data']['total']")" "B 删除后列表重新为空"
+
+# ---------------------------------------------------------------- 2.6 下载票据
+
+section "2.6 下载票据（浏览器拿不了 Bearer 头）"
+
+R="$(api GET "/api/file/$FILE_ID/download-ticket")"
+TICKET_URL="$(jget "$R" "['data']['url']")"
+check_eq "0" "$(jget "$R" "['code']")" "登录用户可以申请下载票据"
+check_contains "$TICKET_URL" "/download?ticket=" "票据 URL 使用 ticket 查询参数"
+
+curl -s -o "$WORK/ticket.bin" "$BASE$TICKET_URL"
+check_eq "$BIG_HASH" "$(sha256sum "$WORK/ticket.bin" | cut -d' ' -f1)" \
+         "无 Bearer、仅凭票据即可下载，内容正确"
+
+R="$(curl -s "$BASE/api/file/$FILE_ID/download?ticket=not-a-real-ticket")"
+check_eq "40001" "$(jget "$R" "['code']")" "伪造票据被拒绝（40001，未通过鉴权）"
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/file/$FILE_ID/download")"
+check_eq "401" "$CODE" "既无 Bearer 又无票据时下载返回 401"
 
 # ---------------------------------------------------------------- 3. 断点续传
 
@@ -208,7 +424,8 @@ echo "  共 $RS_TOTAL 片，先只传前 $HALF 片，然后模拟『关掉浏览
 
 for idx in $(seq 0 $((HALF - 1))); do
     part="$(printf '%s/resume.part.%03d' "$WORK" "$idx")"
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$RS_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$RS_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
 done
 
 # 模拟"关掉浏览器再回来"：重新 init 同一个文件，服务端应告诉客户端已经传了哪些片
@@ -229,12 +446,13 @@ check_eq "False" "$(jget "$R" "['data']['done']")" "未合并前 /status 的 don
 # 只补缺失的分片
 for idx in $(seq "$HALF" $((RS_TOTAL - 1))); do
     part="$(printf '%s/resume.part.%03d' "$WORK" "$idx")"
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$RS_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$RS_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
 done
 R="$(api POST "/api/file/$RS_ID/complete")"
 check_eq "0" "$(jget "$R" "['code']")" "补传剩余分片后合并成功"
 
-curl -s -o "$WORK/resume-out.bin" "$BASE/api/file/$RS_ID/download"
+dl -o "$WORK/resume-out.bin" "$BASE/api/file/$RS_ID/download"
 check_eq "$RS_HASH" "$(sha256sum "$WORK/resume-out.bin" | cut -d' ' -f1)" "续传后的文件内容与原文件一致"
 
 # ---------------------------------------------------------------- 4. 完整性校验
@@ -252,7 +470,8 @@ LIAR_ID="$(jget "$R" "['data']['fileId']")"
 LIAR_TOTAL="$(jget "$R" "['data']['chunkTotal']")"
 for idx in $(seq 0 $((LIAR_TOTAL - 1))); do
     part="$(printf '%s/liar.part.%03d' "$WORK" "$idx")"
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$LIAR_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$LIAR_ID" -F "index=$idx" -F "chunk=@$part" > /dev/null
 done
 R="$(api POST "/api/file/$LIAR_ID/complete")"
 check_eq "30003" "$(jget "$R" "['code']")" "摘要对不上时合并被拒绝（code=30003）"
@@ -273,6 +492,18 @@ check_eq "True" "$(jget "$R" "['data']['total'] > 1")" "分页 total 是总条�
 R="$(api GET "/api/file/list?keyword=%E5%8E%8B%E5%8A%9B%E6%B5%8B%E8%AF%95&size=100")"
 check_eq "True" "$(jget "$R" "['data']['total'] > 0")" "按文件名关键字搜索能命中"
 
+# 2 个汉字：走 ngram 全文索引（MATCH ... AGAINST）
+R="$(api GET "/api/file/list?keyword=%E6%B5%8B%E8%AF%95&size=100")"
+check_eq "True" "$(jget "$R" "['data']['total'] > 0")" "两个汉字的关键词走全文索引能命中"
+
+# 1 个字：ngram 最小分词长度是 2，回退 LIKE
+R="$(api GET "/api/file/list?keyword=%E6%B5%8B&size=100")"
+check_eq "True" "$(jget "$R" "['data']['total'] > 0")" "单字关键词回退 LIKE 仍能命中"
+
+# 完整 SHA-256：精确匹配，不走分词
+R="$(api GET "/api/file/list?keyword=$BIG_HASH&size=100")"
+check_eq "True" "$(jget "$R" "['data']['total'] > 0")" "完整 SHA-256 精确命中"
+
 # 状态过滤：status=0 只返回上传中的记录
 R="$(api GET "/api/file/list?status=0&size=100")"
 check_eq "True" "$(jget "$R" "['data']['items'] and all(x['status'] == 0 for x in d['data']['items'])")" \
@@ -292,7 +523,8 @@ BC_TOTAL="$(jget "$R" "['data']['chunkTotal']")"
 
 # 故意把 index=0 的摘要写成另一个文件的摘要：服务端落盘时复算，应当拒绝这一片
 WRONG_HASH="$(sha256sum "$WORK/liar-b.bin" | cut -d' ' -f1)"
-R="$(curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$BC_ID" -F "index=0" \
+R="$(curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$BC_ID" -F "index=0" \
         -F "chunkHash=$WRONG_HASH" -F "chunk=@$WORK/badchunk.part.000")"
 check_eq "30004" "$(jget "$R" "['code']")" "分片摘要不符时返回 30004"
 check_contains "$(jget "$R" "['msg']")" "请重传该分片" "错误信息提示只重传该分片"
@@ -308,7 +540,8 @@ check_eq "0" "$LEFT_IN" "坏分片没有留下 .incoming 临时文件"
 for idx in $(seq 0 $((BC_TOTAL - 1))); do
     part="$(printf '%s/badchunk.part.%03d' "$WORK" "$idx")"
     part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$BC_ID" -F "index=$idx" \
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$BC_ID" -F "index=$idx" \
         -F "chunkHash=$part_hash" -F "chunk=@$part" > /dev/null
 done
 R="$(api POST "/api/file/$BC_ID/complete")"
@@ -328,7 +561,8 @@ HEAL_TOTAL="$(jget "$R" "['data']['chunkTotal']")"
 for idx in $(seq 0 $((HEAL_TOTAL - 1))); do
     part="$(printf '%s/heal.part.%03d' "$WORK" "$idx")"
     part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$HEAL_ID" -F "index=$idx" \
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$HEAL_ID" -F "index=$idx" \
         -F "chunkHash=$part_hash" -F "chunk=@$part" > /dev/null
 done
 
@@ -356,16 +590,52 @@ PY
              "其余分片仍然保留，只需补传坏的那一片"
 
     # 只补传 index=1，再合并
-    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$HEAL_ID" -F "index=1" \
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$HEAL_ID" -F "index=1" \
         -F "chunkHash=$(sha256sum "$WORK/heal.part.001" | cut -d' ' -f1)" \
         -F "chunk=@$WORK/heal.part.001" > /dev/null
     R="$(api POST "/api/file/$HEAL_ID/complete")"
     check_eq "0" "$(jget "$R" "['code']")" "只补坏片后合并成功"
-    curl -s -o "$WORK/heal-out.bin" "$BASE/api/file/$HEAL_ID/download"
+    dl -o "$WORK/heal-out.bin" "$BASE/api/file/$HEAL_ID/download"
     check_eq "$HEAL_HASH" "$(sha256sum "$WORK/heal-out.bin" | cut -d' ' -f1)" \
              "自愈后的文件内容与原文件一致"
 else
     bad "找不到分片文件 $HEAL_CHUNK（检查 STORAGE_ROOT / FILE_HUB_ROOT）"
+fi
+
+# ---------------------------------------------------------------- 4.8 管理员完整性
+
+if [ -n "$TOKEN_ADMIN" ]; then
+    section "4.8 管理员完整性扫描与修复"
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN_ADMIN" \
+        "$BASE/actuator/prometheus")"
+    check_eq "200" "$CODE" "管理员可以读取 Prometheus 指标"
+
+    # HEAL_ID 已经合并完成；手工删掉物理文件，模拟磁盘丢失/外部误删
+    HEAL_FILE="$(find "$STORAGE_ROOT/files" -type f -name "$HEAL_ID" 2>/dev/null | head -n1)"
+    if [ -n "$HEAL_FILE" ]; then
+        rm -f "$HEAL_FILE"
+
+        R="$(api_as "$TOKEN_ADMIN" GET "/api/admin/integrity/scan?deep=false&limit=1000")"
+        check_eq "0" "$(jget "$R" "['code']")" "管理员可以执行完整性扫描"
+        check_contains "$R" "$HEAL_ID" "扫描发现物理文件丢失的记录"
+        check_contains "$R" "物理文件不存在" "扫描给出了具体原因"
+
+        CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+            "$BASE/api/admin/integrity/scan")"
+        check_eq "403" "$CODE" "普通用户访问管理员接口返回 403"
+
+        R="$(post_json_as "$TOKEN_ADMIN" /api/admin/integrity/repair \
+            "{\"fileIds\":[\"$HEAL_ID\"]}")"
+        check_eq "1" "$(jget "$R" "['data']['repaired']")" "修复删除已确认损坏的记录"
+
+        R="$(api GET "/api/file/list?page=1&size=100&keyword=$HEAL_ID")"
+        check_eq "0" "$(jget "$R" "['data']['total']")" "修复后记录从列表中消失"
+    else
+        bad "找不到 $HEAL_ID 的物理文件（检查 STORAGE_ROOT / FILE_HUB_ROOT）"
+    fi
+else
+    echo "  ↳ 未设置 FILE_HUB_ADMIN_PASSWORD，跳过管理员完整性用例"
 fi
 
 # ---------------------------------------------------------------- 5. 引用计数删除
@@ -374,7 +644,7 @@ section "5. 删除与引用计数"
 # 秒传产生的两条记录共享同一个物理文件，删掉一条时物理文件必须留着
 R="$(api DELETE "/api/file/$SECOND_ID")"
 check_eq "0" "$(jget "$R" "['code']")" "删除秒传产生的第二条记录"
-curl -s -o "$WORK/still.bin" "$BASE/api/file/$FILE_ID/download"
+dl -o "$WORK/still.bin" "$BASE/api/file/$FILE_ID/download"
 check_eq "$BIG_HASH" "$(sha256sum "$WORK/still.bin" | cut -d' ' -f1)" \
          "删掉一条后，原文件仍可下载（物理文件没被误删）"
 

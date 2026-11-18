@@ -25,7 +25,7 @@ jobs:
         run: mvn -B test
 
   frontend:
-    name: 前端构建
+    name: 前端检查与构建
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -35,12 +35,99 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run test:unit
       - run: npm run build
+
+  ui-e2e:
+    name: 浏览器端到端
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    timeout-minutes: 30
+    env:
+      # 一次性 CI 凭据，只活在这个 job 里
+      MYSQL_PWD: filehub-ci
+      FILE_HUB_ADMIN_USER: admin
+      FILE_HUB_ADMIN_PASSWORD: filehub-ci-admin-pass
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: filehub-ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pfilehub-ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 前端构建（产物打进 JAR）
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 建库建表
+        run: mysql -h 127.0.0.1 -uroot -pfilehub-ci < src/main/resources/schema.sql
+
+      - name: 打包（跳过单元测试）
+        run: mvn -B package -DskipTests
+
+      - name: 安装 Playwright Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: 启动服务并运行浏览器 E2E
+        working-directory: web
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8081
+        run: |
+          export FILE_HUB_ROOT="$RUNNER_TEMP/file-hub-ui"
+          java -Dfile.encoding=UTF-8 -jar ../target/file-hub-1.0.0.jar \
+            --file-hub.root="$FILE_HUB_ROOT" \
+            > "$RUNNER_TEMP/app-ui.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8081/api/file/config > /dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8081/api/file/config
+          npm run test:e2e
+
+      - name: 失败时上传测试报告
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report
+            web/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 失败时输出服务端日志
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/app-ui.log"
 
   e2e:
     name: 端到端验收
@@ -84,6 +171,9 @@ jobs:
         env:
           MYSQL_PWD: filehub-ci
           FILE_HUB_ROOT: ${{ runner.temp }}/file-hub-data
+          # 一次性 CI 管理员，只活在这个 job 里；E2E 用它验证管理员 scope=all
+          FILE_HUB_ADMIN_USER: admin
+          FILE_HUB_ADMIN_PASSWORD: filehub-ci-admin-pass
         run: |
           java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar \
             --file-hub.root="$FILE_HUB_ROOT" \
@@ -99,3 +189,85 @@ jobs:
       - name: 失败时输出服务端日志
         if: failure()
         run: tail -n 200 "$RUNNER_TEMP/app.log"
+
+  e2e-cluster:
+    name: 多实例端到端
+    runs-on: ubuntu-latest
+    needs: backend
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          # 只用于 CI 里的一次性实例，不是任何真实环境的口令
+          MYSQL_ROOT_PASSWORD: filehub-ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pfilehub-ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 建库建表
+        run: mysql -h 127.0.0.1 -uroot -pfilehub-ci < src/main/resources/schema.sql
+
+      - name: 打包（跳过单元测试，backend 任务已经跑过）
+        run: mvn -B package -DskipTests
+
+      - name: 启动两个实例并跑集群 E2E
+        env:
+          MYSQL_PWD: filehub-ci
+          FILE_HUB_ROOT: ${{ runner.temp }}/file-hub-cluster
+        run: |
+          common=(
+            "-Dfile.encoding=UTF-8"
+            "-jar target/file-hub-1.0.0.jar"
+            "--spring.datasource.url=jdbc:mysql://127.0.0.1:3306/file_hub?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false"
+            "--file-hub.root=$FILE_HUB_ROOT"
+            "--file-hub.cluster.enabled=true"
+            "--file-hub.cluster.redis-address=redis://127.0.0.1:6379"
+            "--file-hub.cleanup-initial-delay-ms=5000"
+            "--file-hub.cleanup-interval-ms=60000"
+          )
+          java "${common[@]}" --server.port=8081 > "$RUNNER_TEMP/node1.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/node1.pid"
+          java "${common[@]}" --server.port=8082 > "$RUNNER_TEMP/node2.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/node2.pid"
+          for _ in $(seq 1 90); do
+            c1=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8081/api/file/config || true)
+            c2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8082/api/file/config || true)
+            [ "$c1" = "200" ] && [ "$c2" = "200" ] && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8081/api/file/config
+          curl -fsS http://127.0.0.1:8082/api/file/config
+          echo
+          bash scripts/e2e-cluster.sh
+
+      - name: 失败时输出两个实例的日志
+        if: failure()
+        run: |
+          echo '=== node 1 ==='; tail -n 200 "$RUNNER_TEMP/node1.log"
+          echo '=== node 2 ==='; tail -n 200 "$RUNNER_TEMP/node2.log"
