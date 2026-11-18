@@ -387,13 +387,13 @@ UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 
 ```bash
 export MYSQL_PWD=你的口令
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar \
   --server.port=8081 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
   --file-hub.cluster.redis-address=redis://127.0.0.1:6379
 
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar \
   --server.port=8082 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
@@ -476,7 +476,7 @@ docker compose -f docker-compose.cluster.yml up --build
 
 ### 安装与使用
 
-1. 运行 `FileHub-1.0.0.msi`（构建产物在 `build/desktop/dist/`）。
+1. 运行 `FileHub-1.0.1.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
    开始菜单和桌面会创建快捷方式。
 2. 双击 `FileHub`，程序在独立窗口中打开 `http://127.0.0.1:18080`，不会占用默认浏览器。
@@ -486,6 +486,9 @@ docker compose -f docker-compose.cluster.yml up --build
    最小化后双击托盘图标恢复窗口；托盘菜单里还可以打开数据目录、退出程序。
 5. 重复双击只会把已有窗口调到前台，不会启动第二个进程
    （外壳单实例互斥量 + 数据目录文件锁）。
+6. 从旧版升级：直接运行新版本 MSI 即可，会替换旧版程序、保留
+   `%LOCALAPPDATA%\FileHubData` 里的账号和文件。**新包的版本号必须高于旧版**
+   （MSI 的 ProductVersion）；同版本号重装只会走修复流程，不会替换成新界面。
 
 数据全部在 `%LOCALAPPDATA%\FileHubData`（**与安装目录 `%LOCALAPPDATA%\FileHub` 分开**）：
 
@@ -524,7 +527,7 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
-#   build/desktop/dist/FileHub-1.0.0.msi           安装包
+#   build/desktop/dist/FileHub-1.0.1.msi           安装包
 ```
 
 安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
@@ -541,8 +544,8 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 把 `pom.xml` 的版本号和标签对齐后推 tag：
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
 `.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
@@ -578,6 +581,11 @@ git push origin v1.0.0
   `http://127.0.0.1:18080@evil.com` 这类前缀绕过）；外部链接只交给默认浏览器打开
   http/https/mailto。
 - 安装包内含 `FileHub.exe.config`，高 DPI/多显示器下按 Per-Monitor V2 缩放。
+- 升级路径实测（2026-11-19）：先装 Release 里旧的 v1.0.0（浏览器版）到默认目录，
+  再直接把版本号升到 1.0.1 的 MSI 覆盖安装（未先卸载）→ 退出码 0，注册表只剩一个
+  FileHub 1.0.1、安装目录和快捷方式不变，旧的浏览器版文件被外壳/WebView2 文件替换；
+  启动后独立窗口正常，管理员账号和原有文件仍在。**同版本号的新包无法这样升级**，
+  必须提升 `pom.xml` 版本后重新打包。
 
 ### 桌面版的实现位置
 
@@ -617,7 +625,7 @@ export MYSQL_PWD=你的口令
 mvn clean package -DskipTests
 # 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
 export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar
 # → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
 # → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
 ```
