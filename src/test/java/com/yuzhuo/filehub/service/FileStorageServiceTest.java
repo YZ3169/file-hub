@@ -1,5 +1,6 @@
 package com.yuzhuo.filehub.service;
 
+import com.yuzhuo.filehub.auth.UserPrincipal;
 import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.common.FileLockRegistry;
 import com.yuzhuo.filehub.config.StorageProperties;
@@ -48,6 +49,9 @@ class FileStorageServiceTest {
 
     static final String ID = "1f0c2a3b-4d5e-6f70-8192-a3b4c5d6e7f8";
     static final String OTHER_ID = "2f0c2a3b-4d5e-6f70-8192-a3b4c5d6e7f8";
+    static final UserPrincipal USER = new UserPrincipal(7L, "alice", "USER");
+    static final UserPrincipal OTHER_USER = new UserPrincipal(8L, "bob", "USER");
+    static final UserPrincipal ADMIN = new UserPrincipal(1L, "admin", "ADMIN");
 
     @Mock
     FileInfoMapper fileInfoMapper;
@@ -66,7 +70,8 @@ class FileStorageServiceTest {
         StorageProperties props = new StorageProperties();
         props.setChunkSize(5);
         props.setUploadExpireMinutes(60);
-        service = new FileStorageService(fileInfoMapper, fileChunkMapper, storage, props, new FileLockRegistry());
+        service = new FileStorageService(fileInfoMapper, fileChunkMapper, storage, props,
+                new FileLockRegistry(), new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
     }
 
     @Test
@@ -78,7 +83,7 @@ class FileStorageServiceTest {
         when(fileInfoMapper.touchUploading(ID)).thenReturn(0);
 
         BizException ex = assertThrows(BizException.class, () ->
-                service.saveChunk(ID, 0, in("hello"), null));
+                service.saveChunk(ID, 0, in("hello"), null, USER));
 
         assertEquals(10005, ex.getCode());
         verify(storage).deleteChunk(ID, 0);
@@ -95,7 +100,7 @@ class FileStorageServiceTest {
                 .thenReturn(new ChunkWriteResult(5, "b".repeat(64), true));
         when(fileInfoMapper.touchUploading(ID)).thenReturn(0);
 
-        assertDoesNotThrow(() -> service.saveChunk(ID, 0, in("hello"), null));
+        assertDoesNotThrow(() -> service.saveChunk(ID, 0, in("hello"), null, USER));
 
         verify(storage).deleteChunk(ID, 0);
         verify(fileChunkMapper).deleteChunk(ID, 0);
@@ -139,11 +144,11 @@ class FileStorageServiceTest {
     @DisplayName("秒传预检以磁盘为准：物理文件缺失时按未命中处理")
     void checkMissesWhenPhysicalFileIsGone() {
         FileInfo done = doneInfo();
-        when(fileInfoMapper.findDoneListByHashAndSize("a".repeat(64), 5))
+        when(fileInfoMapper.findDoneListByOwnerAndHashAndSize("a".repeat(64), 5, 7L, false))
                 .thenReturn(List.of(done));
         when(storage.exists(done.getStoragePath())).thenReturn(false);
 
-        CheckResponse resp = service.check("a".repeat(64), 5);
+        CheckResponse resp = service.check("a".repeat(64), 5, USER);
 
         assertFalse(resp.exists());
         assertNull(resp.fileId());
@@ -157,13 +162,13 @@ class FileStorageServiceTest {
         good.setFileId(OTHER_ID);
         good.setStoragePath("2026/11/18/" + OTHER_ID);
 
-        when(fileInfoMapper.findDoneListByHashAndSize("a".repeat(64), 5))
+        when(fileInfoMapper.findDoneListByOwnerAndHashAndSize("a".repeat(64), 5, 7L, false))
                 .thenReturn(List.of(broken, good));
         when(storage.exists(broken.getStoragePath())).thenReturn(false);
         when(storage.exists(good.getStoragePath())).thenReturn(true);
         when(storage.size(good.getStoragePath())).thenReturn(5L);
 
-        CheckResponse resp = service.check("a".repeat(64), 5);
+        CheckResponse resp = service.check("a".repeat(64), 5, USER);
 
         assertTrue(resp.exists());
         assertEquals(OTHER_ID, resp.fileId());
@@ -193,7 +198,7 @@ class FileStorageServiceTest {
         when(storage.buildRelativePath(ID)).thenReturn("2026/11/18/" + ID);
         when(fileInfoMapper.markDone(eq(ID), anyString())).thenReturn(1);
 
-        FileVO vo = service.complete(ID);
+        FileVO vo = service.complete(ID, USER);
 
         assertEquals(ID, vo.fileId());
         verify(fileChunkMapper).deleteByFileId(ID);
@@ -217,6 +222,44 @@ class FileStorageServiceTest {
         verify(storage, never()).delete(keep);
     }
 
+    @Test
+    @DisplayName("用户隔离：别人的 fileId 和非 NULL 历史数据对普通用户一律不可见")
+    void requireInfoRejectsOtherOwnerAndLegacyRows() {
+        FileInfo other = doneInfo();
+        other.setOwnerId(OTHER_USER.id());
+        when(fileInfoMapper.selectOne(any())).thenReturn(other);
+
+        BizException ex = assertThrows(BizException.class, () -> service.requireInfo(ID, USER));
+        assertEquals(10005, ex.getCode());
+
+        FileInfo legacy = doneInfo();
+        legacy.setOwnerId(null);
+        when(fileInfoMapper.selectOne(any())).thenReturn(legacy);
+        ex = assertThrows(BizException.class, () -> service.requireInfo(ID, USER));
+        assertEquals(10005, ex.getCode());
+    }
+
+    @Test
+    @DisplayName("管理员可以访问历史无主数据")
+    void adminCanAccessLegacyRows() {
+        FileInfo legacy = doneInfo();
+        legacy.setOwnerId(null);
+        when(fileInfoMapper.selectOne(any())).thenReturn(legacy);
+
+        assertEquals(ID, service.requireInfo(ID, ADMIN).getFileId());
+    }
+
+    @Test
+    @DisplayName("秒传预检按 owner 查询：管理员包含 owner_id IS NULL")
+    void checkUsesAdminScopeForLegacy() {
+        when(fileInfoMapper.findDoneListByOwnerAndHashAndSize("a".repeat(64), 5, 1L, true))
+                .thenReturn(List.of());
+
+        service.check("a".repeat(64), 5, ADMIN);
+
+        verify(fileInfoMapper).findDoneListByOwnerAndHashAndSize("a".repeat(64), 5, 1L, true);
+    }
+
     private static FileInfo doneInfo() {
         FileInfo info = uploadingInfo();
         info.setStatus(FileInfo.STATUS_DONE);
@@ -234,6 +277,7 @@ class FileStorageServiceTest {
         info.setChunkSize(5);
         info.setChunkTotal(1);
         info.setStatus(FileInfo.STATUS_UPLOADING);
+        info.setOwnerId(USER.id());
         info.setCreateTime(LocalDateTime.now());
         info.setUpdateTime(LocalDateTime.now());
         return info;

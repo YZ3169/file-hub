@@ -1,7 +1,11 @@
 package com.yuzhuo.filehub.common;
 
+import com.yuzhuo.filehub.auth.AuthException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -20,6 +24,26 @@ public class GlobalExceptionHandler {
     public Result<Void> handleBiz(BizException e) {
         log.warn("业务异常 code={} msg={}", e.getCode(), e.getMessage());
         return Result.fail(e.getCode(), e.getMessage());
+    }
+
+    /** 认证/授权失败要保持真实 HTTP 状态码，前端才能据此回登录页或提示无权限 */
+    @ExceptionHandler(AuthException.class)
+    public ResponseEntity<Result<Void>> handleAuth(AuthException e) {
+        log.warn("认证异常 code={} msg={}", e.getCode(), e.getMessage());
+        return ResponseEntity.status(e.getStatus())
+                .body(Result.fail(e.getCode(), e.getMessage()));
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Result<Void>> handleAccessDenied(AccessDeniedException e) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(Result.fail(40003, "没有权限执行该操作"));
+    }
+
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<Result<Void>> handleAuthentication(AuthenticationException e) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(Result.fail(40001, "请先登录"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

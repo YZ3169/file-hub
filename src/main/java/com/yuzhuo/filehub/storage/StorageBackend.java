@@ -19,6 +19,35 @@ public interface StorageBackend {
     /** 打开读取流，调用方负责关闭 */
     InputStream open(String relativePath) throws IOException;
 
+    /**
+     * 从 offset 开始打开读取流。默认实现用 skip 跳过前缀，本地磁盘会覆盖成真正的定位读取；
+     * 调用方仍应按需要限制读取长度并负责关闭。
+     */
+    default InputStream openRange(String relativePath, long offset, long length) throws IOException {
+        InputStream in = open(relativePath);
+        try {
+            skipFully(in, offset);
+            return in;
+        } catch (IOException e) {
+            in.close();
+            throw e;
+        }
+    }
+
+    private static void skipFully(InputStream in, long n) throws IOException {
+        long remaining = n;
+        while (remaining > 0) {
+            long skipped = in.skip(remaining);
+            if (skipped <= 0) {
+                if (in.read() == -1) {
+                    throw new IOException("文件实际长度小于索引记录");
+                }
+                skipped = 1;
+            }
+            remaining -= skipped;
+        }
+    }
+
     boolean exists(String relativePath);
 
     long size(String relativePath);

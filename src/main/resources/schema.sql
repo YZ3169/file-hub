@@ -7,6 +7,56 @@ CREATE DATABASE IF NOT EXISTS `file_hub`
 
 USE `file_hub`;
 
+-- ---------------------------------------------------------------------------
+-- 用户与会话
+-- ---------------------------------------------------------------------------
+
+DROP TABLE IF EXISTS `user_account`;
+CREATE TABLE `user_account`
+(
+    `id`            BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `username`      VARCHAR(32)  NOT NULL COMMENT '登录名（唯一，大小写不敏感）',
+    `password_hash` VARCHAR(100) NOT NULL COMMENT 'BCrypt 密码摘要，绝不存明文',
+    `role`          VARCHAR(16)  NOT NULL DEFAULT 'USER' COMMENT 'USER / ADMIN',
+    `enabled`       TINYINT      NOT NULL DEFAULT 1 COMMENT '1=可登录',
+    `created_at`    DATETIME     NOT NULL,
+    `updated_at`    DATETIME     NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_username` (`username`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='用户表';
+
+DROP TABLE IF EXISTS `user_session`;
+CREATE TABLE `user_session`
+(
+    `id`           BIGINT      NOT NULL AUTO_INCREMENT,
+    `user_id`      BIGINT      NOT NULL,
+    `token_hash`   CHAR(64)    NOT NULL COMMENT '随机 Token 的 SHA-256；数据库泄漏也拿不到原 Token',
+    `expires_at`   DATETIME    NOT NULL,
+    `created_at`   DATETIME    NOT NULL,
+    `last_used_at` DATETIME             DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_token_hash` (`token_hash`),
+    KEY `idx_session_user` (`user_id`),
+    KEY `idx_session_expires` (`expires_at`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='登录会话（不透明 Bearer Token）';
+
+DROP TABLE IF EXISTS `download_ticket`;
+CREATE TABLE `download_ticket`
+(
+    `id`          BIGINT      NOT NULL AUTO_INCREMENT,
+    `ticket_hash` CHAR(64)    NOT NULL,
+    `file_id`     VARCHAR(64) NOT NULL,
+    `user_id`     BIGINT      NOT NULL,
+    `expires_at`  DATETIME    NOT NULL,
+    `created_at`  DATETIME    NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_ticket_hash` (`ticket_hash`),
+    KEY `idx_ticket_expires` (`expires_at`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='浏览器下载用短期票据';
+
 -- 文件主表。一行 = 一个逻辑文件（同一个物理文件被秒传命中时会有多行共享 storage_path）
 DROP TABLE IF EXISTS `file_info`;
 CREATE TABLE `file_info`
@@ -20,6 +70,7 @@ CREATE TABLE `file_info`
     `chunk_total`  INT          NOT NULL COMMENT '分片总数',
     `storage_path` VARCHAR(500)          DEFAULT NULL COMMENT '成品在存储后端中的相对路径；上传中为 NULL',
     `status`       TINYINT      NOT NULL DEFAULT 0 COMMENT '0=上传中 1=已完成',
+    `owner_id`     BIGINT                DEFAULT NULL COMMENT '所属用户；旧数据为 NULL，仅管理员可见',
     `create_time`  DATETIME     NOT NULL COMMENT '创建时间',
     `update_time`  DATETIME     NOT NULL COMMENT '更新时间',
     PRIMARY KEY (`id`),
@@ -31,7 +82,14 @@ CREATE TABLE `file_info`
     -- 定时清理的查询条件就是 (status = 0, update_time < cutoff)
     KEY `idx_status_update` (`status`, `update_time`),
     -- 列表按状态过滤后按 id 倒序分页
-    KEY `idx_status_id` (`status`, `id`)
+    KEY `idx_status_id` (`status`, `id`),
+    -- 用户列表：先按 owner 过滤，再按 status 过滤/排序
+    KEY `idx_owner_status_id` (`owner_id`, `status`, `id`),
+    -- 用户级秒传检查
+    KEY `idx_owner_hash_size_status` (`owner_id`, `file_hash`, `file_size`, `status`),
+    -- 中文文件名搜索：ngram 把 "测试报告" 切成二元组，比 LIKE '%关键词%' 全表扫描快得多。
+    -- 需要 MySQL 8（内置 ngram 解析器），MySQL 5.7 没有这个 parser。
+    FULLTEXT KEY `ft_file_name` (`file_name`) WITH PARSER ngram
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='文件主表';
 

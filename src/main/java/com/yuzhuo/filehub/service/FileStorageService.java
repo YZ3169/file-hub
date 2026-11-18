@@ -2,8 +2,9 @@ package com.yuzhuo.filehub.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.yuzhuo.filehub.auth.UserPrincipal;
 import com.yuzhuo.filehub.common.BizException;
-import com.yuzhuo.filehub.common.FileLockRegistry;
+import com.yuzhuo.filehub.common.LockRegistry;
 import com.yuzhuo.filehub.config.StorageProperties;
 import com.yuzhuo.filehub.dto.CheckResponse;
 import com.yuzhuo.filehub.dto.FileVO;
@@ -18,6 +19,7 @@ import com.yuzhuo.filehub.mapper.FileChunkMapper;
 import com.yuzhuo.filehub.mapper.FileInfoMapper;
 import com.yuzhuo.filehub.storage.LocalDiskStorage;
 import com.yuzhuo.filehub.util.HashUtil;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -42,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 /**
@@ -56,11 +59,18 @@ import java.util.stream.IntStream;
 @RequiredArgsConstructor
 public class FileStorageService {
 
+    /**
+     * 孤儿成品回收与「复用已有物理文件」之间的互斥锁。
+     * 锁顺序固定：file/content 锁 → gc 锁；GC 只拿 gc 锁，不反向拿内容锁。
+     */
+    private static final String GC_LOCK = "gc:physical";
+
     private final FileInfoMapper fileInfoMapper;
     private final FileChunkMapper fileChunkMapper;
     private final LocalDiskStorage storage;
     private final StorageProperties props;
-    private final FileLockRegistry locks;
+    private final LockRegistry locks;
+    private final MeterRegistry meters;
 
     // ==================================================================
     // 1. 秒传预检
@@ -72,8 +82,8 @@ public class FileStorageService {
      * <p>命中还必须以磁盘为准再确认一次：如果物理文件被外部删掉或大小不符，
      * 这条「已完成」记录就是打不开的，按未命中处理，让客户端走正常上传。</p>
      */
-    public CheckResponse check(String hash, long size) {
-        FileInfo hit = findUsableDone(hash, size);
+    public CheckResponse check(String hash, long size, UserPrincipal user) {
+        FileInfo hit = findUsableDoneForOwner(hash, size, user);
         return new CheckResponse(hit != null, hit == null ? null : hit.getFileId());
     }
 
@@ -88,8 +98,10 @@ public class FileStorageService {
      *   <li><b>断点续传</b>：同 hash+size 已有上传中的任务，复用它并回传已传分片；</li>
      *   <li>全新上传：建任务。</li>
      * </ol>
+     *
+     * @param user 当前登录用户；秒传/断点续传都只在有权限的记录里匹配
      */
-    public InitUploadResponse init(InitUploadRequest req) {
+    public InitUploadResponse init(InitUploadRequest req, UserPrincipal user) {
         long configuredChunkSize = props.getChunkSize();
         if (configuredChunkSize <= 0 || configuredChunkSize > Integer.MAX_VALUE) {
             throw new BizException(50001, "服务端分片大小配置非法：" + configuredChunkSize);
@@ -101,26 +113,33 @@ public class FileStorageService {
         // --- 情况 1：秒传 ---
         // 同一份内容的「新增引用」和「删除最后一条引用」必须互斥：否则删除方刚数完
         // 引用为 0，秒传方又插进来一条指向同一物理文件的记录，就会得到一条打不开的完成记录。
-        InitUploadResponse instant = locks.write(contentKey(fileHash, req.fileSize()), () -> {
-            FileInfo done = findUsableDone(fileHash, req.fileSize());
-            if (done == null) {
-                return null;
-            }
-            String newFileId = UUID.randomUUID().toString();
-            FileInfo row = newRow(newFileId, req, chunkSize, chunkTotal);
-            row.setStatus(FileInfo.STATUS_DONE);
-            // 新记录指向同一份物理文件：磁盘上不再存第二份
-            row.setStoragePath(done.getStoragePath());
-            fileInfoMapper.insert(row);
-            log.info("秒传命中：{} -> 复用 {}", req.fileName(), done.getStoragePath());
-            return new InitUploadResponse(newFileId, true, chunkSize, chunkTotal, req.fileSize(), List.of());
-        });
+        InitUploadResponse instant = locks.write(contentKey(fileHash, req.fileSize()), () ->
+                // 再套一个读锁挡住「孤儿成品回收」：否则回收任务可能刚数完引用为 0，
+                // 本请求就插入了新引用，随后回收把这份仍被引用的物理文件删掉。
+                locks.read(GC_LOCK, () -> {
+                    FileInfo done = findUsableDone(fileHash, req.fileSize());
+                    if (done == null) {
+                        return null;
+                    }
+                    String newFileId = UUID.randomUUID().toString();
+                    FileInfo row = newRow(newFileId, req, chunkSize, chunkTotal, user);
+                    row.setStatus(FileInfo.STATUS_DONE);
+                    // 新记录指向同一份物理文件：磁盘上不再存第二份
+                    row.setStoragePath(done.getStoragePath());
+                    fileInfoMapper.insert(row);
+                    log.info("秒传命中：{} -> 复用 {}", req.fileName(), done.getStoragePath());
+                    return new InitUploadResponse(newFileId, true, chunkSize, chunkTotal, req.fileSize(), List.of());
+                }));
         if (instant != null) {
+            meters.counter("filehub.upload.instant_hits").increment();
+            meters.counter("filehub.upload.instant_bytes").increment(req.fileSize());
             return instant;
         }
 
-        // --- 情况 2：有同一文件的上传中任务（刷新页面 / 换标签页） ---
+        // --- 情况 2：自己的同一文件上传中任务（刷新页面 / 换标签页） ---
+        // 必须带 owner_id：否则用户 B 可以把用户 A 未完成任务的 fileId 拿走继续传。
         FileInfo ongoing = fileInfoMapper.selectOne(new LambdaQueryWrapper<FileInfo>()
+                .eq(FileInfo::getOwnerId, user.id())
                 .eq(FileInfo::getFileHash, fileHash)
                 .eq(FileInfo::getFileSize, req.fileSize())
                 .eq(FileInfo::getStatus, FileInfo.STATUS_UPLOADING)
@@ -140,13 +159,14 @@ public class FileStorageService {
 
         // --- 情况 3：全新任务 ---
         String fileId = UUID.randomUUID().toString();
-        FileInfo row = newRow(fileId, req, chunkSize, chunkTotal);
+        FileInfo row = newRow(fileId, req, chunkSize, chunkTotal, user);
         fileInfoMapper.insert(row);
         log.info("新建上传任务：{}（{} 字节，{} 片）", fileId, req.fileSize(), chunkTotal);
         return new InitUploadResponse(fileId, false, chunkSize, chunkTotal, req.fileSize(), List.of());
     }
 
-    private FileInfo newRow(String fileId, InitUploadRequest req, int chunkSize, int chunkTotal) {
+    private FileInfo newRow(String fileId, InitUploadRequest req, int chunkSize, int chunkTotal,
+                            UserPrincipal user) {
         FileInfo row = new FileInfo();
         row.setFileId(fileId);
         row.setFileName(req.fileName());
@@ -155,6 +175,7 @@ public class FileStorageService {
         row.setChunkSize(chunkSize);
         row.setChunkTotal(chunkTotal);
         row.setStatus(FileInfo.STATUS_UPLOADING);
+        row.setOwnerId(user.id());
         row.setCreateTime(LocalDateTime.now());
         row.setUpdateTime(LocalDateTime.now());
         return row;
@@ -198,14 +219,17 @@ public class FileStorageService {
      * <p>并发上传同一分片时靠 file_chunk 的唯一索引 + upsert 兜底：
      * 后到的会覆盖元数据，但磁盘上的分片仍是原子改名，不会出现半截文件。</p>
      */
-    public void saveChunk(String fileId, int index, InputStream in, String expectedChunkHash) {
+    public void saveChunk(String fileId, int index, InputStream in, String expectedChunkHash,
+                          UserPrincipal user) {
         LocalDiskStorage.requireSafeId(fileId);
         // 读锁：同一任务的多个分片可以并发落盘，但合并/删除会等这些写入完成再拿写锁
-        locks.readVoid(fileId, () -> doSaveChunk(fileId, index, in, expectedChunkHash));
+        locks.readVoid(fileId, () -> doSaveChunk(fileId, index, in, expectedChunkHash, user));
     }
 
-    private void doSaveChunk(String fileId, int index, InputStream in, String expectedChunkHash) {
-        FileInfo info = requireInfo(fileId);
+    private void doSaveChunk(String fileId, int index, InputStream in, String expectedChunkHash,
+                             UserPrincipal user) {
+        // 权限检查必须在锁内、写入之前：非 owner 连分片序号都不能试探
+        FileInfo info = requireInfo(fileId, user);
 
         if (info.getStatus() == FileInfo.STATUS_DONE) {
             // 已完成的任务不该再收分片，但也不值得报错——客户端可能在收到响应前重试过
@@ -245,10 +269,8 @@ public class FileStorageService {
             }
             throw new BizException(10005, "上传任务已结束或已过期，请重新初始化");
         }
-    }
-
-    public void saveChunk(String fileId, int index, InputStream in) {
-        saveChunk(fileId, index, in, null);
+        meters.counter("filehub.chunk.saved").increment();
+        meters.counter("filehub.chunk.bytes").increment(result.size());
     }
 
     /** 第 index 片应有的字节数：除最后一片外都等于 chunkSize */
@@ -272,17 +294,29 @@ public class FileStorageService {
      *   <li><b>完成动作幂等</b>：markDone 带 status=0 条件，两个请求同时点完成只有一个能生效。</li>
      * </ul>
      */
-    public FileVO complete(String fileId) {
+    public FileVO complete(String fileId, UserPrincipal user) {
         LocalDiskStorage.requireSafeId(fileId);
         // 写锁覆盖整个「检查 -> 合并 -> markDone -> 删分片」过程。
         // 两个并发 complete 会被串行化，后到的进来时能看到完成态并直接返回。
         // 注意这里不再用 @Transactional：方法里的每次 mapper 调用各自提交，
         // 锁释放时数据库状态已经对其他线程可见，不会出现「锁放了但事务还没提交」的窗口。
-        return locks.write(fileId, () -> doComplete(fileId));
+        long start = System.nanoTime();
+        try {
+            FileVO done = locks.write(fileId, () -> doComplete(fileId, user));
+            meters.counter("filehub.upload.completed").increment();
+            meters.counter("filehub.upload.merge_bytes").increment(done.fileSize());
+            return done;
+        } catch (BizException e) {
+            // 缺片、坏片、校验失败都算合并失败；按错误码拆开，便于在面板上区分
+            meters.counter("filehub.upload.merge_failed", "code", String.valueOf(e.getCode())).increment();
+            throw e;
+        } finally {
+            meters.timer("filehub.upload.merge_duration").record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+        }
     }
 
-    private FileVO doComplete(String fileId) {
-        FileInfo info = requireInfo(fileId);
+    private FileVO doComplete(String fileId, UserPrincipal user) {
+        FileInfo info = requireInfo(fileId, user);
 
         if (info.getStatus() == FileInfo.STATUS_DONE) {
             // 完成态也不能盲信数据库：物理文件被外部删掉时，直接返回成功等于骗客户端
@@ -393,37 +427,40 @@ public class FileStorageService {
         // 与秒传插入、删除最后引用共用同一把内容锁：
         // 如果这里读到 existing 后它刚好被删除，物理文件就会在 markDone 之前消失。
         final Path mergedFile = merged;
-        String storagePath = locks.write(contentKey(info.getFileHash(), info.getFileSize()), () -> {
-            FileInfo existing = findUsableDone(info.getFileHash(), info.getFileSize());
-            String path;
-            if (existing != null) {
-                deleteQuietly(mergedFile);
-                path = existing.getStoragePath();
-                log.info("合并后去重：{} 复用已有物理文件 {}", fileId, path);
-            } else {
-                path = storage.buildRelativePath(fileId);
-                try {
-                    storage.put(path, mergedFile);
-                } catch (IOException e) {
-                    deleteQuietly(mergedFile);
-                    throw new BizException(20005, "写入存储失败：" + e.getMessage());
-                }
-            }
-            int updated = fileInfoMapper.markDone(fileId, path);
-            if (updated == 0) {
-                // 本 JVM 内不会走到这里（文件写锁串行化 complete）；跨实例时另一请求先改了。
-                // 内容寻址保证两边算出的路径相同，无害。
-                log.info("文件 {} 已被并发请求置为完成态", fileId);
-            }
-            return path;
-        });
+        String storagePath = locks.write(contentKey(info.getFileHash(), info.getFileSize()), () ->
+                // 锁顺序固定为 file/content -> gc：先拿内容锁再拿 GC 读锁，GC 只拿 gc 锁，
+                // 不会反向等待内容锁，因此不会死锁。
+                locks.read(GC_LOCK, () -> {
+                    FileInfo existing = findUsableDone(info.getFileHash(), info.getFileSize());
+                    String path;
+                    if (existing != null) {
+                        deleteQuietly(mergedFile);
+                        path = existing.getStoragePath();
+                        log.info("合并后去重：{} 复用已有物理文件 {}", fileId, path);
+                    } else {
+                        path = storage.buildRelativePath(fileId);
+                        try {
+                            storage.put(path, mergedFile);
+                        } catch (IOException e) {
+                            deleteQuietly(mergedFile);
+                            throw new BizException(20005, "写入存储失败：" + e.getMessage());
+                        }
+                    }
+                    int updated = fileInfoMapper.markDone(fileId, path);
+                    if (updated == 0) {
+                        // 本 JVM 内不会走到这里（文件写锁串行化 complete）；跨实例时另一请求先改了。
+                        // 内容寻址保证两边算出的路径相同，无害。
+                        log.info("文件 {} 已被并发请求置为完成态", fileId);
+                    }
+                    return path;
+                }));
         // 合并成功后分片文件与分片元数据都没有价值了。先删库再删盘：
         // 如果进程在两者之间被杀，留下的是「有目录无元数据」，孤儿目录回收还能扫到；
         // 反过来先删盘会留下一堆永远不会被扫到的 file_chunk 行。
         fileChunkMapper.deleteByFileId(fileId);
         storage.deleteChunks(fileId);
 
-        FileInfo after = requireInfo(fileId);
+        FileInfo after = requireInfo(fileId, user);
         log.info("文件 {} 合并完成：{} 字节，{} 片，hash={}", fileId, actualSize, info.getChunkTotal(), actualHash);
         return FileVO.from(after);
     }
@@ -439,7 +476,8 @@ public class FileStorageService {
      * 现在分页参数由服务端夹紧（page ≥ 1，1 ≤ size ≤ 100），排序只接受白名单，
      * 避免把前端传来的列名直接拼进 SQL。</p>
      */
-    public PageResponse<FileVO> list(int page, int size, String keyword, Integer status, String sort) {
+    public PageResponse<FileVO> list(int page, int size, String keyword, Integer status, String sort,
+                                     UserPrincipal user, String scope) {
         int safePage = Math.max(1, page);
         int safeSize = Math.min(100, Math.max(1, size));
 
@@ -448,14 +486,27 @@ public class FileStorageService {
         }
 
         LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
+        applyOwnerScope(qw, user, scope);
         if (status != null) {
             qw.eq(FileInfo::getStatus, status);
         }
         if (keyword != null && !keyword.isBlank()) {
             String kw = keyword.trim();
-            qw.and(w -> w.like(FileInfo::getFileName, kw)
-                    .or().like(FileInfo::getFileHash, kw)
-                    .or().like(FileInfo::getFileId, kw));
+            if (kw.matches("^[0-9a-fA-F]{64}$")) {
+                // 完整的 SHA-256：精确匹配才能走 file_hash 索引，也避免把 64 位串当成分词拆碎
+                qw.eq(FileInfo::getFileHash, kw.toLowerCase(java.util.Locale.ROOT));
+            } else if (kw.codePointCount(0, kw.length()) >= 2) {
+                // 中文文件名用 ngram 全文索引：LIKE '%关键词%' 在几万行之后必然全表扫描。
+                // file_id / file_hash 仍保留 LIKE，方便按短标识前缀找文件。
+                qw.and(w -> w.apply("MATCH(file_name) AGAINST({0} IN NATURAL LANGUAGE MODE)", kw)
+                        .or().like(FileInfo::getFileId, kw)
+                        .or().like(FileInfo::getFileHash, kw));
+            } else {
+                // 单个字/字符：ngram 最小分词长度是 2，全文索引查不到，回退 LIKE
+                qw.and(w -> w.like(FileInfo::getFileName, kw)
+                        .or().like(FileInfo::getFileHash, kw)
+                        .or().like(FileInfo::getFileId, kw));
+            }
         }
         switch (sort == null ? "" : sort) {
             case "time_asc" -> qw.orderByAsc(FileInfo::getId);
@@ -472,12 +523,43 @@ public class FileStorageService {
                 result.getTotal(), safePage, safeSize);
     }
 
-    public FileInfo requireInfo(String fileId) {
+    /**
+     * 取文件并校验权限。非 owner（且非管理员）统一返回「文件不存在」，
+     * 不暴露 fileId 是否真实存在，避免拿来枚举别人的文件。
+     */
+    public FileInfo requireInfo(String fileId, UserPrincipal user) {
         FileInfo info = findInfo(fileId);
-        if (info == null) {
+        if (info == null || !canAccess(info, user)) {
             throw new BizException(10005, "文件不存在：" + fileId);
         }
         return info;
+    }
+
+    private boolean canAccess(FileInfo info, UserPrincipal user) {
+        if (user == null) {
+            return false;
+        }
+        if (user.isAdmin()) {
+            return true;
+        }
+        // owner_id = NULL 是升级前的历史数据，普通用户不可见
+        return info.getOwnerId() != null && info.getOwnerId().equals(user.id());
+    }
+
+    /**
+     * 普通用户只能看到自己的文件；管理员默认看到自己的 + 历史数据（owner_id IS NULL），
+     * 显式传 scope=all 才看全部。普通用户传 scope=all 无效。
+     */
+    private void applyOwnerScope(LambdaQueryWrapper<FileInfo> qw, UserPrincipal user, String scope) {
+        if (user.isAdmin() && "all".equalsIgnoreCase(scope)) {
+            return;
+        }
+        if (user.isAdmin()) {
+            qw.and(w -> w.eq(FileInfo::getOwnerId, user.id())
+                    .or().isNull(FileInfo::getOwnerId));
+        } else {
+            qw.eq(FileInfo::getOwnerId, user.id());
+        }
     }
 
     private FileInfo findInfo(String fileId) {
@@ -494,6 +576,20 @@ public class FileStorageService {
      */
     private FileInfo findUsableDone(String hash, long size) {
         List<FileInfo> doneList = fileInfoMapper.findDoneListByHashAndSize(hash.toLowerCase(), size);
+        for (FileInfo done : doneList) {
+            if (isStorageIntact(done)) {
+                return done;
+            }
+            log.warn("已完成记录 {} 的物理文件缺失或大小不符，跳过：{}",
+                    done.getFileId(), done.getStoragePath());
+        }
+        return null;
+    }
+
+    /** 秒传预检的可见范围版本：只返回当前用户（管理员含历史数据）名下的可用记录 */
+    private FileInfo findUsableDoneForOwner(String hash, long size, UserPrincipal user) {
+        List<FileInfo> doneList = fileInfoMapper.findDoneListByOwnerAndHashAndSize(
+                hash.toLowerCase(), size, user.id(), user.isAdmin());
         for (FileInfo done : doneList) {
             if (isStorageIntact(done)) {
                 return done;
@@ -532,9 +628,9 @@ public class FileStorageService {
      * 上传任务状态。以磁盘为准回答"现在到底有哪些片"——
      * 暂停后继续、页面刷新重连、合并发现坏片后补传，都靠这个接口重新对齐。
      */
-    public UploadStatusResponse status(String fileId) {
+    public UploadStatusResponse status(String fileId, UserPrincipal user) {
         LocalDiskStorage.requireSafeId(fileId);
-        FileInfo info = requireInfo(fileId);
+        FileInfo info = requireInfo(fileId, user);
         return new UploadStatusResponse(
                 info.getFileId(),
                 info.getFileName(),
@@ -546,11 +642,24 @@ public class FileStorageService {
                 storage.listChunksOnDisk(fileId));
     }
 
-    public StatsResponse stats() {
-        long done = fileInfoMapper.countDone();
-        long uploading = fileInfoMapper.countUploading();
-        long logical = fileInfoMapper.sumLogicalBytes();
-        long physical = fileInfoMapper.sumPhysicalBytes();
+    public StatsResponse stats(UserPrincipal user, String scope) {
+        boolean all = user.isAdmin() && "all".equalsIgnoreCase(scope);
+        boolean includeLegacy = user.isAdmin();
+        long done;
+        long uploading;
+        long logical;
+        long physical;
+        if (all) {
+            done = fileInfoMapper.countDone();
+            uploading = fileInfoMapper.countUploading();
+            logical = fileInfoMapper.sumLogicalBytes();
+            physical = fileInfoMapper.sumPhysicalBytes();
+        } else {
+            done = fileInfoMapper.countDoneByOwner(user.id(), includeLegacy);
+            uploading = fileInfoMapper.countUploadingByOwner(user.id(), includeLegacy);
+            logical = fileInfoMapper.sumLogicalBytesByOwner(user.id(), includeLegacy);
+            physical = fileInfoMapper.sumPhysicalBytesByOwner(user.id(), includeLegacy);
+        }
         return new StatsResponse(done, uploading, logical, physical, Math.max(0, logical - physical));
     }
 
@@ -564,6 +673,17 @@ public class FileStorageService {
     @Scheduled(fixedDelayString = "${file-hub.cleanup-interval-ms:600000}",
             initialDelayString = "${file-hub.cleanup-initial-delay-ms:60000}")
     public void cleanupExpiredUploads() {
+        // 多实例时只让抢到锁的一个实例扫描：两个实例同时扫同一批过期任务没有收益，
+        // 还会成倍增加对共享盘的 IO。本地模式 tryWrite 永远成功，行为不变。
+        long start = System.nanoTime();
+        if (!locks.tryWrite("cleanup:scheduler", this::doCleanup)) {
+            log.debug("另一个实例正在执行清理，本次跳过");
+            return;
+        }
+        meters.timer("filehub.cleanup.duration").record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+    }
+
+    private void doCleanup() {
         int minutes = props.getUploadExpireMinutes();
         int removed = 0;
         for (FileInfo stale : fileInfoMapper.findExpiredUploading(minutes)) {
@@ -585,6 +705,7 @@ public class FileStorageService {
                     continue;
                 }
                 removed++;
+                meters.counter("filehub.cleanup.expired_uploads").increment();
                 log.info("回收过期上传任务：{}（{}，{} 字节）",
                         stale.getFileId(), stale.getFileName(), stale.getFileSize());
             } catch (Exception e) {
@@ -594,6 +715,9 @@ public class FileStorageService {
         int orphanDirs = cleanupOrphanChunkDirs(Duration.ofMinutes(minutes));
         int orphanFiles = cleanupOrphanFinishedFiles(Duration.ofHours(props.getOrphanFileGraceHours()));
         int tempFiles = storage.cleanupTemporary(Duration.ofMinutes(minutes));
+        meters.counter("filehub.cleanup.orphan_chunk_dirs").increment(orphanDirs);
+        meters.counter("filehub.cleanup.orphan_files").increment(orphanFiles);
+        meters.counter("filehub.cleanup.temp_files").increment(tempFiles);
         if (removed > 0 || orphanDirs > 0 || orphanFiles > 0 || tempFiles > 0) {
             log.info("临时文件清理完成：过期任务 {} 个，孤儿分片目录 {} 个，孤儿成品 {} 个，残留文件 {} 个",
                     removed, orphanDirs, orphanFiles, tempFiles);
@@ -640,9 +764,14 @@ public class FileStorageService {
      * 三道保险防止误删：</p>
      * <ol>
      *   <li>只处理超过 {@code orphan-file-grace-hours}（默认 7 天）没变化的文件；</li>
-     *   <li>拿该 fileId 的写锁，与 complete/delete 串行；</li>
+     *   <li>拿全局 gc 写锁，与「秒传插入 / 合并去重复用」的 gc 读锁互斥；</li>
      *   <li>锁内再查一次引用计数，仍为 0 才删。</li>
      * </ol>
+     *
+     * <p>注意这里<b>只拿 gc 锁，不再拿 fileId 写锁</b>。否则会形成死锁环：
+     * delete 拿 file→content，init 拿 content→gc，GC 若拿 file→gc，三个线程各持一把
+     * 互相等待。GC 改成只拿 gc 后，锁序（file→content→gc，GC 只取 gc）无环；
+     * 新插入的引用仍会被 gc 写锁挡住，引用计数不会在「数到 0」和「删盘」之间被改掉。</p>
      */
     private int cleanupOrphanFinishedFiles(Duration grace) {
         Set<String> referenced = new HashSet<>(fileInfoMapper.findAllStoragePaths());
@@ -651,8 +780,7 @@ public class FileStorageService {
             if (referenced.contains(path) || !storage.fileOlderThan(path, grace)) {
                 continue;
             }
-            String fileId = path.substring(path.lastIndexOf('/') + 1);
-            boolean deleted = locks.write(fileId, () -> {
+            boolean deleted = locks.write(GC_LOCK, () -> {
                 if (fileInfoMapper.countByStoragePath(path) > 0) {
                     return false;
                 }
@@ -670,12 +798,7 @@ public class FileStorageService {
     }
 
     public InputStream openForRead(FileInfo info) {
-        if (info.getStatus() != FileInfo.STATUS_DONE) {
-            throw new BizException(10006, "文件尚未上传完成，无法下载");
-        }
-        if (!isStorageIntact(info)) {
-            throw new BizException(20006, "存储中的文件缺失或大小不符，无法下载");
-        }
+        requireReadable(info);
         try {
             return storage.open(info.getStoragePath());
         } catch (IOException e) {
@@ -684,13 +807,35 @@ public class FileStorageService {
     }
 
     /**
+     * 从指定偏移打开成品文件，供 HTTP Range（尤其是多段 Range）使用。
+     * 长度由调用方用 BoundedInputStream 之类限制；这里只负责校验和定位。
+     */
+    public InputStream openRangeForRead(FileInfo info, long offset, long length) {
+        requireReadable(info);
+        try {
+            return storage.openRange(info.getStoragePath(), offset, length);
+        } catch (IOException e) {
+            throw new BizException(20006, "读取文件失败：" + e.getMessage());
+        }
+    }
+
+    private void requireReadable(FileInfo info) {
+        if (info.getStatus() != FileInfo.STATUS_DONE) {
+            throw new BizException(10006, "文件尚未上传完成，无法下载");
+        }
+        if (!isStorageIntact(info)) {
+            throw new BizException(20006, "存储中的文件缺失或大小不符，无法下载");
+        }
+    }
+
+    /**
      * 删除。因为秒传/去重会让多条逻辑记录共享同一份物理文件，
      * <b>不能看到一条记录就直接删磁盘文件</b>——得先数一下还有没有别人在用。
      */
-    public void delete(String fileId) {
+    public void delete(String fileId, UserPrincipal user) {
         LocalDiskStorage.requireSafeId(fileId);
         locks.writeVoid(fileId, () -> {
-            FileInfo info = requireInfo(fileId);
+            FileInfo info = requireInfo(fileId, user);
             fileInfoMapper.deleteById(info.getId());
 
             if (info.getStatus() == FileInfo.STATUS_DONE) {

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,6 +65,28 @@ class FileLockRegistryTest {
         reader.join(2000);
         assertTrue(writerEntered.await(2, TimeUnit.SECONDS));
         writer.join(2000);
+    }
+
+    @Test
+    @DisplayName("tryWrite 被占用时立即返回 false 且不执行，空闲时返回 true")
+    void tryWriteDoesNotBlock() throws Exception {
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        Thread holder = new Thread(() -> locks.writeVoid("cleanup:scheduler", () -> {
+            firstEntered.countDown();
+            await(releaseFirst);
+        }));
+        holder.start();
+        assertTrue(firstEntered.await(2, TimeUnit.SECONDS));
+
+        AtomicBoolean ran = new AtomicBoolean(false);
+        assertFalse(locks.tryWrite("cleanup:scheduler", () -> ran.set(true)));
+        assertFalse(ran.get(), "抢不到锁时不能执行清理");
+
+        releaseFirst.countDown();
+        holder.join(2000);
+        assertTrue(locks.tryWrite("cleanup:scheduler", () -> ran.set(true)));
+        assertTrue(ran.get());
     }
 
     private static void await(CountDownLatch latch) {

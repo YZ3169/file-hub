@@ -37,6 +37,9 @@ public class FileInfo {
     /** 0=上传中 1=已完成 */
     private Integer status;
 
+    /** 文件所有者；NULL 表示升级前创建的历史数据，仅管理员可见 */
+    private Long ownerId;
+
     private LocalDateTime createTime;
 
     private LocalDateTime updateTime;

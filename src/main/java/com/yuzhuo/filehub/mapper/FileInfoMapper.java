@@ -24,6 +24,19 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
     List<FileInfo> findDoneListByHashAndSize(@Param("hash") String hash, @Param("size") long size);
 
     /**
+     * 秒传预检按所有者过滤：普通用户绝不能通过 check 拿到别人的 fileId。
+     * 管理员额外包含 owner_id IS NULL 的历史数据。
+     */
+    @Select("<script>SELECT * FROM file_info WHERE file_hash = #{hash} AND file_size = #{size} "
+            + "AND status = 1 AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>) "
+            + "ORDER BY id LIMIT 50</script>")
+    List<FileInfo> findDoneListByOwnerAndHashAndSize(@Param("hash") String hash,
+                                                     @Param("size") long size,
+                                                     @Param("ownerId") Long ownerId,
+                                                     @Param("includeLegacy") boolean includeLegacy);
+
+    /**
      * 数一下还有几行逻辑文件引用同一个物理文件——秒传会让多行共享一个 storage_path，
      * 只有引用数为 1 时才能真删磁盘文件。
      */
@@ -83,4 +96,35 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
             + "  SELECT MAX(file_size) AS sz FROM file_info WHERE status = 1 GROUP BY storage_path"
             + ") t")
     long sumPhysicalBytes();
+
+    // ---- 按所有者统计（管理员默认包含 owner_id IS NULL 的历史数据） ----
+
+    @Select("<script>SELECT COUNT(*) FROM file_info WHERE status = 1 AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>)</script>")
+    long countDoneByOwner(@Param("ownerId") Long ownerId,
+                          @Param("includeLegacy") boolean includeLegacy);
+
+    @Select("<script>SELECT COUNT(*) FROM file_info WHERE status = 0 AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>)</script>")
+    long countUploadingByOwner(@Param("ownerId") Long ownerId,
+                               @Param("includeLegacy") boolean includeLegacy);
+
+    @Select("<script>SELECT COALESCE(SUM(file_size), 0) FROM file_info WHERE status = 1 "
+            + "AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>)</script>")
+    long sumLogicalBytesByOwner(@Param("ownerId") Long ownerId,
+                                @Param("includeLegacy") boolean includeLegacy);
+
+    /**
+     * 物理字节数按 storage_path 去重。用户能看到两条指向同一物理文件的记录时只计一次；
+     * 这不等于全局去重收益——别的用户独占的物理文件不会出现在这里。
+     */
+    @Select("<script>SELECT COALESCE(SUM(sz), 0) FROM ("
+            + "  SELECT MAX(file_size) AS sz FROM file_info WHERE status = 1 "
+            + "  AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>) "
+            + "  GROUP BY storage_path"
+            + ") t</script>")
+    long sumPhysicalBytesByOwner(@Param("ownerId") Long ownerId,
+                                 @Param("includeLegacy") boolean includeLegacy);
 }

@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -228,6 +229,21 @@ class LocalDiskStorageTest {
         String rel = storage.buildRelativePath(ID);
         assertTrue(rel.endsWith("/" + ID), rel);
         assertEquals(4, rel.split("/").length, rel);   // yyyy/MM/dd/{id}
+    }
+
+    @Test
+    @DisplayName("openRange 直接定位到偏移，不会把前面的字节读出来")
+    void openRangeReadsFromOffset() throws IOException {
+        Path src = Files.writeString(root.resolve("range.bin"), "0123456789");
+        String rel = storage.buildRelativePath(ID);
+        storage.put(rel, src);
+
+        try (InputStream in = storage.openRange(rel, 4, 3)) {
+            assertEquals("456", new String(in.readNBytes(3), StandardCharsets.UTF_8));
+        }
+        try (InputStream in = storage.openRange(rel, 0, 10)) {
+            assertEquals("0123456789", new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        }
     }
 
     @Test

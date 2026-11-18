@@ -1,8 +1,12 @@
 package com.yuzhuo.filehub.controller;
 
+import com.yuzhuo.filehub.auth.AuthException;
+import com.yuzhuo.filehub.auth.DownloadTicketService;
+import com.yuzhuo.filehub.auth.UserPrincipal;
 import com.yuzhuo.filehub.common.Result;
 import com.yuzhuo.filehub.config.StorageProperties;
 import com.yuzhuo.filehub.dto.CheckResponse;
+import com.yuzhuo.filehub.dto.DownloadTicketResponse;
 import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.dto.InitUploadResponse;
@@ -12,6 +16,7 @@ import com.yuzhuo.filehub.dto.UploadStatusResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.service.FileStorageService;
 import com.yuzhuo.filehub.storage.StorageBackend;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,6 +26,7 @@ import org.springframework.http.HttpRange;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -33,22 +39,34 @@ import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.SequenceInputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @Slf4j
 @RestController
 @RequestMapping("/api/file")
 @RequiredArgsConstructor
+@Tag(name = "文件", description = "初始化 / 分片 / 合并 / 列表 / 下载 / 删除")
 public class FileController {
+
+    /** 多段 Range 的上限：段数与总字节数，超过一律 416 */
+    private static final int MAX_RANGES = 8;
+    private static final long MAX_MULTIPART_BYTES = 64L * 1024 * 1024;
+    private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.US_ASCII);
 
     private final FileStorageService service;
     private final StorageBackend storageBackend;
     private final StorageProperties props;
+    private final DownloadTicketService ticketService;
 
     /** 前端启动时读一次，拿到分片大小和存储后端标识 */
     @GetMapping("/config")
@@ -61,14 +79,16 @@ public class FileController {
     /** 秒传预检 */
     @GetMapping("/check")
     public Result<CheckResponse> check(@RequestParam("hash") String hash,
-                                       @RequestParam("size") long size) {
-        return Result.ok(service.check(hash, size));
+                                       @RequestParam("size") long size,
+                                       @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.check(hash, size, user));
     }
 
     /** 初始化上传，拿 fileId + 需要补传的分片序号 */
     @PostMapping("/init")
-    public Result<InitUploadResponse> init(@RequestBody @Valid InitUploadRequest req) {
-        return Result.ok(service.init(req));
+    public Result<InitUploadResponse> init(@RequestBody @Valid InitUploadRequest req,
+                                           @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.init(req, user));
     }
 
     /**
@@ -81,23 +101,26 @@ public class FileController {
     public Result<Void> uploadChunk(@RequestParam("fileId") String fileId,
                                     @RequestParam("index") int index,
                                     @RequestParam(value = "chunkHash", required = false) String chunkHash,
-                                    @RequestPart("chunk") MultipartFile chunk) throws IOException {
+                                    @RequestPart("chunk") MultipartFile chunk,
+                                    @AuthenticationPrincipal UserPrincipal user) throws IOException {
         try (InputStream in = chunk.getInputStream()) {
-            service.saveChunk(fileId, index, in, chunkHash);
+            service.saveChunk(fileId, index, in, chunkHash, user);
         }
         return Result.ok();
     }
 
     /** 合并分片 */
     @PostMapping("/{fileId}/complete")
-    public Result<FileVO> complete(@PathVariable("fileId") String fileId) {
-        return Result.ok(service.complete(fileId));
+    public Result<FileVO> complete(@PathVariable("fileId") String fileId,
+                                   @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.complete(fileId, user));
     }
 
     /** 上传任务状态：以磁盘为准的已传分片，断点续传/坏片补传前先对齐一次 */
     @GetMapping("/{fileId}/status")
-    public Result<UploadStatusResponse> status(@PathVariable("fileId") String fileId) {
-        return Result.ok(service.status(fileId));
+    public Result<UploadStatusResponse> status(@PathVariable("fileId") String fileId,
+                                               @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.status(fileId, user));
     }
 
     /**
@@ -115,13 +138,29 @@ public class FileController {
             @RequestParam(value = "size", defaultValue = "20") int size,
             @RequestParam(value = "keyword", required = false) String keyword,
             @RequestParam(value = "status", required = false) Integer status,
-            @RequestParam(value = "sort", defaultValue = "time_desc") String sort) {
-        return Result.ok(service.list(page, size, keyword, status, sort));
+            @RequestParam(value = "sort", defaultValue = "time_desc") String sort,
+            @RequestParam(value = "scope", required = false) String scope,
+            @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.list(page, size, keyword, status, sort, user, scope));
     }
 
     @GetMapping("/stats")
-    public Result<StatsResponse> stats() {
-        return Result.ok(service.stats());
+    public Result<StatsResponse> stats(
+            @RequestParam(value = "scope", required = false) String scope,
+            @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.stats(user, scope));
+    }
+
+    /**
+     * 浏览器下载票据：Bearer Token 不能放进 &lt;a href&gt;，先换一张 5 分钟的短期票据。
+     * 票据必须由 owner 或管理员申请，绑定 fileId + userId。
+     */
+    @GetMapping("/{fileId}/download-ticket")
+    public Result<DownloadTicketResponse> downloadTicket(
+            @PathVariable("fileId") String fileId,
+            @AuthenticationPrincipal UserPrincipal user) {
+        service.requireInfo(fileId, user);
+        return Result.ok(ticketService.issue(fileId, user));
     }
 
     /**
@@ -131,8 +170,22 @@ public class FileController {
     @GetMapping("/{fileId}/download")
     public ResponseEntity<InputStreamResource> download(
             @PathVariable("fileId") String fileId,
-            @RequestHeader(value = HttpHeaders.RANGE, required = false) String rangeHeader) {
-        FileInfo info = service.requireInfo(fileId);
+            @RequestParam(value = "ticket", required = false) String ticket,
+            @RequestHeader(value = HttpHeaders.RANGE, required = false) String rangeHeader,
+            @AuthenticationPrincipal UserPrincipal user) {
+        // 下载接口在 SecurityConfig 里放行，鉴权必须在这里完成：
+        // 优先兑换票据（浏览器），否则使用 Bearer Token（脚本/curl）。两者都没有就是 401。
+        UserPrincipal accessor = user;
+        if (ticket != null && !ticket.isBlank()) {
+            accessor = ticketService.resolve(fileId, ticket);
+            if (accessor == null) {
+                throw AuthException.unauthorized("下载票据无效或已过期");
+            }
+        }
+        if (accessor == null) {
+            throw AuthException.unauthorized("请先登录或使用下载票据");
+        }
+        FileInfo info = service.requireInfo(fileId, accessor);
         long size = info.getFileSize();
         HttpHeaders headers = downloadHeaders(info);
 
@@ -146,38 +199,90 @@ public class FileController {
         } catch (IllegalArgumentException e) {
             return rangeNotSatisfiable(size);
         }
-        // 多段 Range 要 multipart/byteranges，实现成本高于收益；按 RFC 允许直接返回整文件
-        if (ranges.size() != 1) {
+        if (ranges.isEmpty()) {
             return fullResponse(info, headers);
         }
-
-        long start;
-        long end;
-        try {
-            start = ranges.get(0).getRangeStart(size);
-            end = ranges.get(0).getRangeEnd(size);
-        } catch (IllegalArgumentException e) {
-            return rangeNotSatisfiable(size);
-        }
-        if (start >= size) {
+        // 多段请求最多 8 段、总计 64MB：再大就不值得为「并行下载」多开这么多流，
+        // 也避免一个请求被构造出几十万个区间把内存/连接占满。
+        if (ranges.size() > MAX_RANGES) {
             return rangeNotSatisfiable(size);
         }
 
-        long length = end - start + 1;
-        InputStream in = service.openForRead(info);
-        try {
-            skipFully(in, start);
-        } catch (IOException e) {
-            closeQuietly(in);
-            throw new com.yuzhuo.filehub.common.BizException(20006, "读取文件失败：" + e.getMessage());
+        long[][] spans = new long[ranges.size()][];
+        long total = 0;
+        for (int i = 0; i < ranges.size(); i++) {
+            long start;
+            long end;
+            try {
+                start = ranges.get(i).getRangeStart(size);
+                end = ranges.get(i).getRangeEnd(size);
+            } catch (IllegalArgumentException e) {
+                return rangeNotSatisfiable(size);
+            }
+            if (start < 0 || start >= size || end < start || end >= size) {
+                return rangeNotSatisfiable(size);
+            }
+            total += end - start + 1;
+            if (total > MAX_MULTIPART_BYTES) {
+                return rangeNotSatisfiable(size);
+            }
+            spans[i] = new long[]{start, end};
         }
 
-        headers.set(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + size);
+        if (spans.length == 1) {
+            long start = spans[0][0];
+            long end = spans[0][1];
+            long length = end - start + 1;
+            InputStream in = service.openRangeForRead(info, start, length);
+            headers.set(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + size);
+            return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
+                    .headers(headers)
+                    .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                    .contentLength(length)
+                    .body(new InputStreamResource(new BoundedInputStream(in, length)));
+        }
+        return multipartResponse(info, headers, size, spans);
+    }
+
+    /**
+     * RFC 7233 的多段响应：body 由若干「分界行 + 段头 + 本段字节 + CRLF」组成，
+     * 最后以 {@code --boundary--} 收尾。所有段头都是纯 ASCII，因此 Content-Length
+     * 可以在发送前精确算出来——这对不支持 chunked 的老下载器很重要。
+     */
+    private ResponseEntity<InputStreamResource> multipartResponse(FileInfo info, HttpHeaders headers,
+                                                                  long size, long[][] spans) {
+        String boundary = "filehub-" + UUID.randomUUID().toString().replace("-", "");
+        long contentLength = 0;
+        List<InputStream> parts = new ArrayList<>(spans.length * 3 + 1);
+        try {
+            for (long[] span : spans) {
+                long start = span[0];
+                long end = span[1];
+                long length = end - start + 1;
+                byte[] partHeader = ("--" + boundary + "\r\n"
+                        + "Content-Type: application/octet-stream\r\n"
+                        + "Content-Range: bytes " + start + "-" + end + "/" + size + "\r\n\r\n")
+                        .getBytes(StandardCharsets.US_ASCII);
+                parts.add(new ByteArrayInputStream(partHeader));
+                // 每段单独打开、只暴露本段：FileChannel 直接定位，不会从文件头开始空读
+                parts.add(new BoundedInputStream(service.openRangeForRead(info, start, length), length));
+                parts.add(new ByteArrayInputStream(CRLF));
+                contentLength += partHeader.length + length + CRLF.length;
+            }
+            byte[] closing = ("--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII);
+            parts.add(new ByteArrayInputStream(closing));
+            contentLength += closing.length;
+        } catch (RuntimeException e) {
+            // 中途某个区间打不开：已经打开的流必须关掉，否则句柄泄漏
+            parts.forEach(FileController::closeQuietly);
+            throw e;
+        }
+
+        headers.set(HttpHeaders.CONTENT_TYPE, "multipart/byteranges; boundary=" + boundary);
         return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
                 .headers(headers)
-                .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .contentLength(length)
-                .body(new InputStreamResource(new BoundedInputStream(in, length)));
+                .contentLength(contentLength)
+                .body(new InputStreamResource(new SequenceInputStream(Collections.enumeration(parts))));
     }
 
     private ResponseEntity<InputStreamResource> fullResponse(FileInfo info, HttpHeaders headers) {
@@ -205,19 +310,6 @@ public class FileController {
         return ResponseEntity.<InputStreamResource>status(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 .header(HttpHeaders.CONTENT_RANGE, "bytes */" + size)
                 .build();
-    }
-
-    private static void skipFully(InputStream in, long n) throws IOException {
-        while (n > 0) {
-            long skipped = in.skip(n);
-            if (skipped <= 0) {
-                if (in.read() == -1) {
-                    throw new IOException("文件实际长度小于索引记录");
-                }
-                skipped = 1;
-            }
-            n -= skipped;
-        }
     }
 
     private static void closeQuietly(InputStream in) {
@@ -274,8 +366,9 @@ public class FileController {
     }
 
     @DeleteMapping("/{fileId}")
-    public Result<Void> delete(@PathVariable("fileId") String fileId) {
-        service.delete(fileId);
+    public Result<Void> delete(@PathVariable("fileId") String fileId,
+                               @AuthenticationPrincipal UserPrincipal user) {
+        service.delete(fileId, user);
         return Result.ok();
     }
 }

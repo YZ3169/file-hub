@@ -9,10 +9,14 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
@@ -119,7 +123,14 @@ public class LocalDiskStorage implements StorageBackend {
             return new ChunkWriteResult(written, actual, false);
         }
 
-        Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
+        // 共享目录下必须原子替换：否则另一个实例读分片时可能看到写了一半的文件。
+        // 个别文件系统不支持 ATOMIC_MOVE（例如跨挂载点），才退回普通替换。
+        try {
+            Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
+        }
         return new ChunkWriteResult(written, actual, true);
     }
 
@@ -169,7 +180,15 @@ public class LocalDiskStorage implements StorageBackend {
                     .filter(n -> n.endsWith(".part"))
                     .map(n -> n.substring(0, n.length() - 5))
                     .filter(n -> n.chars().allMatch(Character::isDigit))
-                    .map(Integer::parseInt)
+                    .flatMap(n -> {
+                        // 文件名是纯数字也可能是超出 int 范围的垃圾（例如手工放进去的），跳过而不是让整个列目录失败
+                        try {
+                            return Stream.of(Integer.parseInt(n));
+                        } catch (NumberFormatException e) {
+                            log.warn("忽略非法分片文件名：{}/{}", fileId, n);
+                            return Stream.empty();
+                        }
+                    })
                     .filter(i -> i >= 0)
                     .sorted()
                     .toList();
@@ -347,14 +366,43 @@ public class LocalDiskStorage implements StorageBackend {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException atomicFailed) {
-            // 跨盘符时 ATOMIC_MOVE 不支持，退化成普通移动
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            // 跨盘符/跨挂载点时 ATOMIC_MOVE 不支持。不能直接 move 到目标位置：
+            // 非原子移动会让并发下载读到半个文件。先在目标目录里复制成隐藏临时名，
+            // 再在同目录内原子改名，读者要么看到旧文件、要么看到完整新文件。
+            Path incoming = target.resolveSibling(
+                    target.getFileName() + "." + UUID.randomUUID() + ".incoming");
+            try {
+                Files.copy(source, incoming, StandardCopyOption.REPLACE_EXISTING);
+                try {
+                    Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+                Files.deleteIfExists(source);
+            } catch (IOException e) {
+                Files.deleteIfExists(incoming);
+                throw e;
+            }
         }
     }
 
     @Override
     public InputStream open(String relativePath) throws IOException {
         return Files.newInputStream(resolveSafe(relativePath));
+    }
+
+    /**
+     * 真正的偏移读取：FileChannel.position 直接定位，不再从 0 开始 skip。
+     * 多段 Range 里每段都从 0 跳过前缀的话，大文件尾部的请求会白读整个文件。
+     */
+    @Override
+    public InputStream openRange(String relativePath, long offset, long length) throws IOException {
+        FileChannel channel = FileChannel.open(resolveSafe(relativePath), StandardOpenOption.READ);
+        if (offset > 0) {
+            channel.position(offset);
+        }
+        return Channels.newInputStream(channel);
     }
 
     @Override
@@ -383,6 +431,7 @@ public class LocalDiskStorage implements StorageBackend {
 
     @Override
     public String backendName() {
-        return "local-disk:" + root;
+        // /api/config 是公开接口，不把服务器绝对路径暴露出去；root 仍可在日志/启动信息中看到
+        return "local-disk";
     }
 }
