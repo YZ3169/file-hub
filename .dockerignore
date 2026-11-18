@@ -1,0 +1,13 @@
+# 构建阶段不需要的东西，别塞进 build context
+target
+web/node_modules
+web/test-results
+web/playwright-report
+.git
+.github
+.idea
+*.iml
+data
+Dockerfile
+.dockerignore
+README.md

@@ -1,0 +1,79 @@
+# 单机演示：MySQL 8 + Redis 7 + file-hub
+#
+# 用法：
+#   export MYSQL_ROOT_PASSWORD='换成一个强口令'
+#   export FILE_HUB_ADMIN_PASSWORD='管理员初始口令'
+#   docker compose up --build
+#   open http://127.0.0.1:8081
+#
+# 口令只从环境变量注入，不写进本文件。
+name: file-hub
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请先设置 MYSQL_ROOT_PASSWORD}
+      # 应用不用 root 连库：官方镜像会给这个用户建 host=% 并授权到 MYSQL_DATABASE
+      MYSQL_DATABASE: file_hub
+      MYSQL_USER: filehub
+      MYSQL_PASSWORD: ${MYSQL_APP_PASSWORD:?请先设置 MYSQL_APP_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 只在数据卷为空时执行一次；重复 up 不会重建表
+      - ./src/main/resources/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MYSQL_URL: jdbc:mysql://mysql:3306/file_hub?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true
+      MYSQL_USER: filehub
+      MYSQL_PWD: ${MYSQL_APP_PASSWORD}
+      FILE_HUB_ROOT: /data
+      FILE_HUB_ADMIN_USER: ${FILE_HUB_ADMIN_USER:-admin}
+      FILE_HUB_ADMIN_PASSWORD: ${FILE_HUB_ADMIN_PASSWORD:-}
+      FILE_HUB_REDIS_ADDRESS: redis://redis:6379
+      FILE_HUB_LOG_LEVEL: info
+      SERVER_PORT: 8081
+      TZ: Asia/Shanghai
+    ports:
+      - "${FILE_HUB_PORT:-8081}:8081"
+    volumes:
+      - file-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  mysql-data:
+  redis-data:
+  file-data:

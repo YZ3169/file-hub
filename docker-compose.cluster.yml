@@ -1,0 +1,80 @@
+# 多实例演示：两个 app 共用一个 MySQL、一个 Redis、一份共享存储目录（同一个卷）。
+#
+#   export MYSQL_ROOT_PASSWORD='换成一个强口令'
+#   export FILE_HUB_ADMIN_PASSWORD='管理员初始口令'
+#   docker compose -f docker-compose.cluster.yml up --build
+#
+# 8081 / 8082 都可独立上传；分片可以交替打到两个实例，Redis 读写锁保证
+# 合并、删除、秒传插入、清理不会被两个 JVM 同时执行。
+name: file-hub-cluster
+
+x-app: &app
+  build: .
+  restart: unless-stopped
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  environment: &app-env
+    MYSQL_URL: jdbc:mysql://mysql:3306/file_hub?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true
+    MYSQL_USER: filehub
+    MYSQL_PWD: ${MYSQL_APP_PASSWORD}
+    FILE_HUB_ROOT: /data
+    FILE_HUB_CLUSTER_ENABLED: "true"
+    FILE_HUB_REDIS_ADDRESS: redis://redis:6379
+    FILE_HUB_ADMIN_USER: ${FILE_HUB_ADMIN_USER:-admin}
+    FILE_HUB_ADMIN_PASSWORD: ${FILE_HUB_ADMIN_PASSWORD:-}
+    FILE_HUB_LOG_LEVEL: info
+    SERVER_PORT: 8081
+    TZ: Asia/Shanghai
+  volumes:
+    - file-data:/data
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请先设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: file_hub
+      MYSQL_USER: filehub
+      MYSQL_PASSWORD: ${MYSQL_APP_PASSWORD:?请先设置 MYSQL_APP_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./src/main/resources/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app1:
+    <<: *app
+    ports:
+      - "8081:8081"
+
+  app2:
+    <<: *app
+    ports:
+      - "8082:8081"
+
+volumes:
+  mysql-data:
+  redis-data:
+  # 两个实例必须挂同一个卷；换成 NFS/SMB 时也要保证原子 rename
+  file-data:

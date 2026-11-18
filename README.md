@@ -1,7 +1,7 @@
 # file-hub
 
 一个自己实现存储层的文件服务：**分片上传 / 秒传 / 断点续传 / 分片级校验与自动补传**，
-外加一个 Vue 3 + Vite 的可视化传输工作台。
+外加一个 Vue 3 + Vite 的可视化传输工作台，以及**按账号隔离的鉴权与限流**。
 
 和"调一个 OSS SDK 把文件传上去"不同，这个项目把对象存储那一层的语义自己写了一遍——
 内容寻址、分片状态、合并的原子性、并发去重——所以它替换掉本地磁盘实现就能接 OSS/MinIO，
@@ -9,6 +9,8 @@
 
 前端构建产物直接打进 `src/main/resources/static/`，**一个 jar + 一个静态工作台**，
 不需要额外起 Node 服务；原来的单页演示保留在 `/classic.html`。
+运维侧带 Dockerfile / compose（单机与双实例）、Actuator + Prometheus 指标、
+请求 ID 与 JSON 日志、OpenAPI 文档，见下文「运维」和「Docker 一键启动」。
 
 > **关于 AI 辅助研发**
 > 本项目的代码由 Claude Code 按我给出的设计约束生成，我在其基础上逐文件阅读、调试、
@@ -44,6 +46,9 @@
      │  ⑥ 30005 坏片 → 只补坏片（最多 2 轮自愈）；下载支持 HTTP Range
      ▼
   ┌──────────────────────────────────────────────┐
+  │  Spring Security + Bearer Token + 限流        │
+  │  （/api/** 需登录；ADMIN 可跨用户扫描）       │
+  ├──────────────────────────────────────────────┤
   │  FileController      Result<T> 统一返回       │
   ├──────────────────────────────────────────────┤
   │  FileStorageService  秒传 / 幂等 / 完整性校验 │
@@ -182,11 +187,18 @@ WHERE file_id = #{fileId} AND status = 0
 
 ### 13. Range 下载：断点续传不只是上传
 
-`GET /api/file/{id}/download` 支持单段 `Range: bytes=start-end`，返回 **206** +
-`Content-Range` + `Accept-Ranges: bytes` + `ETag`（内容哈希）。
-不可满足的范围返回 **416** + `bytes */size`；多段 Range 按 RFC 允许直接回整文件，
-因为 multipart/byteranges 的收益不足以抵消实现复杂度。
-响应体用 `BoundedInputStream` 卡住剩余字节数，读完即 EOF，不会把整个文件塞进内存。
+`GET /api/file/{id}/download` 支持 `Range`：
+
+- **单段** `bytes=start-end`：**206** + `Content-Range` + `Accept-Ranges: bytes` + `ETag`
+  （内容哈希）；用 `FileChannel.position()` 直接定位，不会从文件头开始空读。
+- **多段** `bytes=0-99,1000-1099`：**206** + `Content-Type: multipart/byteranges; boundary=…`，
+  每段带自己的 `Content-Range`，`Content-Length` 在发送前精确算出（不依赖 chunked）。
+  上限是 8 段、总计 64MB，超限或语法非法统一回 **416** + `bytes */size`，
+  不会「悄悄回退成整文件」——那会让客户端按 206 解析却收到 200 的语义。
+- 多段响应由 `SequenceInputStream` 流式拼出，打开失败时会关闭已经打开的流；
+  单个文件依然只读取请求区间，不会整个进内存。
+
+响应体用 `BoundedInputStream` 卡住剩余字节数，读完即 EOF。
 
 ### 14. 过期任务清理：判据是 update_time，删除要带条件
 
@@ -223,8 +235,10 @@ WHERE id = #{id} AND status = 0
   的同时，秒传刚好插入一条指向同一物理文件的新记录；
 - 锁按 key 哈希到 256 个槽位，不为每个任务建一个锁对象，避免任务多了以后锁无限增长。
 
-必须强调：这是**进程内锁**，只在单实例部署下完整成立。多实例时要用 Redis 锁 / 数据库行锁，
-或者把分片的读写都收敛到同一台机器（按 `fileId` 路由）。
+必须强调：`FileLockRegistry` 是**进程内锁**，只在单实例部署下完整成立。多实例时把
+`file-hub.cluster.enabled` 打开，换成 `RedisLockRegistry`（Redisson `RReadWriteLock`），
+所有锁点、key 和语义都不变，只是从 JVM 内换成了跨 JVM 的 Redis 锁。Redis 异常时业务明确失败，
+不会退回本地锁。
 
 一个容易踩的细节：**不能在锁里包 `@Transactional` 再在方法返回时释放锁**。
 Spring 的事务提交发生在方法返回之后，锁已经放了、事务还没提交，第二个线程会读到旧状态。
@@ -281,6 +295,175 @@ UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 老库不用重建表：`scripts/migrate-v3-indexes.sql` 会先查 `information_schema.statistics`，
 只在索引缺失时 `ALTER TABLE`，重复执行不会报错。
 
+### 文件名搜索为什么用全文索引
+
+`LIKE '%关键词%'` 用不上 B+Tree，文件名一多就是全表扫描。MySQL 8 内置的 ngram 解析器
+能把中文切成二元组，所以 `file_info.file_name` 上建了
+`FULLTEXT KEY ft_file_name (file_name) WITH PARSER ngram`。`list` 的关键词分支：
+
+| 关键词 | 走法 |
+|---|---|
+| 完整 64 位十六进制 | `file_hash = ?` 精确命中（它就是 SHA-256） |
+| ≥ 2 个字符 | `MATCH(file_name) AGAINST(? IN NATURAL LANGUAGE MODE)`，OR `file_id`/`file_hash` 的 LIKE（方便按短标识搜） |
+| 1 个字符 | ngram 最小分词长度是 2，直接查不到，回退 `file_name LIKE` |
+
+老库执行 `scripts/migrate-v5-fulltext.sql`（幂等）。注意：
+
+- 需要 **MySQL 8**；5.7 没有 ngram parser。
+- 大表上建全文索引会重建索引，可能阻塞写入，建议低峰执行。
+- `MATCH` 和 `LIKE` 用 OR 组合时，MySQL 优化器不保证一定选全文索引；纯文件名关键词通常能命中，
+  极短/极泛的关键词仍可能退化成扫描。这是「既要全文又要按 fileId 前缀搜」的取舍。
+
+---
+
+## 多用户与鉴权（v4）
+
+- **不透明 Token，不是 JWT**：登录成功发一个 32 字节随机串（Base64URL），数据库只存它的
+  SHA-256。Token 可以随时在服务端撤销、7 天自动过期；即使库泄露也拿不到可用的原始 Token。
+- **账号级文件隔离**：`file_info.owner_id` 标记归属。普通用户的 list / check / status / download /
+  delete 都只作用于自己的记录；访问别人的 `fileId` 统一返回 `10005`，不暴露「文件是否存在」。
+  物理去重仍然是全局的：B 对 A 传过的同内容文件秒传时，会拿到**属于 B 的新 fileId**，
+  不会复用 A 的记录。
+- **旧数据**：`owner_id IS NULL` 的历史文件只有 ADMIN 可见。管理员默认列表是「自己的 + 旧数据」，
+  传 `scope=all` 可以看全站；不会在迁移里猜一个所有者。
+- **下载票据**：浏览器的 `<a href>` 没法带 `Authorization` 头，所以前端先调
+  `GET /api/file/{id}/download-ticket` 换一张 5 分钟、绑定 file + user 的票据，再用
+  `?ticket=…` 下载。票据同样只存哈希；curl/脚本仍可直接带 Bearer。
+- **限流**：Spring MVC Interceptor 在鉴权之后执行。登录/注册按 IP，其他接口按用户；
+  固定窗口计数（默认登录 10 次/分/IP、分片 2400 次/分/用户）。超限返回真实 HTTP 429 +
+  `Retry-After` + 业务码 `40002`，前端会当作可重试。默认不信任 `X-Forwarded-For`，
+  只有放在可信代理后面才打开。
+- **管理员初始化**：启动时若设置了 `FILE_HUB_ADMIN_PASSWORD`（至少 8 个字符），
+  会创建/提升 `FILE_HUB_ADMIN_USER`（默认 `admin`）为 ADMIN；密码不落盘、不打印。
+
+鉴权错误用真实的 HTTP 状态码（401/403/429），但响应体仍然是统一的
+`{code,msg,data}`，前端只需判断 HTTP 状态即可清理会话。
+
+---
+
+## 管理员完整性扫描与修复（v5）
+
+数据库是索引、磁盘才是事实，所以磁盘被外部误删/改坏的记录迟早会和库对不上。管理员入口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/admin/integrity/scan?deep=false&limit=100` | 扫描 DONE 记录；`deep=true` 额外流式复算 SHA-256 |
+| POST | `/api/admin/integrity/repair` | `{fileIds:[...]}`，删除**复检确认损坏**的逻辑记录 |
+
+- 扫描按 `storage_path` 缓存结论：秒传共享的同一物理文件只 stat/读一次，但每条受影响的
+  逻辑记录都会列出来，因为修复是按行删的。
+- 浅扫描只查「存在 + 大小」，一次 stat 就能判断，适合大范围巡检；深扫描能发现「大小没变、
+  内容被改坏」的静默损坏，代价是把文件全部读一遍。
+- 修复前**重新检查**：从扫描到点修复之间文件可能被恢复、记录可能已被删。只有复检仍损坏才
+  调删除；物理文件仍遵守引用计数，最后一个引用消失才真删盘。
+- 普通用户访问 `/api/admin/**` 返回 403；Vue 工作台只有 ADMIN 能看到顶部「完整性」按钮。
+
+---
+
+## 多实例部署（v5：共享目录 + Redis 分布式锁）
+
+默认 `file-hub.cluster.enabled=false`：分片锁是 JVM 内的分段读写锁，限流是 Caffeine，
+**不需要 Redis**，行为和之前的单机版完全一致。
+
+打开 `file-hub.cluster.enabled=true` 后，锁和限流同时切到 Redis：
+
+- **分布式锁**：Redisson `RReadWriteLock`，key 为 `filehub:lock:<原来的 key>`（fileId /
+  `content:<hash>:<size>` / `cleanup:scheduler` / `gc:physical`）。`lock()` 不设固定租期，
+  由 watchdog 自动续期——合并大文件可能远超任意固定租期。Redis 不可用时抛 `20008` 明确失败，
+  **不会静默退回本地锁**（否则两个实例会同时写同一份物理文件）。
+- **限流**：Lua 脚本把 `INCR` 和 `PEXPIRE` 放在一次调用里，登录按 IP、上传按用户，
+  两个实例共享同一份计数；Redis 故障返回 HTTP 503 + `50003`，同样不静默放行。
+- **清理抢主**：定时清理外层 `tryWrite("cleanup:scheduler")`，抢不到锁的实例直接跳过。
+  孤儿成品 GC 与「秒传插入 / 合并去重复用」通过 `gc:physical` 读写锁互斥，锁顺序固定为
+  file/content → gc。
+- **共享目录**：所有实例的 `file-hub.root` 必须指向同一个**支持原子 rename、mtime 一致**的
+  目录（NFS/SMB 请先在目标环境验证）。分片、合并临时文件、成品都在共享盘上，任一实例都能
+  查询和下载另一个实例写入的分片/成品。
+- **会话**：Token 存数据库，注册/登录在任何节点都有效，不需要粘性会话。
+
+两个实例的启动方式（同一个 MySQL、同一个 root、同一个 Redis）：
+
+```bash
+export MYSQL_PWD=你的口令
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar \
+  --server.port=8081 \
+  --file-hub.root=/shared/file-hub-data \
+  --file-hub.cluster.enabled=true \
+  --file-hub.cluster.redis-address=redis://127.0.0.1:6379
+
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar \
+  --server.port=8082 \
+  --file-hub.root=/shared/file-hub-data \
+  --file-hub.cluster.enabled=true \
+  --file-hub.cluster.redis-address=redis://127.0.0.1:6379
+```
+
+---
+
+## 运维：健康检查、指标、日志、接口文档（v6）
+
+| 端点 | 权限 | 说明 |
+|---|---|---|
+| `GET /actuator/health` | 公开 | 汇总健康状态；`storage` 检查 root 可写、集群模式下 Redis 可连 |
+| `GET /actuator/health/liveness` / `readiness` | 公开 | 容器探针 |
+| `GET /actuator/metrics`、`/actuator/prometheus` | ADMIN | Micrometer 指标（Prometheus 文本格式） |
+| `GET /swagger-ui.html`、`/v3/api-docs` | 公开（演示） | OpenAPI 文档；生产建议只放内网或改成 ADMIN |
+| `GET /actuator/info` | 公开 | 应用名 / 版本 |
+
+业务指标都在 `filehub.*` 命名空间下：
+
+- `filehub.upload.instant_hits`、`instant_bytes`：秒传命中次数，以及“省下”的字节数；
+- `filehub.chunk.saved`、`chunk.bytes`：成功落盘的分片数与字节数；
+- `filehub.upload.completed`、`merge_bytes`、`merge_duration`：合并成功与耗时；
+- `filehub.upload.merge_failed{code=…}`：按业务码区分（缺片 30001 / 摘要不符 30003 / 坏片 30005）；
+- `filehub.cleanup.*`、`filehub.rate_limit.rejected{scope}`：清理回收数量、限流拒绝次数。
+
+```bash
+curl -s http://127.0.0.1:8081/actuator/health
+TOKEN=<管理员 Token>
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/actuator/prometheus | head
+```
+
+日志与链路：
+
+- 每个请求都有 `X-Request-Id`：调用方传的合规 ID 会复用，否则服务端生成；同一值回写响应头。
+  控制台格式里是 `rid=…`，JSON 格式里是 `requestId` 字段。ID 只接受 1–64 位
+  `[A-Za-z0-9._-]`，避免往日志里注入换行。
+- `traceId` / `spanId` 由 Micrometer Tracing (Brave) 生成并写入 MDC；当前没有配置 exporter，
+  只在本地做日志关联，不往外部发送。
+- 默认是人读的 console 格式；需要一行一条 JSON 时用 `--spring.profiles.active=json`
+  （容器里设 `SPRING_PROFILES_ACTIVE=json`）。
+- 日志不记录 `Authorization`、Token、下载票据；RequestIdFilter 在 Spring Security 之前执行，
+  401/403/429 的响应也带同一个请求 ID。
+
+## Docker 一键启动（v6）
+
+单机（MySQL 8 + Redis 7 + app，数据都在命名卷里）：
+
+```bash
+export MYSQL_ROOT_PASSWORD='MySQL root 口令（只给 healthcheck 用）'
+export MYSQL_APP_PASSWORD='应用连库口令'
+export FILE_HUB_ADMIN_PASSWORD='管理员初始口令'
+docker compose up --build
+# → http://127.0.0.1:8081
+```
+
+应用**不用 root 连库**：MySQL 官方镜像会用 `MYSQL_USER` / `MYSQL_PASSWORD` 创建
+`filehub` 用户并只授权到 `file_hub` 库。三个口令都只从环境变量注入。
+
+多实例（8081/8082 两个 app，共用一个 MySQL、一个 Redis、一份 `file-data` 共享卷）：
+
+```bash
+docker compose -f docker-compose.cluster.yml up --build
+```
+
+- 镜像多阶段构建：Maven 阶段 `package -DskipTests`，运行阶段用 JRE + 非 root 用户，
+  存储根目录固定为 `/data` 卷。
+- 两个口令只从环境变量注入，compose 文件里没有明文；数据库端口没有映射到宿主机。
+- `schema.sql` 里含 `DROP TABLE IF EXISTS`，但只会在 MySQL 首次初始化**空数据卷**时执行一次；
+  已有数据请用 `scripts/migrate-v*.sql`，不要删卷重来。
+- 前端产物已经提交在 `src/main/resources/static`，镜像里不需要再跑 npm。
+
 ---
 
 ## 跑起来
@@ -293,43 +476,95 @@ mysql -uroot -p < src/main/resources/schema.sql
 mysql -uroot -p < scripts/migrate-v2-chunk-hash.sql
 #    已经跑过 v2 的库，补列表/清理用的两个索引（同样幂等）：
 mysql -uroot -p < scripts/migrate-v3-indexes.sql
+#    已经跑过 v3 的库，补用户/会话/票据表和 owner_id（同样幂等）：
+mysql -uroot -p < scripts/migrate-v4-auth.sql
+#    已经跑过 v4 的库，补文件名 ngram 全文索引（需要 MySQL 8，同样幂等）：
+mysql -uroot -p < scripts/migrate-v5-fulltext.sql
 
 # 2. 数据库口令走环境变量，不落盘（application.yml 里写的是 ${MYSQL_PWD}）
 export MYSQL_PWD=你的口令
 
 # 3. 起服务（静态工作台已经打进 jar，不需要单独起前端）
 mvn clean package -DskipTests
+# 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
+export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
 java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.0.jar
-# → http://127.0.0.1:8081         Vue 工作台
-# → http://127.0.0.1:8081/classic.html   原始单页演示
+# → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
+# → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
+```
+
+curl 调用需要先拿 Token：
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8081/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"filehub-demo-pass"}' | python -c \
+  'import sys,json; print(json.load(sys.stdin)["data"]["token"])')
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8081/api/file/list?page=1&size=10"
 ```
 
 ### 改前端
 
 ```bash
 cd web
-npm install          # 只有改前端时才需要
+npm ci               # 按 package-lock.json 安装
 npm run dev          # Vite dev server，/api 代理到 127.0.0.1:8081
 npm run build        # 产物直接写进 ../src/main/resources/static/
+npm run lint         # ESLint 9+ flat config（Vue recommended + Prettier 关格式冲突）
+npm run format:check # Prettier：单引号、无分号、printWidth 100
+npm run test:unit    # Vitest + Vue Test Utils + jsdom
+npm run test:e2e     # Playwright（需要后端已在 8081 启动）
 ```
 
 `vite.config.js` 里 `build.outDir` 指向 Spring Boot 的静态目录，并且 `emptyOutDir: true`；
-原始演示放在 `web/public/classic.html`，构建时会原样复制过去。
+原始演示放在 `web/public/classic.html`，构建时会原样复制过去。`test` 配置也在同一个文件里
+（`environment: 'jsdom'`、`src/test/setup.js` 每个用例清空 localStorage）。
+
+浏览器 E2E 默认用 Playwright 自带的 Chromium：
+
+```bash
+cd web
+npx playwright install chromium     # 首次需要
+npm run test:e2e
+```
+
+本机已装 Edge/Chrome 时可以用环境变量复用，省掉下载：
+`PLAYWRIGHT_CHANNEL=msedge npm run test:e2e`。后端地址用 `PLAYWRIGHT_BASE_URL` 覆盖，
+默认 `http://127.0.0.1:8081`。管理员用例需要启动服务时同样设置
+`FILE_HUB_ADMIN_USER` / `FILE_HUB_ADMIN_PASSWORD`，否则自动跳过。
+
+单元测试覆盖：SHA-256 与 Node `crypto` 对齐（含 55/56/63/64 字节边界和不等长分块）、
+格式化边界、API 的 Bearer/401 清会话/429 可重试/超时/非 JSON、认证状态与订阅、
+localStorage 按用户隔离、任务卡进度 aria、文件表搜索/分页/筛选，以及登录表单校验。
+浏览器用例覆盖注册 → 刷新保持登录 → 退出 → 重新登录、错误密码提示、
+上传小文件 → 列表刷新 → 搜索 → 票据下载 → 二次确认删除。
 
 ### 主要接口
 
+除 `/api/auth/login`、`/api/auth/register`、`/api/file/config` 和静态资源外，
+`/api/**` 都需要 `Authorization: Bearer <token>`。下载接口额外接受 `?ticket=`。
+
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/api/file/config` | 分片大小、存储后端标识 |
-| GET | `/api/file/check?hash=&size=` | 秒传预检 |
+| POST | `/api/auth/register` | 注册并直接返回 Token（可用 `allow-registration=false` 关闭） |
+| POST | `/api/auth/login` | 登录，返回 Token + 用户信息 |
+| GET | `/api/auth/me` | 当前用户与角色 |
+| POST | `/api/auth/logout` | 撤销当前 Token，幂等 |
+| GET | `/api/file/config` | 分片大小、存储后端标识（公开） |
+| GET | `/api/file/check?hash=&size=` | 秒传预检（只在当前用户可见范围内找） |
 | POST | `/api/file/init` | 秒传 / 复用上传中任务 / 新建，返回已传分片 |
 | POST | `/api/file/chunk` | `fileId` + `index` + 可选 `chunkHash` + 分片 |
 | GET | `/api/file/{id}/status` | 以磁盘为准的已传分片（断点续传对齐） |
 | POST | `/api/file/{id}/complete` | 逐片 + 整文件校验、流式合并（30005 表示坏片已剔除） |
-| GET | `/api/file/list?page=&size=&keyword=&status=&sort=` | 分页文件列表（`items` + `total`），支持搜索/过滤/排序；`size` 上限 100 |
-| GET | `/api/file/stats` | 秒传节省统计 |
-| GET | `/api/file/{id}/download` | 流式下载，支持单段 `Range` |
-| DELETE | `/api/file/{id}` | 删除逻辑记录，最后一个引用才删物理文件 |
+| GET | `/api/file/list?page=&size=&keyword=&status=&sort=&scope=` | 分页文件列表（`items` + `total`）；ADMIN 可用 `scope=all` |
+| GET | `/api/file/stats?scope=` | 秒传节省统计；统计口径随账号隔离 |
+| GET | `/api/file/{id}/download-ticket` | 换取 5 分钟下载票据（浏览器用） |
+| GET | `/api/file/{id}/download` | 流式下载，支持单段/多段 `Range`；Bearer 或 `?ticket=` |
+| DELETE | `/api/file/{id}` | 删除自己的逻辑记录，最后一个引用才删物理文件 |
+| GET | `/api/admin/integrity/scan?deep=&limit=` | ADMIN：扫描损坏文件（存在性/大小，可选 SHA-256 复算） |
+| POST | `/api/admin/integrity/repair` | ADMIN：`{fileIds}` 删除复检确认损坏的记录；普通用户 403 |
 
 Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志会按 GBK 处理中文。
 
@@ -338,39 +573,80 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 | `file-hub.root` | `D:/Projects/file-hub-data` | 存储根目录 |
 | `file-hub.chunk-size` | 5MB | 分片大小，前端按它切片（服务端会校验取值范围） |
 | `file-hub.orphan-file-grace-hours` | 168（7 天） | 无任何数据库记录引用的成品文件，超过这个时长才回收 |
+| `file-hub.auth.token-ttl-hours` | 168 | 登录 Token 有效期 |
+| `file-hub.auth.ticket-ttl-minutes` | 5 | 下载票据有效期 |
+| `file-hub.auth.allow-registration` | true | 是否开放自助注册 |
+| `file-hub.cluster.enabled` | false | 开启后锁和限流切到 Redis（多实例） |
+| `file-hub.cluster.redis-address` | `redis://127.0.0.1:6379` | 集群模式的 Redis 地址 |
+| `file-hub.cluster.redis-database` | 0 | Redis database |
+| `file-hub.cluster.key-prefix` | `filehub:` | 锁和限流 key 的统一前缀 |
+| `file-hub.rate-limit.*` | 见 `application.yml` | 登录/注册/init/chunk/其他接口的固定窗口限额 |
+| `MYSQL_URL`（环境变量） | 本机 3306 | 覆盖 JDBC URL；容器里指向 `mysql:3306` |
+| `FILE_HUB_ROOT`（环境变量） | `file-hub.root` | 容器/共享目录部署时用，如 `/data` |
+| `SERVER_PORT`（环境变量） | 8081 | 容器内监听端口 |
+| `FILE_HUB_LOG_LEVEL`（环境变量） | debug | 生产/容器设 `info` 降噪 |
+| `SPRING_PROFILES_ACTIVE=json` | 未启用 | 输出单行 JSON 日志（含 traceId/spanId/requestId） |
+| `management.endpoints.web.exposure.include` | health,info,metrics,prometheus | Actuator 暴露的端点 |
 | `spring.servlet.multipart.max-file-size` | 6MB | 单分片上限，只比分片大小大 1MB；改 `chunk-size` 时同步调整 |
 
 ### 验证
 
 ```bash
-mvn test                      # 37 个单元测试（分片校验、并发锁、迟到分片回滚、
-                              # 条件清理、孤儿目录/孤儿成品、分片数溢出）
-bash scripts/e2e-test.sh      # 端到端验收（真传 120MB，逐项断言）
+mvn test                      # 93 个单元测试（分片校验、并发锁、认证/Token/票据、限流、多段 Range、完整性扫描、请求 ID/健康检查）
+cd web && npm run lint && npm run format:check && npm run test:unit && npm run build
+                              # 前端：68 个单元/组件测试 + 生产构建
+bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB，逐项断言，含跨用户隔离）
+bash scripts/e2e-cluster.sh   # 多实例验收（两个 JVM + 共享目录 + Redis）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 ```
 
-单元测试不需要 MySQL；E2E 需要一个已建库的 MySQL 和服务端。E2E 结束时会删掉自己留下的
-「上传中」任务，可以重复执行。
+`e2e-cluster.sh` 默认连接 `127.0.0.1:8081` / `8082`，共享目录由 `FILE_HUB_ROOT` 传入。
+它会验证：跨节点会话、分片交替写入、跨节点合并/下载、跨节点秒传、并发 complete、
+引用计数删除，以及两个节点共享同一份登录限流计数。
+
+单元测试不需要 MySQL；E2E 需要一个已建库的 MySQL 和服务端，并会注册两个随机用户做租户隔离用例。
+设置 `FILE_HUB_ADMIN_PASSWORD`（启动服务时同一环境变量）还会验证管理员 `scope=all`、完整性扫描/
+修复和普通用户 403；不设置则跳过这些用例。E2E 结束时会删掉自己留下的上传中任务，可以重复执行。
+全文索引用例需要先执行 `scripts/migrate-v5-fulltext.sql`。
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 上跑三个任务：
+`.github/workflows/ci.yml` 在每次 push / PR 上跑五个任务：
 
 1. `mvn test`；
-2. 前端 `npm ci && npm run build`（确认 Vue 模板和 Worker 都能过编译）；
-3. 起一个 MySQL 8.0 service，导入 `schema.sql`，用临时存储目录启动 jar，
-   再跑完整的 `scripts/e2e-test.sh`。
+2. 前端 `npm ci && npm run lint && npm run format:check && npm run test:unit && npm run build`
+   （ESLint/Prettier 零容忍，Vitest 全绿，Vue 模板和 Worker 都能过编译）；
+3. 起 MySQL 8.0 service，导入 `schema.sql`，构建前端后打包，用临时存储目录和一次性管理员口令
+   启动 jar，安装 Playwright Chromium，跑 `web/e2e` 的浏览器用例（登录/刷新恢复/退出、
+   上传→列表→搜索→下载→删除、管理员身份）；失败时上传 trace/HTML 报告；
+4. 起一个 MySQL 8.0 service，导入 `schema.sql`，用临时存储目录和一次性管理员口令启动 jar，
+   再跑完整的 `scripts/e2e-test.sh`（注册/登录、跨用户隔离、票据下载、限流错误码都在里面）；
+5. 起 MySQL + Redis 7 service，同时启动 8081/8082 两个 JVM（同一数据库、同一共享目录、
+   `cluster.enabled=true`），跑 `scripts/e2e-cluster.sh`（跨节点上传/合并/秒传/并发完成/共享限流）。
 
-CI 里的 MySQL 口令是一次性容器口令，不是任何真实环境的口令。
+CI 里的 MySQL 口令和 `FILE_HUB_ADMIN_PASSWORD` 都是一次性容器值，不是任何真实环境的口令。
 
 > `e2e-test.sh` 在 v1 的 25 项基础上补了分片摘要拒绝（30004）、合并时坏片自愈（30005）、
-> `/status`、`/stats`、Range 下载和分页/搜索/状态过滤的断言。**2026-11-18 已在真实
-> MySQL 8.0.45 上跑通：51 项断言全部通过**（临时实例、端口 3307、独立存储目录，
-> 未动本机 3306 的库）；P0 并发修复、P1–P3 加固后又各复跑一次，仍为 51/51。
-> 脚本会清理自己留下的上传中任务，连续跑两遍不会互相污染。
+> `/status`、`/stats`、单段/多段 Range、中文全文搜索、管理员完整性扫描/修复、分页/状态过滤，
+> 以及 Actuator health/metrics 的鉴权、`X-Request-Id` 回传和 OpenAPI 可读性。
+> **2026-11-18 已在真实 MySQL 8.0.45 上跑通：101 项断言全部通过**（临时实例、端口 3307、
+> 独立存储目录，未动本机 3306 的库）；脚本会清理自己留下的上传中任务，连续跑两遍不会互相污染。
 > 另外手工验证了「并发 complete 只合并一次、两个请求都返回成功」、老分片摘要回填、
 > 任务完成后迟到分片不重建目录，以及真实定时清理的条件删除和孤儿目录回收。
 > 跑它需要一个已建库的环境，且脚本和服务端在同一台机器上（坏片用例要直接改磁盘分片）。
+
+Phase 3 的运维端点也在同一个实例上手工验证过（2026-11-18）：
+
+- `/actuator/health` 200；管理员看到的 `storage` 组件含 root 路径，单机模式 `redis=disabled`；
+- 管理员 `/actuator/prometheus`、`/actuator/metrics` 200；不带 Token 返回 401（业务码 40001）；
+- `/v3/api-docs` 200，`/swagger-ui.html` 302 到 `/swagger-ui/index.html`；
+- 带 `X-Request-Id: verify-123` 的登录请求，响应头原样回传，日志行是
+  `rid=verify-123 trace=<32 hex>`；
+- 走完一次单分片小文件上传后，Prometheus 里出现
+  `filehub_chunk_saved_total`、`filehub_upload_completed_total`、`filehub_upload_merge_duration_seconds`；
+- `--spring.profiles.active=json` 时输出单行 JSON，含 `requestId` / `traceId` / `spanId`。
+- **Docker Desktop 当时没有运行**：`docker compose config` 对两个 compose 文件语法校验通过，
+  但 `docker compose up --build` 没有在本机实际跑过；有 Docker 的环境请按上面的命令验证。
 
 ---
 
@@ -380,19 +656,20 @@ CI 里的 MySQL 口令是一次性容器口令，不是任何真实环境的口�
 
 | 文件大小 | 分片数 | 分片上传 | 服务端合并 | 合计 | 端到端吞吐 |
 |---|---|---|---|---|---|
-| 300 MB | 60 | 3.07 s | 1.35 s | 4.43 s | **67.8 MB/s** |
-| 1000 MB | 200 | 10.02 s | 4.67 s | 14.69 s | **68.1 MB/s** |
+| 300 MB | 60 | 8.80 s | 2.70 s | 11.50 s | **26.1 MB/s** |
+| 1000 MB | 200 | 37.05 s | 9.16 s | 46.21 s | **21.6 MB/s** |
+
+（2026-11-18 重跑；v2 的合并阶段要逐片复算 SHA-256，比 v1 的纯拼接慢。）
 
 - 两次下载回来的文件 SHA-256 与原文件**完全一致**——这是"分片拼对了"的唯一硬证据。
-- 秒传：**服务端单次约 10 ms**；客户端观感 552 ms，其中约 150 ms 是 Windows 上
-  两次 `curl.exe` 进程启动的开销（实测纯 curl 往返约 75 ms/次，服务端处理约 5 ms）。
+- 秒传：**服务端单次约 21–23 ms**（20 次连续请求摊掉进程启动）；客户端观感 617–810 ms，
+  大头是 Windows 上两次 `curl.exe` 进程启动加一次 check + init 往返。
 - 1GB 的文件走秒传，**传输量为 0**（200 个分片全部不用传）。
 
-> 吞吐 68 MB/s 的量级说明：瓶颈基本在本机磁盘 IO 和 sha256sum/curl 这些客户端进程上，
-> 不是服务端逻辑。这个数字的意义是"链路是通的、没有明显瓶颈"，不是"性能上限"。
->
-> 这组数据是 v1（合并时只算整文件摘要）测的。v2 在合并时多算一次逐片 SHA-256，
-> 但和整文件摘要共用同一次磁盘读，理论开销主要多的是 CPU 摘要计算，没有重新跑基准。
+> 吞吐 20–26 MB/s 的量级说明：瓶颈基本在本机磁盘 IO、逐片/整文件两次 SHA-256，
+> 以及 `curl.exe`/`sha256sum` 这些客户端进程上，不是服务端业务逻辑。
+> 这个数字的意义是"链路是通的、没有明显瓶颈"，不是"性能上限"。
+> 基准脚本每次运行会注册独立用户并清理自己产生的记录。
 
 ---
 
@@ -404,22 +681,39 @@ CI 里的 MySQL 口令是一次性容器口令，不是任何真实环境的口�
   界面提示重新计算，不会静默传坏文件。
 - **刷新页面不会自动续传**：浏览器拿不到刷新前的 `File` 对象，需要用户重新选择同名、同大小、
   同修改时间的文件，前端用指纹（name + size + lastModified）对上本地断点记录后再续传。
-- **单实例**：分片落本地磁盘，多实例部署时 `init` 和 `chunk` 可能落到不同机器上就找不到分片了。
-  并发一致性用的 `FileLockRegistry` 也是进程内锁，只在单 JVM 下有效。
-  要水平扩展得把分片也放到共享存储（OSS/S3）、按 `fileId` 做一致性哈希路由，
-  并把进程内锁换成 Redis/数据库锁。
-- **没有做认证**：任何能访问到接口的人都能上传/下载/删除。真实系统这里要接鉴权，
-  并且按用户隔离可见性。
-- **没有限流**：单个客户端可以打满磁盘 IO。
-- **Range 只支持单段**：多段 Range 按 RFC 允许的简化路径直接返回整文件，没有实现
-  `multipart/byteranges`。
+- **多实例依赖共享目录和 Redis**：共享目录必须支持原子 rename、mtime 一致（NFS/SMB 的语义
+  要在目标环境实测）；Redis 目前是单点，没有做 Sentinel/Cluster 高可用。Redis 不可用时上传和
+  登录会明确失败（`20008` / HTTP 503），这是刻意的 fail-closed，不是降级。S3/MinIO 仍不在范围内。
+- **Token 存在 localStorage**：实现简单、刷新不掉线，但同源 XSS 能读到它。生产环境更稳妥的是
+  HttpOnly Cookie + CSRF 防护，或配合严格 CSP；当前只做了「退出即撤销 + 7 天过期」。
+- **认证范围有限**：没有找回密码、邮箱验证、OAuth、2FA、登录审计表；限流是固定窗口
+  （单机 Caffeine、多实例 Redis），不是令牌桶/漏桶。
+- **管理员能看旧文件**：`owner_id IS NULL` 的历史数据只对 ADMIN 可见，这是迁移期的兼容策略，
+  不是团队共享空间；不做跨用户共享/协作。
+- **多段 Range 有硬上限**：单次最多 8 段、总长不超过 64 MB，超出直接 416 而不是降级成
+  200 整文件；每段统一按 `application/octet-stream` 输出，没有做按段内容类型协商。
+- **全文索引依赖 MySQL 8 ngram**：1 个字的关键词回退 `LIKE %kw%`（会全表扫），2 字以上才走
+  `MATCH ... AGAINST`；英文/数字短词受 `ngram_token_size`（默认 2）影响，改这个参数要重启
+  并重建索引；大表首次加索引会锁表，应在低峰执行迁移脚本。
 - **端到端脚本依赖本机环境**：坏片自愈用例要直接改服务端磁盘上的分片文件，所以脚本必须和
   服务端同机跑（CI 里就是同 runner）；脚本现在会清理自己留下的「上传中」任务，但成功用例的
-  成品文件仍会留在临时目录里，由 CI 的 runner 自行回收。基准数据仍是 v1 的，v2 多了逐片摘要
-  计算，但没有重跑 `bench.sh`。
+  成品文件仍会留在临时目录里，由 CI 的 runner 自行回收。基准数据已按 v2 重跑，但仍是单机、
+  本机磁盘、客户端和服务器在同一个 Windows 会话里的结果，不代表跨网络或生产硬件的吞吐。
+- **浏览器 E2E 只覆盖单一内核**：Playwright 目前只配了一个项目（本机 `msedge`，CI 用
+  Chromium），Safari/WebKit 和 Firefox 没有跑；上传用例的 Worker 哈希、`AbortSignal.any`
+  等分支在其他内核上的差异没有被自动验证。管理员完整性面板的用例已取消 `fixme` 并在 Edge
+  上跑通（入口可见、扫描摘要渲染），但「删物理文件 → 扫描命中 → 修复」的完整链路只在
+  curl E2E 里覆盖。
 - **清理任务与暂停冲突**：一个任务暂停超过 `upload-expire-minutes` 后被回收，用户再点继续时
   `init` 会新建任务，需要从头传（数据是安全的，只是省不掉重传）。现在的条件删除 + 续传心跳
   保证"刚回来续传却被误删"不会发生，但已经回收的分片找不回来。
+- **观测性只到“本进程”**：指标存在内存里，重启归零；没有接 Prometheus Server/Grafana，
+  tracing 只做本地 MDC 关联（没配 Zipkin exporter），采样率固定 100%。生产要按流量调低采样，
+  并把 `/actuator/prometheus` 交给内网采集器而不是浏览器。
+- **接口文档在演示环境是公开的**：`/swagger-ui.html` 和 `/v3/api-docs` 当前 permitAll，
+  方便面试演示和本地调试；生产应改成仅管理员/内网（`SecurityConfig` 一行）或关掉 swagger。
+- **Docker 只做了静态校验**：本机 Docker Desktop 未运行，`docker compose config` 通过，
+  但镜像构建和 `docker compose up` 没有实际跑过；CI 也没有加 `docker build` 任务。
 
 ---
 
@@ -456,3 +750,20 @@ CI 里的 MySQL 口令是一次性容器口令，不是任何真实环境的口�
 10. 断点续传的状态以数据库还是磁盘为准？
    → 磁盘。`/status` 和合并前的缺片判断都扫磁盘目录；数据库是索引，可能和磁盘不一致。
    见设计取舍第 2、12 条。
+11. 为什么用不透明 Token 而不是 JWT？
+   → JWT 的撤销要额外维护黑名单；这个服务本来就有 MySQL，直接存 SHA-256 会话哈希，
+   撤销就是删一行，过期就是查 `expires_at`，语义最直接。代价是每次请求多一次索引查询，
+   对这个量级可以接受；真要扩展再上 Redis 会话缓存。
+12. 两个用户上传同一个文件，秒传会不会串号？
+   → 不会。`check` 只在自己可见的记录里找；`init` 命中物理去重时，给当前用户新建一条
+   带自己 `owner_id` 的 DONE 记录，返回新的 fileId。物理文件共享，逻辑记录隔离。
+13. 浏览器下载怎么带鉴权？
+   → 先换 5 分钟、绑定 file + user 的票据，再拼 `?ticket=`。票据只存哈希、可过期；
+   `Authorization` 头留给脚本和 curl，两条路径在下载接口汇合后统一做 owner 校验。
+14. 线上有人说"上传卡住了"，你怎么定位？
+   → 先拿响应头的 `X-Request-Id` 在日志里找这一个请求（JSON 日志还有 traceId/spanId，
+   能连起同一请求里的所有事件）；再看 `/actuator/health` 的 `storage`（root 不可写或
+   集群模式 Redis 断了都会直接 DOWN）；然后用 Prometheus 看
+   `filehub_upload_merge_failed{code}` 区分缺片/摘要不符/坏片，看
+   `filehub_upload_merge_duration` 判断是不是合并变慢，看 `filehub_rate_limit_rejected{scope}`
+   排除被限流。指标、日志、health 三条线对应"哪里慢/哪个请求/哪个依赖坏了"。
