@@ -30,7 +30,10 @@ const hasFilters = computed(() => Boolean(state.filePage.keyword) || statusFilte
 function extension(name) {
   const dot = name.lastIndexOf('.')
   if (dot <= 0 || dot === name.length - 1) return 'FILE'
-  return name.slice(dot + 1).slice(0, 4).toUpperCase()
+  return name
+    .slice(dot + 1)
+    .slice(0, 4)
+    .toUpperCase()
 }
 
 async function refresh() {
@@ -127,12 +130,7 @@ function resetFilters() {
       <strong>{{ hasFilters ? '没有匹配的文件' : '还没有文件' }}</strong>
       <span v-if="hasFilters">换个关键字，或者清除筛选条件</span>
       <span v-else>上传第一个文件，或者拖一份大文件试试断点续传</span>
-      <button
-        v-if="hasFilters"
-        class="btn btn-ghost btn-sm"
-        type="button"
-        @click="resetFilters"
-      >
+      <button v-if="hasFilters" class="btn btn-ghost btn-sm" type="button" @click="resetFilters">
         清除筛选
       </button>
     </div>
@@ -488,7 +486,10 @@ tbody tr:hover {
   background: var(--panel-2);
   color: var(--muted);
   cursor: pointer;
-  transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease;
 }
 
 .icon-link:hover {

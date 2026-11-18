@@ -1,5 +1,5 @@
 import { fileURLToPath, URL } from 'node:url'
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
 
 // 开发时：Vite 跑 5173，/api 代理到 Spring Boot 8081
@@ -20,5 +20,12 @@ export default defineConfig({
     emptyOutDir: true,
     assetsDir: 'assets',
     chunkSizeWarningLimit: 900,
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: './src/test/setup.js',
+    include: ['src/**/*.test.js'],
+    restoreMocks: true,
   },
 })

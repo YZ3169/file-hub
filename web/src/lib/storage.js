@@ -1,6 +1,30 @@
-const PENDING_KEY = 'filehub.pendingTasks.v2'
-const HASH_KEY = 'filehub.hashCache.v1'
 const THEME_KEY = 'filehub.theme'
+
+// 断点续传记录与哈希缓存必须按用户隔离：换账号登录时绝不能看到、
+// 更不能复用上一个用户的上传任务 fileId。
+let storageUserId = null
+
+export function setStorageUser(userId) {
+  storageUserId = userId ? String(userId) : null
+}
+
+function pendingKey() {
+  return storageUserId ? `filehub.${storageUserId}.pendingTasks.v3` : null
+}
+
+function hashKey() {
+  return storageUserId ? `filehub.${storageUserId}.hashCache.v2` : null
+}
+
+export function clearUserStorage(userId) {
+  if (!userId) return
+  try {
+    localStorage.removeItem(`filehub.${userId}.pendingTasks.v3`)
+    localStorage.removeItem(`filehub.${userId}.hashCache.v2`)
+  } catch {
+    // ignore
+  }
+}
 
 function readJson(key, fallback) {
   try {
@@ -28,12 +52,13 @@ export function fingerprintOf(file) {
 }
 
 export function loadPendingTasks() {
-  const list = readJson(PENDING_KEY, [])
+  if (!storageUserId) return []
+  const list = readJson(pendingKey(), [])
   return Array.isArray(list) ? list : []
 }
 
 export function savePendingTask(task) {
-  if (!task?.fingerprint) return
+  if (!task?.fingerprint || !storageUserId) return
   const list = loadPendingTasks().filter((t) => t.fingerprint !== task.fingerprint)
   if (task.state !== 'done' && task.state !== 'instant' && task.state !== 'canceled') {
     list.unshift({
@@ -49,12 +74,15 @@ export function savePendingTask(task) {
       updatedAt: Date.now(),
     })
   }
-  writeJson(PENDING_KEY, list.slice(0, 30))
+  writeJson(pendingKey(), list.slice(0, 30))
 }
 
 export function removePendingTask(fingerprint) {
-  if (!fingerprint) return
-  writeJson(PENDING_KEY, loadPendingTasks().filter((t) => t.fingerprint !== fingerprint))
+  if (!fingerprint || !storageUserId) return
+  writeJson(
+    pendingKey(),
+    loadPendingTasks().filter((t) => t.fingerprint !== fingerprint),
+  )
 }
 
 export function findPendingTask(fingerprint) {
@@ -62,24 +90,27 @@ export function findPendingTask(fingerprint) {
 }
 
 export function getCachedHash(fingerprint) {
-  return readJson(HASH_KEY, {})[fingerprint] || null
+  if (!storageUserId) return null
+  return readJson(hashKey(), {})[fingerprint] || null
 }
 
 export function setCachedHash(fingerprint, hash) {
-  const map = readJson(HASH_KEY, {})
+  if (!storageUserId) return
+  const map = readJson(hashKey(), {})
   map[fingerprint] = hash
   const keys = Object.keys(map)
   if (keys.length > 120) {
     // 简单淘汰：删掉最早写入的键（对象保持插入顺序）
     for (const k of keys.slice(0, keys.length - 100)) delete map[k]
   }
-  writeJson(HASH_KEY, map)
+  writeJson(hashKey(), map)
 }
 
 export function removeCachedHash(fingerprint) {
-  const map = readJson(HASH_KEY, {})
+  if (!storageUserId) return
+  const map = readJson(hashKey(), {})
   delete map[fingerprint]
-  writeJson(HASH_KEY, map)
+  writeJson(hashKey(), map)
 }
 
 export function getTheme() {

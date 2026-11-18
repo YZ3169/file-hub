@@ -62,10 +62,18 @@ const icons = {
   background: var(--panel-2);
 }
 
-.is-success .toast-icon { color: var(--ok); }
-.is-error .toast-icon { color: var(--bad); }
-.is-warn .toast-icon { color: var(--warn); }
-.is-info .toast-icon { color: var(--brand-2); }
+.is-success .toast-icon {
+  color: var(--ok);
+}
+.is-error .toast-icon {
+  color: var(--bad);
+}
+.is-warn .toast-icon {
+  color: var(--warn);
+}
+.is-info .toast-icon {
+  color: var(--brand-2);
+}
 
 .toast-text {
   padding-top: 1px;
@@ -74,7 +82,9 @@ const icons = {
 
 .toast-enter-active,
 .toast-leave-active {
-  transition: opacity 0.22s ease, transform 0.22s ease;
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease;
 }
 
 .toast-enter-from,

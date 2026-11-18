@@ -2,20 +2,8 @@
 import { computed } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import ChunkGrid from './ChunkGrid.vue'
-import {
-  cancelTask,
-  downloadFile,
-  pauseTask,
-  removeTask,
-  resumeTask,
-} from '../stores/uploader'
-import {
-  formatBytes,
-  formatDuration,
-  formatSpeed,
-  percent,
-  shortHash,
-} from '../lib/format'
+import { cancelTask, downloadFile, pauseTask, removeTask, resumeTask } from '../stores/uploader'
+import { formatBytes, formatDuration, formatSpeed, percent, shortHash } from '../lib/format'
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -65,9 +53,7 @@ const isActive = computed(() => ACTIVE.has(props.task.state))
 const isUploading = computed(() => props.task.state === 'uploading')
 const canPause = computed(() => ACTIVE.has(props.task.state) && props.task.state !== 'queued')
 const canResume = computed(() => props.task.state === 'paused' || props.task.state === 'error')
-const canCancel = computed(
-  () => !['done', 'instant', 'canceled'].includes(props.task.state),
-)
+const canCancel = computed(() => !['done', 'instant', 'canceled'].includes(props.task.state))
 const canRemove = computed(() =>
   ['done', 'instant', 'canceled', 'error', 'paused'].includes(props.task.state),
 )
@@ -113,9 +99,7 @@ function download() {
           :stroke-dashoffset="dashOffset"
         />
       </svg>
-      <span class="ring-text">
-        {{ Math.floor(progress) }}<i>%</i>
-      </span>
+      <span class="ring-text"> {{ Math.floor(progress) }}<i>%</i> </span>
     </div>
 
     <div class="task-main">
@@ -135,9 +119,7 @@ function download() {
           <span v-if="task.healRounds" class="mini-badge warn">
             <BaseIcon name="shield" :size="11" /> 自愈 {{ task.healRounds }} 轮
           </span>
-          <span v-if="task.hashFromCache && isActive" class="mini-badge muted">
-            哈希缓存
-          </span>
+          <span v-if="task.hashFromCache && isActive" class="mini-badge muted"> 哈希缓存 </span>
         </div>
         <span class="task-size">{{ formatBytes(task.size) }}</span>
       </header>
@@ -176,7 +158,12 @@ function download() {
           <BaseIcon name="pause" :size="14" />
           暂停
         </button>
-        <button v-if="canResume" class="btn btn-primary btn-sm" type="button" @click="resumeTask(task)">
+        <button
+          v-if="canResume"
+          class="btn btn-primary btn-sm"
+          type="button"
+          @click="resumeTask(task)"
+        >
           <BaseIcon name="play" :size="14" />
           {{ task.state === 'error' ? '重试' : '继续' }}
         </button>
@@ -226,7 +213,9 @@ function download() {
   background: var(--panel);
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(var(--blur));
-  transition: border-color 0.2s ease, transform 0.2s ease;
+  transition:
+    border-color 0.2s ease,
+    transform 0.2s ease;
 }
 
 .task-card.active {
@@ -262,7 +251,9 @@ function download() {
   stroke: var(--ring-color, var(--brand));
   stroke-width: 5;
   stroke-linecap: round;
-  transition: stroke-dashoffset 0.4s ease, stroke 0.3s ease;
+  transition:
+    stroke-dashoffset 0.4s ease,
+    stroke 0.3s ease;
   filter: drop-shadow(0 0 5px var(--ring-glow, rgba(109, 93, 252, 0.45)));
 }
 
@@ -354,10 +345,21 @@ function download() {
   white-space: nowrap;
 }
 
-.mini-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
-.mini-badge.cyan { color: var(--brand-2); border-color: color-mix(in srgb, var(--brand-2) 35%, transparent); }
-.mini-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
-.mini-badge.muted { color: var(--muted-2); }
+.mini-badge.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+}
+.mini-badge.cyan {
+  color: var(--brand-2);
+  border-color: color-mix(in srgb, var(--brand-2) 35%, transparent);
+}
+.mini-badge.warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.mini-badge.muted {
+  color: var(--muted-2);
+}
 
 .task-msg {
   margin: 7px 0 0;
@@ -407,20 +409,52 @@ function download() {
 }
 
 /* 状态色 */
-.tone-muted { --state-color: var(--muted); }
-.tone-violet { --state-color: var(--violet); }
-.tone-cyan { --state-color: var(--brand-2); }
-.tone-brand { --state-color: var(--brand-light); }
-.tone-warn { --state-color: var(--warn); }
-.tone-ok { --state-color: var(--ok); }
-.tone-bad { --state-color: var(--bad); }
+.tone-muted {
+  --state-color: var(--muted);
+}
+.tone-violet {
+  --state-color: var(--violet);
+}
+.tone-cyan {
+  --state-color: var(--brand-2);
+}
+.tone-brand {
+  --state-color: var(--brand-light);
+}
+.tone-warn {
+  --state-color: var(--warn);
+}
+.tone-ok {
+  --state-color: var(--ok);
+}
+.tone-bad {
+  --state-color: var(--bad);
+}
 
-.tone-violet { --ring-color: var(--violet); --ring-glow: rgba(168, 85, 247, 0.45); }
-.tone-cyan { --ring-color: var(--brand-2); --ring-glow: rgba(34, 211, 238, 0.45); }
-.tone-brand { --ring-color: var(--brand-light); --ring-glow: rgba(139, 127, 255, 0.45); }
-.tone-warn { --ring-color: var(--warn); --ring-glow: rgba(251, 191, 36, 0.4); }
-.tone-ok { --ring-color: var(--ok); --ring-glow: rgba(52, 211, 153, 0.45); }
-.tone-bad { --ring-color: var(--bad); --ring-glow: rgba(251, 113, 133, 0.45); }
+.tone-violet {
+  --ring-color: var(--violet);
+  --ring-glow: rgba(168, 85, 247, 0.45);
+}
+.tone-cyan {
+  --ring-color: var(--brand-2);
+  --ring-glow: rgba(34, 211, 238, 0.45);
+}
+.tone-brand {
+  --ring-color: var(--brand-light);
+  --ring-glow: rgba(139, 127, 255, 0.45);
+}
+.tone-warn {
+  --ring-color: var(--warn);
+  --ring-glow: rgba(251, 191, 36, 0.4);
+}
+.tone-ok {
+  --ring-color: var(--ok);
+  --ring-glow: rgba(52, 211, 153, 0.45);
+}
+.tone-bad {
+  --ring-color: var(--bad);
+  --ring-glow: rgba(251, 113, 133, 0.45);
+}
 
 @media (max-width: 640px) {
   .task-card {

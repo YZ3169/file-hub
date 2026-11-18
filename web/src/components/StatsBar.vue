@@ -82,10 +82,18 @@ const cards = computed(() => [
   border: 1px solid var(--border);
 }
 
-.tone-brand .stat-icon { color: var(--brand-light); }
-.tone-cyan .stat-icon { color: var(--brand-2); }
-.tone-violet .stat-icon { color: var(--violet); }
-.tone-green .stat-icon { color: var(--ok); }
+.tone-brand .stat-icon {
+  color: var(--brand-light);
+}
+.tone-cyan .stat-icon {
+  color: var(--brand-2);
+}
+.tone-violet .stat-icon {
+  color: var(--violet);
+}
+.tone-green .stat-icon {
+  color: var(--ok);
+}
 
 .stat-body {
   display: flex;

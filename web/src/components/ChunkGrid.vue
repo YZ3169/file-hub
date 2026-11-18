@@ -77,7 +77,9 @@ const labels = {
   height: 7px;
   border-radius: 2px;
   background: var(--chunk-pending);
-  transition: background 0.25s ease, box-shadow 0.25s ease;
+  transition:
+    background 0.25s ease,
+    box-shadow 0.25s ease;
 }
 
 .chunk.is-done {

@@ -1,3 +1,5 @@
+import { clearSession, getToken } from './auth'
+
 export class ApiError extends Error {
   constructor(code, message, status = 0) {
     super(message)
@@ -66,12 +68,23 @@ function combineSignals(external, timeoutMs) {
 }
 
 async function request(path, options = {}) {
-  const { signal: externalSignal, timeout = DEFAULT_TIMEOUT, ...fetchOptions } = options
+  const {
+    signal: externalSignal,
+    timeout = DEFAULT_TIMEOUT,
+    auth: withAuth = true,
+    ...rest
+  } = options
   const combined = combineSignals(externalSignal, timeout)
+
+  const headers = new Headers(rest.headers || {})
+  if (withAuth) {
+    const token = getToken()
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+  }
 
   let res
   try {
-    res = await fetch(path, { ...fetchOptions, signal: combined.signal })
+    res = await fetch(path, { ...rest, headers, signal: combined.signal })
     const text = await res.text()
     let body = null
     if (text) {
@@ -83,7 +96,16 @@ async function request(path, options = {}) {
     }
 
     if (!res.ok) {
-      throw new ApiError(body?.code ?? res.status, body?.msg ?? `请求失败（HTTP ${res.status}）`, res.status)
+      // 401 代表会话失效；清空本地会话并通知 App 回登录页。
+      // 登录/注册接口用 auth:false，密码错误不会被误判成「登录过期」。
+      if (res.status === 401 && withAuth) {
+        clearSession()
+      }
+      throw new ApiError(
+        body?.code ?? res.status,
+        body?.msg ?? `请求失败（HTTP ${res.status}）`,
+        res.status,
+      )
     }
     if (!body || body.code === undefined) {
       throw new ApiError(50000, '服务端返回格式异常', res.status)
@@ -107,6 +129,30 @@ async function request(path, options = {}) {
     combined.cleanup()
   }
 }
+
+// ---- 认证 ----
+
+export const register = (username, password) =>
+  request('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+    auth: false,
+  })
+
+export const login = (username, password) =>
+  request('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+    auth: false,
+  })
+
+export const me = () => request('/api/auth/me')
+
+export const logout = () => request('/api/auth/logout', { method: 'POST' })
+
+// ---- 文件 ----
 
 export const getConfig = () => request('/api/file/config')
 
@@ -153,17 +199,44 @@ export const listFiles = ({
   keyword = '',
   status = null,
   sort = 'time_desc',
+  scope = null,
   signal,
 } = {}) => {
   const qs = new URLSearchParams({ page: String(page), size: String(size), sort })
   if (keyword) qs.set('keyword', keyword)
   if (status !== null && status !== undefined && status !== '') qs.set('status', String(status))
+  if (scope) qs.set('scope', scope)
   return request(`/api/file/list?${qs.toString()}`, { signal })
 }
 
-export const getStats = () => request('/api/file/stats')
+export const getStats = (scope = null) =>
+  request(`/api/file/stats${scope ? `?scope=${encodeURIComponent(scope)}` : ''}`)
 
 export const deleteFile = (fileId) =>
   request(`/api/file/${encodeURIComponent(fileId)}`, { method: 'DELETE', timeout: 60_000 })
 
-export const downloadUrl = (fileId) => `/api/file/${encodeURIComponent(fileId)}/download`
+/**
+ * 浏览器下载票据。Bearer Token 无法附加到 <a href>，先换一张 5 分钟的
+ * 短期票据，再把返回的 url 交给浏览器。
+ */
+export const createDownloadTicket = (fileId) =>
+  request(`/api/file/${encodeURIComponent(fileId)}/download-ticket`)
+
+// ---- 管理员：完整性检查 ----
+
+/**
+ * 扫描已完成文件。deep=true 会复算每个文件的 SHA-256，大库里可能要跑很久，
+ * 因此单独给一个长超时；浅扫描只 stat，几百条通常秒回。
+ */
+export const scanIntegrity = ({ deep = false, limit = 100 } = {}) =>
+  request(`/api/admin/integrity/scan?deep=${deep}&limit=${limit}`, {
+    timeout: deep ? 600_000 : 60_000,
+  })
+
+export const repairIntegrity = (fileIds) =>
+  request('/api/admin/integrity/repair', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileIds }),
+    timeout: 600_000,
+  })

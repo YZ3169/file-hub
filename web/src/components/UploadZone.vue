@@ -56,9 +56,7 @@ function onDrop(event) {
 
     <div class="drop-copy">
       <h2>{{ dragging ? '松开即可加入队列' : '拖拽文件到这里，或点击选择' }}</h2>
-      <p>
-        大文件自动切片 · 断网/刷新后只补缺失分片 · 相同内容 0 字节秒传
-      </p>
+      <p>大文件自动切片 · 断网/刷新后只补缺失分片 · 相同内容 0 字节秒传</p>
     </div>
 
     <div class="drop-meta">
@@ -97,11 +95,19 @@ function onDrop(event) {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius-lg);
   background:
-    linear-gradient(135deg, rgba(109, 93, 252, 0.09), rgba(34, 211, 238, 0.035) 45%, transparent 70%),
+    linear-gradient(
+      135deg,
+      rgba(109, 93, 252, 0.09),
+      rgba(34, 211, 238, 0.035) 45%,
+      transparent 70%
+    ),
     var(--panel);
   box-shadow: var(--shadow-soft);
   cursor: pointer;
-  transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
+  transition:
+    border-color 0.2s ease,
+    transform 0.2s ease,
+    background 0.2s ease;
   overflow: hidden;
 }
 
@@ -117,7 +123,9 @@ function onDrop(event) {
   background:
     linear-gradient(135deg, rgba(34, 211, 238, 0.16), rgba(109, 93, 252, 0.12) 60%, transparent),
     var(--panel);
-  box-shadow: 0 0 0 4px rgba(34, 211, 238, 0.12), var(--shadow-soft);
+  box-shadow:
+    0 0 0 4px rgba(34, 211, 238, 0.12),
+    var(--shadow-soft);
 }
 
 .drop-glow {

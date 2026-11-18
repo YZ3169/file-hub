@@ -1,17 +1,16 @@
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import BaseIcon from './components/BaseIcon.vue'
 import UploadZone from './components/UploadZone.vue'
 import StatsBar from './components/StatsBar.vue'
 import TaskCard from './components/TaskCard.vue'
 import FileTable from './components/FileTable.vue'
 import ToastHost from './components/ToastHost.vue'
-import {
-  bootstrap,
-  clearFinished,
-  state,
-  toggleTheme,
-} from './stores/uploader'
+import LoginView from './components/LoginView.vue'
+import UserMenu from './components/UserMenu.vue'
+import AdminIntegrityPanel from './components/AdminIntegrityPanel.vue'
+import { bootstrap, clearFinished, state, toggleTheme } from './stores/uploader'
+import { auth } from './lib/auth'
 import { formatBytes } from './lib/format'
 
 const flow = [
@@ -21,10 +20,11 @@ const flow = [
   { icon: 'shield', title: '流式合并', text: '逐片 + 整文件复核' },
 ]
 
+const isAdmin = computed(() => auth.user?.role === 'ADMIN')
+const showIntegrity = ref(false)
+
 const resumableHint = computed(() =>
-  state.pendingResumable.filter(
-    (p) => !state.tasks.some((t) => t.fingerprint === p.fingerprint),
-  ),
+  state.pendingResumable.filter((p) => !state.tasks.some((t) => t.fingerprint === p.fingerprint)),
 )
 
 const activeCount = computed(
@@ -58,11 +58,7 @@ onMounted(() => {
                 <stop offset="100%" stop-color="#22d3ee" />
               </linearGradient>
             </defs>
-            <path
-              d="M16 3 28 9.5v13L16 29 4 22.5v-13L16 3Z"
-              fill="url(#logoGrad)"
-              opacity=".18"
-            />
+            <path d="M16 3 28 9.5v13L16 29 4 22.5v-13L16 3Z" fill="url(#logoGrad)" opacity=".18" />
             <path
               d="M16 3 28 9.5v13L16 29 4 22.5v-13L16 3Z"
               fill="none"
@@ -107,10 +103,21 @@ onMounted(() => {
         >
           <BaseIcon :name="state.theme === 'dark' ? 'sun' : 'moon'" :size="17" />
         </button>
+        <button
+          v-if="isAdmin"
+          class="btn btn-ghost btn-sm"
+          type="button"
+          data-testid="integrity-button"
+          @click="showIntegrity = true"
+        >
+          <BaseIcon name="shield" :size="14" />
+          完整性
+        </button>
+        <UserMenu v-if="auth.token" />
       </nav>
     </header>
 
-    <div v-if="!state.online" class="offline-banner">
+    <div v-if="auth.token && !state.online" class="offline-banner">
       <BaseIcon name="alert" :size="16" />
       <span>服务端未连接：请先在 8081 端口启动 file-hub，再重试。</span>
       <button class="btn btn-ghost btn-sm" type="button" @click="bootstrap">
@@ -119,19 +126,38 @@ onMounted(() => {
       </button>
     </div>
 
-    <main class="page">
+    <main v-if="!auth.ready" class="page boot-page">
+      <div class="boot-screen" data-testid="boot-screen">
+        <span class="boot-ring"></span>
+        <span>正在恢复会话…</span>
+      </div>
+    </main>
+
+    <main v-else-if="!auth.token" class="page page-auth">
+      <LoginView />
+      <footer class="footer">
+        <div class="footer-meta">
+          <span><BaseIcon name="user" :size="13" /> 账号级文件隔离</span>
+          <span><BaseIcon name="gauge" :size="13" /> 登录/上传限流</span>
+          <span><BaseIcon name="link" :size="13" /> 短期下载票据</span>
+        </div>
+        <span class="footer-note">file-hub v2 · 登录后开始传输</span>
+      </footer>
+    </main>
+
+    <main v-else class="page">
       <section class="hero">
         <div class="kicker">
           <i></i>
-          Spring Boot · 分片存储 · 内容寻址
+          Spring Boot · 分片存储 · 内容寻址 · 账号隔离
         </div>
         <h1>
           大文件传输，
           <span class="gradient-text">断了也不用从头再来</span>
         </h1>
         <p>
-          分片上传、秒传、断点续传，加上分片级完整性校验与自动重传。
-          传一个 2GB 的文件，网络抖一下只补那一片，而不是重传整个文件。
+          分片上传、秒传、断点续传，加上分片级完整性校验与自动重传。 传一个 2GB
+          的文件，网络抖一下只补那一片，而不是重传整个文件。
         </p>
       </section>
 
@@ -145,7 +171,11 @@ onMounted(() => {
           <strong>有 {{ resumableHint.length }} 个未完成的传输任务</strong>
           <span>
             重新选择同名、同大小、同修改时间的文件即可接着传：
-            {{ resumableHint.map((p) => p.fileName).slice(0, 3).join('、')
+            {{
+              resumableHint
+                .map((p) => p.fileName)
+                .slice(0, 3)
+                .join('、')
             }}{{ resumableHint.length > 3 ? ' 等' : '' }}
           </span>
         </div>
@@ -197,15 +227,22 @@ onMounted(() => {
 
       <footer class="footer">
         <div class="footer-meta">
-          <span><BaseIcon name="layers" :size="13" /> 分片 {{ formatBytes(state.config.chunkSize) }}</span>
-          <span><BaseIcon name="server" :size="13" /> {{ state.config.backend || '本地磁盘' }}</span>
+          <span
+            ><BaseIcon name="layers" :size="13" /> 分片
+            {{ formatBytes(state.config.chunkSize) }}</span
+          >
+          <span
+            ><BaseIcon name="server" :size="13" /> {{ state.config.backend || '本地磁盘' }}</span
+          >
           <span><BaseIcon name="shield" :size="13" /> SHA-256 内容寻址</span>
         </div>
         <span class="footer-note">
-          file-hub v2 · 分片级校验 / 自动重传 / 断点续传 / Range 下载
+          file-hub v2 · 分片级校验 / 自动重传 / 断点续传 / 多用户隔离
         </span>
       </footer>
     </main>
+
+    <AdminIntegrityPanel v-if="showIntegrity" @close="showIntegrity = false" />
 
     <ToastHost />
   </div>
@@ -262,13 +299,19 @@ onMounted(() => {
 }
 
 @keyframes float-a {
-  to { transform: translate3d(70px, 50px, 0) scale(1.06); }
+  to {
+    transform: translate3d(70px, 50px, 0) scale(1.06);
+  }
 }
 @keyframes float-b {
-  to { transform: translate3d(-60px, 80px, 0) scale(1.1); }
+  to {
+    transform: translate3d(-60px, 80px, 0) scale(1.1);
+  }
 }
 @keyframes float-c {
-  to { transform: translate3d(-40px, -70px, 0) scale(0.94); }
+  to {
+    transform: translate3d(-40px, -70px, 0) scale(0.94);
+  }
 }
 
 .grid-overlay {
@@ -350,7 +393,9 @@ onMounted(() => {
   background: var(--panel-2);
   color: var(--muted);
   cursor: pointer;
-  transition: color 0.18s ease, border-color 0.18s ease;
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease;
 }
 
 .icon-btn:hover {
@@ -383,6 +428,40 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 22px;
+}
+
+.page-auth {
+  min-height: calc(100vh - 180px);
+  justify-content: center;
+}
+
+.boot-page {
+  min-height: calc(100vh - 160px);
+  justify-content: center;
+}
+
+.boot-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.boot-ring {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--brand-light);
+  border-radius: 50%;
+  animation: boot-spin 0.8s linear infinite;
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .hero {
@@ -420,7 +499,12 @@ onMounted(() => {
 }
 
 .gradient-text {
-  background: linear-gradient(100deg, var(--brand-light) 0%, var(--brand-2) 55%, var(--violet) 100%);
+  background: linear-gradient(
+    100deg,
+    var(--brand-light) 0%,
+    var(--brand-2) 55%,
+    var(--violet) 100%
+  );
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -596,7 +680,9 @@ onMounted(() => {
 
 .task-enter-active,
 .task-leave-active {
-  transition: opacity 0.25s ease, transform 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    transform 0.25s ease;
 }
 
 .task-enter-from,

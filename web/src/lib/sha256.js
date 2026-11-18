@@ -22,8 +22,8 @@ const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0
 export class Sha256 {
   constructor() {
     this.h = new Uint32Array([
-      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+      0x5be0cd19,
     ])
     this.buf = new Uint8Array(64)
     this.bufLen = 0
@@ -42,8 +42,14 @@ export class Sha256 {
       w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0
     }
 
-    let a = this.h[0], b2 = this.h[1], c = this.h[2], d = this.h[3]
-    let e = this.h[4], f = this.h[5], g = this.h[6], hh = this.h[7]
+    let a = this.h[0],
+      b2 = this.h[1],
+      c = this.h[2],
+      d = this.h[3]
+    let e = this.h[4],
+      f = this.h[5],
+      g = this.h[6],
+      hh = this.h[7]
 
     for (let i = 0; i < 64; i++) {
       const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
@@ -52,14 +58,24 @@ export class Sha256 {
       const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
       const maj = (a & b2) ^ (a & c) ^ (b2 & c)
       const t2 = (S0 + maj) >>> 0
-      hh = g; g = f; f = e; e = (d + t1) >>> 0
-      d = c; c = b2; b2 = a; a = (t1 + t2) >>> 0
+      hh = g
+      g = f
+      f = e
+      e = (d + t1) >>> 0
+      d = c
+      c = b2
+      b2 = a
+      a = (t1 + t2) >>> 0
     }
 
-    this.h[0] = (this.h[0] + a) >>> 0; this.h[1] = (this.h[1] + b2) >>> 0
-    this.h[2] = (this.h[2] + c) >>> 0; this.h[3] = (this.h[3] + d) >>> 0
-    this.h[4] = (this.h[4] + e) >>> 0; this.h[5] = (this.h[5] + f) >>> 0
-    this.h[6] = (this.h[6] + g) >>> 0; this.h[7] = (this.h[7] + hh) >>> 0
+    this.h[0] = (this.h[0] + a) >>> 0
+    this.h[1] = (this.h[1] + b2) >>> 0
+    this.h[2] = (this.h[2] + c) >>> 0
+    this.h[3] = (this.h[3] + d) >>> 0
+    this.h[4] = (this.h[4] + e) >>> 0
+    this.h[5] = (this.h[5] + f) >>> 0
+    this.h[6] = (this.h[6] + g) >>> 0
+    this.h[7] = (this.h[7] + hh) >>> 0
   }
 
   update(bytes) {
@@ -106,7 +122,9 @@ export class Sha256 {
       for (let i = 0; i < full.length; i += 64) {
         this.processBlock(full.subarray(i, i + 64))
       }
-      return Array.from(this.h).map((x) => x.toString(16).padStart(8, '0')).join('')
+      return Array.from(this.h)
+        .map((x) => x.toString(16).padStart(8, '0'))
+        .join('')
     } finally {
       this.h = original
     }

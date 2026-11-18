@@ -29,6 +29,9 @@
         .tag.mid { background: #fef3c7; color: #92400e; }
         .tag.instant { background: #ede9fe; color: #5b21b6; }
         .empty { color: #9ca3af; font-size: 13px; }
+        body.auth-required .needs-auth { display: none !important; }
+        .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+        .toolbar a { color: #2563eb; }
     </style>
 </head>
 <body>
@@ -36,7 +39,18 @@
 <h1>file-hub</h1>
 <div class="sub">分片上传 · 秒传 · 断点续传　<span id="cfg" class="stat"></span></div>
 
-<div class="card">
+<div class="toolbar needs-auth">
+    <span id="who" class="stat"></span>
+    <button id="btnLogout">退出登录</button>
+</div>
+
+<div class="card" id="authGate" style="display:none">
+    <strong style="font-size:14px">需要登录</strong>
+    <div class="stat" style="margin:6px 0 10px">请先在主界面登录。主界面与经典版使用同一份本机 Token。</div>
+    <div class="row"><a href="/">去主界面登录 →</a></div>
+</div>
+
+<div class="card needs-auth">
     <div class="row">
         <input type="file" id="file"/>
         <button class="primary" id="btnUpload">开始上传</button>
@@ -49,7 +63,7 @@
     <div class="stat" id="msg" style="margin-top:8px"></div>
 </div>
 
-<div class="card">
+<div class="card needs-auth">
     <div class="row"><strong style="font-size:14px">已存文件</strong>
         <button id="btnRefresh">刷新</button></div>
     <table>
@@ -164,11 +178,51 @@ class Sha256 {
 const $ = id => document.getElementById(id);
 let abortFlag = false;
 
+/* 与 Vue 主界面共用同一份会话：Token 只存在 localStorage，请求带 Authorization */
+const TOKEN_KEY = 'filehub.token.v1';
+const USER_KEY = 'filehub.user.v1';
+
+function token() {
+    return localStorage.getItem(TOKEN_KEY);
+}
+
+function currentUser() {
+    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
+}
+
+function setAuthed(on) {
+    document.body.classList.toggle('auth-required', !on);
+    $('authGate').style.display = on ? 'none' : '';
+    if (on) {
+        const u = currentUser();
+        $('who').textContent = u ? `${u.username} · ${u.role === 'ADMIN' ? '管理员' : '普通用户'}` : '';
+    }
+}
+
+function clearSession() {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+}
+
 const api = {
-    async json(url, opt) {
-        const r = await fetch(url, opt);
-        const body = await r.json();
-        if (body.code !== 0) throw new Error(body.msg);
+    async json(url, opt = {}) {
+        const headers = new Headers(opt.headers || {});
+        const t = token();
+        if (t) headers.set('Authorization', `Bearer ${t}`);
+        const r = await fetch(url, { ...opt, headers });
+        const text = await r.text();
+        let body = null;
+        if (text) {
+            try { body = JSON.parse(text); } catch { /* 非 JSON，下面统一报错 */ }
+        }
+        if (r.status === 401) {
+            clearSession();
+            setAuthed(false);
+            throw new Error('登录已过期，请回主界面重新登录');
+        }
+        if (!r.ok || !body || body.code !== 0) {
+            throw new Error(body?.msg || `请求失败（HTTP ${r.status}）`);
+        }
         return body.data;
     },
     check: (hash, size) => api.json(`/api/file/check?hash=${hash}&size=${size}`),
@@ -184,7 +238,18 @@ const api = {
     complete: (fileId) => api.json(`/api/file/${fileId}/complete`, {method: 'POST'}),
     list: () => api.json('/api/file/list'),
     remove: (fileId) => api.json(`/api/file/${fileId}`, {method: 'DELETE'}),
+    downloadTicket: (fileId) => api.json(`/api/file/${encodeURIComponent(fileId)}/download-ticket`),
 };
+
+/** <a href> 带不了 Bearer，先用短期票据换一个一次性 URL 再交给浏览器 */
+async function download(fileId) {
+    try {
+        const ticket = await api.downloadTicket(fileId);
+        window.location.assign(ticket.url);
+    } catch (e) {
+        $('msg').innerHTML = `<span style="color:#b91c1c">下载失败：${escapeHtml(e.message)}</span>`;
+    }
+}
 
 function fmtSize(n) {
     if (n < 1024) return n + ' B';
@@ -310,17 +375,28 @@ async function refresh() {
                 <td>${f.status === 1 ? '<span class="tag ok">已完成</span>'
                                      : '<span class="tag mid">上传中</span>'}</td>
                 <td>
-                    ${f.status === 1 ? `<a href="/api/file/${f.fileId}/download">下载</a>` : '—'}
-                    <button class="danger" data-del="${f.fileId}" style="margin-left:8px;padding:2px 8px">删除</button>
+                    ${f.status === 1 ? `<a href="#" data-dl="${escapeHtml(f.fileId)}">下载</a>` : '—'}
+                    <button class="danger" data-del="${escapeHtml(f.fileId)}" style="margin-left:8px;padding:2px 8px">删除</button>
                 </td>
             </tr>`).join('');
+        tb.querySelectorAll('[data-dl]').forEach(a => a.onclick = e => {
+            e.preventDefault();
+            download(a.dataset.dl);
+        });
         tb.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
             await api.remove(b.dataset.del);
             await refresh();
         });
     } catch (e) {
-        $('list').innerHTML = `<tr><td colspan="4" class="empty">加载失败：${e.message}</td></tr>`;
+        $('list').innerHTML = `<tr><td colspan="4" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
     }
+}
+
+async function doLogout() {
+    try { await api.json('/api/auth/logout', { method: 'POST' }); } catch { /* Token 已失效也照常退出 */ }
+    clearSession();
+    setAuthed(false);
+    $('list').innerHTML = '<tr><td colspan="4" class="empty">请先登录</td></tr>';
 }
 
 function escapeHtml(s) {
@@ -330,15 +406,17 @@ function escapeHtml(s) {
 $('btnUpload').onclick = startUpload;
 $('btnAbort').onclick = () => { abortFlag = true; };
 $('btnRefresh').onclick = refresh;
+$('btnLogout').onclick = doLogout;
 
 (async () => {
+    setAuthed(Boolean(token()));
     try {
         const c = await api.json('/api/file/config');
         $('cfg').textContent = `分片大小 ${fmtSize(c.chunkSize)} · 存储后端 ${c.backend}`;
     } catch (e) {
         $('cfg').textContent = '（读取服务配置失败）';
     }
-    refresh();
+    if (token()) refresh();
 })();
 </script>
 </body>

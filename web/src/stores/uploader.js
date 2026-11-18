@@ -1,6 +1,7 @@
 import { markRaw, reactive } from 'vue'
 import * as api from '../lib/api'
 import { ApiError } from '../lib/api'
+import { auth, clearSession, onUnauthorized, setSession } from '../lib/auth'
 import { Sha256 } from '../lib/sha256'
 import {
   fingerprintOf,
@@ -12,6 +13,7 @@ import {
   removePendingTask,
   savePendingTask,
   setCachedHash,
+  setStorageUser,
   setTheme,
 } from '../lib/storage'
 
@@ -54,8 +56,14 @@ export const state = reactive({
   concurrency: 4,
   toasts: [],
   processing: false,
-  pendingResumable: loadPendingTasks(),
+  pendingResumable: [],
   theme: getTheme(),
+})
+
+// Token 失效（401）时 api 层会清空会话并触发这里：回到登录页，别让上传队列继续跑
+onUnauthorized(() => {
+  resetWorkspace()
+  toast('登录已过期，请重新登录', 'warn')
 })
 
 let toastSeq = 0
@@ -382,9 +390,10 @@ async function uploadMissing(task) {
 
   task.state = 'uploading'
   task._chunkError = null
-  task.message = pending.length === task.chunkTotal
-    ? `开始上传 ${pending.length} 个分片（并发 ${Math.min(state.concurrency, pending.length)}）`
-    : `断点续传：跳过 ${task.chunkTotal - pending.length} 片，补传 ${pending.length} 片`
+  task.message =
+    pending.length === task.chunkTotal
+      ? `开始上传 ${pending.length} 个分片（并发 ${Math.min(state.concurrency, pending.length)}）`
+      : `断点续传：跳过 ${task.chunkTotal - pending.length} 片，补传 ${pending.length} 片`
 
   let cursor = 0
   const workerCount = Math.min(state.concurrency, pending.length)
@@ -471,13 +480,16 @@ async function completeWithHeal(task) {
         removeCachedHash(task.fingerprint)
         task.hash = null
         task.hashFromCache = false
-        throw new Error('缓存的哈希与实际文件内容不一致，已清除缓存；请点击重试，会重新计算哈希')
+        throw new Error('缓存的哈希与实际文件内容不一致，已清除缓存；请点击重试，会重新计算哈希', {
+          cause: e,
+        })
       }
       if ((e.code === 30005 || e.code === 30001) && round < MAX_HEAL_ROUNDS) {
         task.healRounds += 1
-        task.message = e.code === 30005
-          ? `服务端发现损坏分片并已剔除，正在只补传坏片（第 ${task.healRounds} 轮自愈）`
-          : `服务端报告分片缺失，正在重新对齐后补传（第 ${task.healRounds} 轮自愈）`
+        task.message =
+          e.code === 30005
+            ? `服务端发现损坏分片并已剔除，正在只补传坏片（第 ${task.healRounds} 轮自愈）`
+            : `服务端报告分片缺失，正在重新对齐后补传（第 ${task.healRounds} 轮自愈）`
         await realignWithServer(task)
         continue
       }
@@ -507,7 +519,9 @@ async function runTask(task) {
 
     // 2) init：秒传命中 / 复用未完成任务 / 新建任务，三选一
     task.state = 'checking'
-    task.message = task.hashFromCache ? '使用上次缓存的哈希，正在校验秒传…' : '正在校验秒传并初始化任务…'
+    task.message = task.hashFromCache
+      ? '使用上次缓存的哈希，正在校验秒传…'
+      : '正在校验秒传并初始化任务…'
     const init = await callWithRetry(
       () =>
         api.initUpload({
@@ -613,9 +627,7 @@ async function processQueue() {
   state.processing = true
   try {
     while (true) {
-      const task = state.tasks.find(
-        (t) => t.state === 'queued' && !t.paused && !t.canceled,
-      )
+      const task = state.tasks.find((t) => t.state === 'queued' && !t.paused && !t.canceled)
       if (!task) break
       await runTask(task)
     }
@@ -722,7 +734,8 @@ export async function refreshFiles() {
       return refreshFiles()
     }
   } catch (e) {
-    state.online = false
+    // 只有真正连不上服务端才算离线；401/403/429 不应把顶部显示成「服务未启动」
+    if (!(e instanceof ApiError) || e.status === 0) state.online = false
   }
 }
 
@@ -747,8 +760,8 @@ export async function refreshStats() {
   try {
     state.stats = await api.getStats()
     state.online = true
-  } catch {
-    state.online = false
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status === 0) state.online = false
   }
 }
 
@@ -766,50 +779,113 @@ export async function deleteServerFile(file) {
   }
 }
 
-export function downloadFile(file) {
-  const a = document.createElement('a')
-  a.href = api.downloadUrl(file.fileId)
-  a.download = file.fileName
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
+export async function downloadFile(file) {
+  try {
+    const ticket = await api.createDownloadTicket(file.fileId)
+    const a = document.createElement('a')
+    a.href = ticket.url
+    a.download = file.fileName
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } catch (e) {
+    toast(`下载失败：${e.message}`, 'error')
+  }
+}
+
+/** 登录后加载该用户的工作区：配置、本地断点记录、文件列表、统计 */
+export async function startWorkspace() {
+  if (!auth.user) return
+  setStorageUser(auth.user.id)
+  state.pendingResumable = loadPendingTasks()
+  try {
+    state.config = await api.getConfig()
+    state.online = true
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status === 0) {
+      state.online = false
+      toast('无法连接服务端：请先启动 file-hub（8081）', 'error')
+    }
+  }
+  await Promise.all([refreshFiles(), refreshStats()])
+}
+
+/** 退出登录/会话失效：停止传输并清空内存态，但保留本用户的本地断点记录 */
+export function resetWorkspace() {
+  for (const task of state.tasks) {
+    task.controller?.abort()
+  }
+  state.tasks = []
+  state.files = []
+  state.filePage = {
+    page: 1,
+    size: 10,
+    total: 0,
+    keyword: '',
+    status: null,
+    sort: 'time_desc',
+  }
+  state.stats = emptyStats()
+  state.pendingResumable = []
+  setStorageUser(null)
+}
+
+export async function logout() {
+  try {
+    await api.logout()
+  } catch {
+    // 网络不通或 Token 已失效都不阻塞退出
+  }
+  clearSession({ notify: false })
+  resetWorkspace()
 }
 
 export async function bootstrap() {
   applyTheme()
-  try {
-    state.config = await api.getConfig()
-    state.online = true
-  } catch {
-    state.online = false
-    toast('无法连接服务端：请先启动 file-hub（8081）', 'error')
-  }
-  state.booted = true
-  if (state.online) {
-    await Promise.all([refreshFiles(), refreshStats()])
-  }
-}
-
-// 每秒刷新一次速度 / ETA：分片之间可能有停顿，不能让界面显示一个永远不动的速度
-setInterval(() => {
-  const now = performance.now()
-  for (const task of state.tasks) {
-    if (task.state !== 'uploading') continue
-    const samples = task._samples
-    while (samples.length > 1 && samples[0].t < now - 5000) samples.shift()
-    if (samples.length >= 2) {
-      const first = samples[0]
-      const last = samples[samples.length - 1]
-      const dt = (last.t - first.t) / 1000
-      if (dt > 0.3) {
-        task.speed = Math.max(0, (last.bytes - first.bytes) / dt)
-        const remaining = Math.max(0, task.size - task.completedBytes)
-        task.eta = task.speed > 1 ? remaining / task.speed : 0
-      }
-      if (now - last.t > 4000) {
-        task.speed = 0
-        task.eta = 0
+  startTicker()
+  if (auth.token) {
+    try {
+      const user = await api.me()
+      // 服务端是唯一权威：本地角色只是缓存，每次启动都刷新一次
+      setSession({ token: auth.token, user })
+      await startWorkspace()
+    } catch (e) {
+      if (e.status !== 401) {
+        state.online = false
+        toast('无法连接服务端：请先启动 file-hub（8081）', 'error')
       }
     }
   }
-}, 800)
+  auth.ready = true
+  state.booted = true
+}
+
+let tickerStarted = false
+
+/** 测速定时器只在启动时创建一次；模块被测试 import 时不应产生后台定时器 */
+function startTicker() {
+  if (tickerStarted) return
+  tickerStarted = true
+  setInterval(() => {
+    const now = performance.now()
+    for (const task of state.tasks) {
+      if (task.state !== 'uploading') continue
+      const samples = task._samples
+      while (samples.length > 1 && samples[0].t < now - 5000) samples.shift()
+      if (samples.length >= 2) {
+        const first = samples[0]
+        const last = samples[samples.length - 1]
+        const dt = (last.t - first.t) / 1000
+        if (dt > 0.3) {
+          task.speed = Math.max(0, (last.bytes - first.bytes) / dt)
+          const remaining = Math.max(0, task.size - task.completedBytes)
+          task.eta = task.speed > 1 ? remaining / task.speed : 0
+        }
+        if (now - last.t > 4000) {
+          task.speed = 0
+          task.eta = 0
+        }
+      }
+    }
+  }, 800)
+}
