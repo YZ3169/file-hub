@@ -36,7 +36,7 @@
 
 ```
   Vue 3 工作台（web/ → static/）            /classic.html 是原始单页演示
-     │  ① 增量算整文件 SHA-256（WebCrypto 不行，见下），结果缓存进 localStorage
+     │  ① 在 Web Worker 里增量算整文件 SHA-256，结果缓存进 localStorage
      │  ② POST /api/file/init       → fileId + 已传分片序号 + 是否秒传命中
      │  ③ POST /api/file/chunk      ×N，并发 4；每片附带 WebCrypto 算的 SHA-256
      │  ④ 失败分片指数退避重试；暂停/刷新后从 /status 或 init 重新对齐
@@ -243,6 +243,23 @@ Spring 的事务提交发生在方法返回之后，锁已经放了、事务还�
 WebCrypto（每片只有 5MB，内存可控，而且硬件加速更快）。
 增量实现已用 Node `crypto` 对 12 组长度（含 55/56/63/64 等 padding 边界）做过全量 + 不规则分块喂入校验。
 
+### 17. 「记录在、文件没了」也要当成错误处理
+
+秒传如果只信数据库，会踩一个隐蔽的坑：`file_info` 有一条 `status = 1`、`storage_path = X` 的记录，
+但 `files/X` 被手工清理、备份恢复漏了或磁盘坏了。此时秒传会命中这条记录，用户拿到一个 0 字节的
+"成功"，下载时才 500。
+
+现在的规则是**每次复用已完成记录前，先确认物理文件存在且大小一致**（`isStorageIntact`）：
+
+- `check` / 秒传去重时逐条检查候选记录，跳过坏记录继续找可用的；全都不可用就退回正常上传；
+- 已完成的 `complete` 重入、下载入口也做同样检查，分别返回 **20007 / 20006**，而不是假装成功；
+- 坏记录保留下来供人工排查，不会自动删掉——自动删可能误伤"存储暂时不可达"。
+
+反向的孤儿也要收：`files/` 下存在、但没有任何 `status = 1` 记录引用的文件，超过
+`orphan-file-grace-hours`（默认 7 天）后由定时任务回收。删除前拿该文件的写锁并重新数一次引用，
+确认仍是 0 才动磁盘；给 7 天宽限期，是为了避免数据库临时不可用、配置指错库时把仍在使用中的
+文件当孤儿删掉。
+
 ---
 
 ## 表结构为什么长这样
@@ -252,10 +269,17 @@ WebCrypto（每片只有 5MB，内存可控，而且硬件加速更快）。
 KEY idx_hash_size_status (file_hash, file_size, status)
 -- 删除时按 storage_path 数引用行数
 KEY idx_storage_path (storage_path)
+-- 定时清理的判据 (status = 0, update_time < cutoff)
+KEY idx_status_update (status, update_time)
+-- 列表按状态过滤后按 id 倒序分页
+KEY idx_status_id (status, id)
 
 -- 分片表：靠唯一索引把"重复上传同一分片"变成幂等操作
 UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 ```
+
+老库不用重建表：`scripts/migrate-v3-indexes.sql` 会先查 `information_schema.statistics`，
+只在索引缺失时 `ALTER TABLE`，重复执行不会报错。
 
 ---
 
@@ -265,8 +289,10 @@ UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 # 1. 建库建表
 mysql -uroot -p < src/main/resources/schema.sql
 
-#    已经跑过 v1 的库，只需补一列（脚本幂等，重复执行不会报错）：
+#    已经跑过 v1 的库，补一列 chunk_hash（脚本幂等，重复执行不会报错）：
 mysql -uroot -p < scripts/migrate-v2-chunk-hash.sql
+#    已经跑过 v2 的库，补列表/清理用的两个索引（同样幂等）：
+mysql -uroot -p < scripts/migrate-v3-indexes.sql
 
 # 2. 数据库口令走环境变量，不落盘（application.yml 里写的是 ${MYSQL_PWD}）
 export MYSQL_PWD=你的口令
@@ -300,7 +326,8 @@ npm run build        # 产物直接写进 ../src/main/resources/static/
 | POST | `/api/file/chunk` | `fileId` + `index` + 可选 `chunkHash` + 分片 |
 | GET | `/api/file/{id}/status` | 以磁盘为准的已传分片（断点续传对齐） |
 | POST | `/api/file/{id}/complete` | 逐片 + 整文件校验、流式合并（30005 表示坏片已剔除） |
-| GET | `/api/file/list` / `/api/file/stats` | 文件列表 / 秒传节省统计 |
+| GET | `/api/file/list?page=&size=&keyword=&status=&sort=` | 分页文件列表（`items` + `total`），支持搜索/过滤/排序；`size` 上限 100 |
+| GET | `/api/file/stats` | 秒传节省统计 |
 | GET | `/api/file/{id}/download` | 流式下载，支持单段 `Range` |
 | DELETE | `/api/file/{id}` | 删除逻辑记录，最后一个引用才删物理文件 |
 
@@ -309,21 +336,38 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `file-hub.root` | `D:/Projects/file-hub-data` | 存储根目录 |
-| `file-hub.chunk-size` | 5MB | 分片大小，前端按它切片 |
-| `spring.servlet.multipart.max-file-size` | 512MB | 单分片上限，给足余量 |
+| `file-hub.chunk-size` | 5MB | 分片大小，前端按它切片（服务端会校验取值范围） |
+| `file-hub.orphan-file-grace-hours` | 168（7 天） | 无任何数据库记录引用的成品文件，超过这个时长才回收 |
+| `spring.servlet.multipart.max-file-size` | 6MB | 单分片上限，只比分片大小大 1MB；改 `chunk-size` 时同步调整 |
 
 ### 验证
 
 ```bash
-mvn test                      # 30 个单元测试（分片校验、并发锁、迟到分片回滚、条件清理、孤儿目录）
+mvn test                      # 37 个单元测试（分片校验、并发锁、迟到分片回滚、
+                              # 条件清理、孤儿目录/孤儿成品、分片数溢出）
 bash scripts/e2e-test.sh      # 端到端验收（真传 120MB，逐项断言）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 ```
 
+单元测试不需要 MySQL；E2E 需要一个已建库的 MySQL 和服务端。E2E 结束时会删掉自己留下的
+「上传中」任务，可以重复执行。
+
+### CI
+
+`.github/workflows/ci.yml` 在每次 push / PR 上跑三个任务：
+
+1. `mvn test`；
+2. 前端 `npm ci && npm run build`（确认 Vue 模板和 Worker 都能过编译）；
+3. 起一个 MySQL 8.0 service，导入 `schema.sql`，用临时存储目录启动 jar，
+   再跑完整的 `scripts/e2e-test.sh`。
+
+CI 里的 MySQL 口令是一次性容器口令，不是任何真实环境的口令。
+
 > `e2e-test.sh` 在 v1 的 25 项基础上补了分片摘要拒绝（30004）、合并时坏片自愈（30005）、
-> `/status`、`/stats` 和 Range 下载的断言。**2026-11-18 已在真实 MySQL 8.0.45 上跑通：
-> 45 项断言全部通过**（临时实例、端口 3307、独立存储目录，未动本机 3306 的库）；
-> P0 并发修复后又用同一套临时环境复跑，仍是 45/45。
+> `/status`、`/stats`、Range 下载和分页/搜索/状态过滤的断言。**2026-11-18 已在真实
+> MySQL 8.0.45 上跑通：51 项断言全部通过**（临时实例、端口 3307、独立存储目录，
+> 未动本机 3306 的库）；P0 并发修复、P1–P3 加固后又各复跑一次，仍为 51/51。
+> 脚本会清理自己留下的上传中任务，连续跑两遍不会互相污染。
 > 另外手工验证了「并发 complete 只合并一次、两个请求都返回成功」、老分片摘要回填、
 > 任务完成后迟到分片不重建目录，以及真实定时清理的条件删除和孤儿目录回收。
 > 跑它需要一个已建库的环境，且脚本和服务端在同一台机器上（坏片用例要直接改磁盘分片）。
@@ -354,9 +398,10 @@ bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 
 ## 已知不足（别在面试里吹过头）
 
-- **整文件哈希仍跑在主线程**：虽然改成了 4MB 增量、内存恒定，但 1GB 文件算哈希时页面仍会
-  有可感知的卡顿。真实产品会用 Web Worker；哈希结果会缓存进 localStorage，第二次选择同一文件
-  可以直接跳过。缓存失效时服务端会返回 30003，界面提示重新计算，不会静默传坏文件。
+- **哈希在 Worker 里算，但老浏览器会回退**：整文件 SHA-256 现在跑在 Web Worker 里，
+  主线程只收进度消息；不支持 Worker 的环境仍会回退到主线程，1GB 文件算哈希时会有卡顿。
+  哈希结果会缓存进 localStorage，第二次选择同一文件可以直接跳过；缓存失效时服务端返回 30003，
+  界面提示重新计算，不会静默传坏文件。
 - **刷新页面不会自动续传**：浏览器拿不到刷新前的 `File` 对象，需要用户重新选择同名、同大小、
   同修改时间的文件，前端用指纹（name + size + lastModified）对上本地断点记录后再续传。
 - **单实例**：分片落本地磁盘，多实例部署时 `init` 和 `chunk` 可能落到不同机器上就找不到分片了。
@@ -369,8 +414,9 @@ bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 - **Range 只支持单段**：多段 Range 按 RFC 允许的简化路径直接返回整文件，没有实现
   `multipart/byteranges`。
 - **端到端脚本依赖本机环境**：坏片自愈用例要直接改服务端磁盘上的分片文件，所以脚本必须和
-  服务端同机跑；脚本也没有清理它创建的测试数据，重复跑会留下"上传中"记录。
-  基准数据仍是 v1 的，v2 多了逐片摘要计算，但没有重跑 `bench.sh`。
+  服务端同机跑（CI 里就是同 runner）；脚本现在会清理自己留下的「上传中」任务，但成功用例的
+  成品文件仍会留在临时目录里，由 CI 的 runner 自行回收。基准数据仍是 v1 的，v2 多了逐片摘要
+  计算，但没有重跑 `bench.sh`。
 - **清理任务与暂停冲突**：一个任务暂停超过 `upload-expire-minutes` 后被回收，用户再点继续时
   `init` 会新建任务，需要从头传（数据是安全的，只是省不掉重传）。现在的条件删除 + 续传心跳
   保证"刚回来续传却被误删"不会发生，但已经回收的分片找不回来。
