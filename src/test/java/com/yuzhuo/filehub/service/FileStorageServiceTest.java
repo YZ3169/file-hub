@@ -3,28 +3,38 @@ package com.yuzhuo.filehub.service;
 import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.common.FileLockRegistry;
 import com.yuzhuo.filehub.config.StorageProperties;
+import com.yuzhuo.filehub.dto.CheckResponse;
+import com.yuzhuo.filehub.dto.FileVO;
+import com.yuzhuo.filehub.entity.FileChunk;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.mapper.FileChunkMapper;
 import com.yuzhuo.filehub.mapper.FileInfoMapper;
 import com.yuzhuo.filehub.storage.LocalDiskStorage;
 import com.yuzhuo.filehub.storage.LocalDiskStorage.ChunkWriteResult;
+import com.yuzhuo.filehub.util.HashUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -45,6 +55,9 @@ class FileStorageServiceTest {
     FileChunkMapper fileChunkMapper;
     @Mock
     LocalDiskStorage storage;
+
+    @TempDir
+    Path tempDir;
 
     FileStorageService service;
 
@@ -120,6 +133,95 @@ class FileStorageServiceTest {
 
         verify(storage).deleteChunks(OTHER_ID);
         verify(fileChunkMapper).deleteByFileId(OTHER_ID);
+    }
+
+    @Test
+    @DisplayName("秒传预检以磁盘为准：物理文件缺失时按未命中处理")
+    void checkMissesWhenPhysicalFileIsGone() {
+        FileInfo done = doneInfo();
+        when(fileInfoMapper.findDoneListByHashAndSize("a".repeat(64), 5))
+                .thenReturn(List.of(done));
+        when(storage.exists(done.getStoragePath())).thenReturn(false);
+
+        CheckResponse resp = service.check("a".repeat(64), 5);
+
+        assertFalse(resp.exists());
+        assertNull(resp.fileId());
+    }
+
+    @Test
+    @DisplayName("秒传预检：跳过坏记录，命中另一条物理文件完好的记录")
+    void checkSkipsBrokenCandidateAndFindsUsableOne() {
+        FileInfo broken = doneInfo();
+        FileInfo good = doneInfo();
+        good.setFileId(OTHER_ID);
+        good.setStoragePath("2026/11/18/" + OTHER_ID);
+
+        when(fileInfoMapper.findDoneListByHashAndSize("a".repeat(64), 5))
+                .thenReturn(List.of(broken, good));
+        when(storage.exists(broken.getStoragePath())).thenReturn(false);
+        when(storage.exists(good.getStoragePath())).thenReturn(true);
+        when(storage.size(good.getStoragePath())).thenReturn(5L);
+
+        CheckResponse resp = service.check("a".repeat(64), 5);
+
+        assertTrue(resp.exists());
+        assertEquals(OTHER_ID, resp.fileId());
+    }
+
+    @Test
+    @DisplayName("合并成功后清掉 file_chunk 元数据，避免分片行永久堆积")
+    void completeRemovesChunkMetadata() throws Exception {
+        String hash = HashUtil.sha256Hex("hello".getBytes(StandardCharsets.UTF_8));
+        FileInfo uploading = uploadingInfo();
+        uploading.setFileHash(hash);
+        FileInfo done = doneInfo();
+        done.setFileHash(hash);
+
+        Path chunk = Files.writeString(tempDir.resolve("0.part"), "hello");
+        Path merged = Files.createTempFile(tempDir, "merge", ".tmp");
+
+        when(fileInfoMapper.selectOne(any())).thenReturn(uploading).thenReturn(done);
+        when(storage.listChunksOnDisk(ID)).thenReturn(List.of(0));
+        FileChunk meta = new FileChunk();
+        meta.setChunkIndex(0);
+        meta.setChunkHash(hash);
+        when(fileChunkMapper.listChunkMeta(ID)).thenReturn(List.of(meta));
+        when(storage.createMergeTmpFile(ID)).thenReturn(merged);
+        when(storage.chunkFile(ID, 0)).thenReturn(chunk);
+        when(fileInfoMapper.findDoneListByHashAndSize(hash, 5)).thenReturn(List.of());
+        when(storage.buildRelativePath(ID)).thenReturn("2026/11/18/" + ID);
+        when(fileInfoMapper.markDone(eq(ID), anyString())).thenReturn(1);
+
+        FileVO vo = service.complete(ID);
+
+        assertEquals(ID, vo.fileId());
+        verify(fileChunkMapper).deleteByFileId(ID);
+        verify(storage).deleteChunks(ID);
+    }
+
+    @Test
+    @DisplayName("孤儿成品回收：有引用的留着，无引用且过宽限期的才删")
+    void cleanupRemovesOnlyUnreferencedOldFiles() {
+        String orphan = "2026/11/18/" + OTHER_ID;
+        String keep = "2026/11/18/" + ID;
+        when(fileInfoMapper.findAllStoragePaths()).thenReturn(List.of(keep));
+        when(storage.listFilePaths()).thenReturn(List.of(orphan, keep));
+        when(storage.fileOlderThan(eq(orphan), any(Duration.class))).thenReturn(true);
+        when(fileInfoMapper.countByStoragePath(orphan)).thenReturn(0);
+        when(storage.delete(orphan)).thenReturn(true);
+
+        service.cleanupExpiredUploads();
+
+        verify(storage).delete(orphan);
+        verify(storage, never()).delete(keep);
+    }
+
+    private static FileInfo doneInfo() {
+        FileInfo info = uploadingInfo();
+        info.setStatus(FileInfo.STATUS_DONE);
+        info.setStoragePath("2026/11/18/" + ID);
+        return info;
     }
 
     private static FileInfo uploadingInfo() {

@@ -1,6 +1,7 @@
 package com.yuzhuo.filehub.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.common.FileLockRegistry;
 import com.yuzhuo.filehub.config.StorageProperties;
@@ -8,6 +9,7 @@ import com.yuzhuo.filehub.dto.CheckResponse;
 import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.dto.InitUploadResponse;
+import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.StatsResponse;
 import com.yuzhuo.filehub.dto.UploadStatusResponse;
 import com.yuzhuo.filehub.entity.FileChunk;
@@ -66,9 +68,12 @@ public class FileStorageService {
 
     /**
      * 上传前先问一句「这个文件你库里有没有」。命中就一个字节都不用传。
+     *
+     * <p>命中还必须以磁盘为准再确认一次：如果物理文件被外部删掉或大小不符，
+     * 这条「已完成」记录就是打不开的，按未命中处理，让客户端走正常上传。</p>
      */
     public CheckResponse check(String hash, long size) {
-        FileInfo hit = fileInfoMapper.findDoneByHashAndSize(hash, size);
+        FileInfo hit = findUsableDone(hash, size);
         return new CheckResponse(hit != null, hit == null ? null : hit.getFileId());
     }
 
@@ -85,7 +90,11 @@ public class FileStorageService {
      * </ol>
      */
     public InitUploadResponse init(InitUploadRequest req) {
-        int chunkSize = (int) props.getChunkSize();
+        long configuredChunkSize = props.getChunkSize();
+        if (configuredChunkSize <= 0 || configuredChunkSize > Integer.MAX_VALUE) {
+            throw new BizException(50001, "服务端分片大小配置非法：" + configuredChunkSize);
+        }
+        int chunkSize = (int) configuredChunkSize;
         int chunkTotal = calcChunkTotal(req.fileSize(), chunkSize);
         String fileHash = req.fileHash().toLowerCase();
 
@@ -93,7 +102,7 @@ public class FileStorageService {
         // 同一份内容的「新增引用」和「删除最后一条引用」必须互斥：否则删除方刚数完
         // 引用为 0，秒传方又插进来一条指向同一物理文件的记录，就会得到一条打不开的完成记录。
         InitUploadResponse instant = locks.write(contentKey(fileHash, req.fileSize()), () -> {
-            FileInfo done = fileInfoMapper.findDoneByHashAndSize(fileHash, req.fileSize());
+            FileInfo done = findUsableDone(fileHash, req.fileSize());
             if (done == null) {
                 return null;
             }
@@ -151,12 +160,28 @@ public class FileStorageService {
         return row;
     }
 
-    /** 分片总数由服务端推导，不接受前端传入——前端算错一次就会合并出坏文件 */
+    /**
+     * 分片总数由服务端推导，不接受前端传入——前端算错一次就会合并出坏文件。
+     *
+     * <p>用 {@code (fileSize - 1) / chunkSize + 1} 而不是 {@code (fileSize + chunkSize - 1) / chunkSize}：
+     * 后者在 fileSize 接近 Long.MAX_VALUE 时会先溢出。结果超过 int 时明确报错，
+     * 不静默截断——截断后的分片数会让合并逻辑读错片。</p>
+     */
     static int calcChunkTotal(long fileSize, int chunkSize) {
+        if (fileSize < 0) {
+            throw new BizException(10007, "文件大小不能为负数：" + fileSize);
+        }
+        if (chunkSize <= 0) {
+            throw new BizException(50001, "分片大小必须大于 0：" + chunkSize);
+        }
         if (fileSize == 0) {
             return 0;
         }
-        return (int) ((fileSize + chunkSize - 1) / chunkSize);
+        long total = (fileSize - 1) / chunkSize + 1;
+        if (total > Integer.MAX_VALUE) {
+            throw new BizException(10007, "文件过大：分片数 " + total + " 超过系统上限 " + Integer.MAX_VALUE);
+        }
+        return (int) total;
     }
 
     // ==================================================================
@@ -260,6 +285,10 @@ public class FileStorageService {
         FileInfo info = requireInfo(fileId);
 
         if (info.getStatus() == FileInfo.STATUS_DONE) {
+            // 完成态也不能盲信数据库：物理文件被外部删掉时，直接返回成功等于骗客户端
+            if (!isStorageIntact(info)) {
+                throw new BizException(20007, "文件已完成但物理内容缺失或大小不符，无法合并/下载");
+            }
             log.info("文件 {} 已经是完成态，直接返回", fileId);
             return FileVO.from(info);
         }
@@ -365,7 +394,7 @@ public class FileStorageService {
         // 如果这里读到 existing 后它刚好被删除，物理文件就会在 markDone 之前消失。
         final Path mergedFile = merged;
         String storagePath = locks.write(contentKey(info.getFileHash(), info.getFileSize()), () -> {
-            FileInfo existing = fileInfoMapper.findDoneByHashAndSize(info.getFileHash(), info.getFileSize());
+            FileInfo existing = findUsableDone(info.getFileHash(), info.getFileSize());
             String path;
             if (existing != null) {
                 deleteQuietly(mergedFile);
@@ -388,6 +417,10 @@ public class FileStorageService {
             }
             return path;
         });
+        // 合并成功后分片文件与分片元数据都没有价值了。先删库再删盘：
+        // 如果进程在两者之间被杀，留下的是「有目录无元数据」，孤儿目录回收还能扫到；
+        // 反过来先删盘会留下一堆永远不会被扫到的 file_chunk 行。
+        fileChunkMapper.deleteByFileId(fileId);
         storage.deleteChunks(fileId);
 
         FileInfo after = requireInfo(fileId);
@@ -399,11 +432,44 @@ public class FileStorageService {
     // 5. 查询 / 下载 / 删除
     // ==================================================================
 
-    public List<FileVO> list() {
-        return fileInfoMapper.selectList(new LambdaQueryWrapper<FileInfo>()
-                        .orderByDesc(FileInfo::getId)
-                        .last("LIMIT 200"))
-                .stream().map(FileVO::from).toList();
+    /**
+     * 文件列表（分页 + 关键字 + 状态过滤 + 白名单排序）。
+     *
+     * <p>之前是硬编码 {@code LIMIT 200}：超过 200 条的记录永远看不到，也没法搜索。
+     * 现在分页参数由服务端夹紧（page ≥ 1，1 ≤ size ≤ 100），排序只接受白名单，
+     * 避免把前端传来的列名直接拼进 SQL。</p>
+     */
+    public PageResponse<FileVO> list(int page, int size, String keyword, Integer status, String sort) {
+        int safePage = Math.max(1, page);
+        int safeSize = Math.min(100, Math.max(1, size));
+
+        if (status != null && status != FileInfo.STATUS_UPLOADING && status != FileInfo.STATUS_DONE) {
+            throw new BizException(10008, "status 只能是 0（上传中）或 1（已完成）");
+        }
+
+        LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
+        if (status != null) {
+            qw.eq(FileInfo::getStatus, status);
+        }
+        if (keyword != null && !keyword.isBlank()) {
+            String kw = keyword.trim();
+            qw.and(w -> w.like(FileInfo::getFileName, kw)
+                    .or().like(FileInfo::getFileHash, kw)
+                    .or().like(FileInfo::getFileId, kw));
+        }
+        switch (sort == null ? "" : sort) {
+            case "time_asc" -> qw.orderByAsc(FileInfo::getId);
+            case "size_desc" -> qw.orderByDesc(FileInfo::getFileSize).orderByDesc(FileInfo::getId);
+            case "size_asc" -> qw.orderByAsc(FileInfo::getFileSize).orderByDesc(FileInfo::getId);
+            case "name_asc" -> qw.orderByAsc(FileInfo::getFileName).orderByDesc(FileInfo::getId);
+            // 默认最新优先；未知排序值回退到默认，不报错
+            default -> qw.orderByDesc(FileInfo::getId);
+        }
+
+        Page<FileInfo> result = fileInfoMapper.selectPage(new Page<>(safePage, safeSize), qw);
+        return new PageResponse<>(
+                result.getRecords().stream().map(FileVO::from).toList(),
+                result.getTotal(), safePage, safeSize);
     }
 
     public FileInfo requireInfo(String fileId) {
@@ -417,6 +483,39 @@ public class FileStorageService {
     private FileInfo findInfo(String fileId) {
         return fileInfoMapper.selectOne(new LambdaQueryWrapper<FileInfo>()
                 .eq(FileInfo::getFileId, fileId));
+    }
+
+    /**
+     * 找一条「数据库和磁盘都算数」的已完成记录。
+     *
+     * <p>只看 status=1 不够：物理文件可能被外部删掉、被误清理，或者文件大小对不上。
+     * 这时如果仍然返回秒传命中，客户端拿到的就是一个永远下载失败的文件 id。
+     * 同一份内容可能有历史遗留的多条记录，逐条检查，找到第一条真的能用的。</p>
+     */
+    private FileInfo findUsableDone(String hash, long size) {
+        List<FileInfo> doneList = fileInfoMapper.findDoneListByHashAndSize(hash.toLowerCase(), size);
+        for (FileInfo done : doneList) {
+            if (isStorageIntact(done)) {
+                return done;
+            }
+            log.warn("已完成记录 {} 的物理文件缺失或大小不符，跳过：{}",
+                    done.getFileId(), done.getStoragePath());
+        }
+        return null;
+    }
+
+    /** 数据库说完成、磁盘上也确实有一份大小一致的文件，三者同时成立才算完好 */
+    private boolean isStorageIntact(FileInfo info) {
+        String path = info.getStoragePath();
+        if (path == null || path.isBlank()) {
+            return false;
+        }
+        try {
+            return storage.exists(path) && storage.size(path) == info.getFileSize();
+        } catch (RuntimeException e) {
+            log.warn("检查物理文件失败：{}", path, e);
+            return false;
+        }
     }
 
     /** 内容锁的 key：同一 (hash, size) 在磁盘上只有一份成品，所有引用都靠它互斥 */
@@ -477,8 +576,9 @@ public class FileStorageService {
                     if (n == 0) {
                         return 0;
                     }
-                    storage.deleteChunks(stale.getFileId());
+                    // 先删元数据再删盘：中间崩溃时留下的是可被孤儿目录扫描发现的目录
                     fileChunkMapper.deleteByFileId(stale.getFileId());
+                    storage.deleteChunks(stale.getFileId());
                     return n;
                 });
                 if (deleted == 0) {
@@ -492,10 +592,11 @@ public class FileStorageService {
             }
         }
         int orphanDirs = cleanupOrphanChunkDirs(Duration.ofMinutes(minutes));
+        int orphanFiles = cleanupOrphanFinishedFiles(Duration.ofHours(props.getOrphanFileGraceHours()));
         int tempFiles = storage.cleanupTemporary(Duration.ofMinutes(minutes));
-        if (removed > 0 || orphanDirs > 0 || tempFiles > 0) {
-            log.info("临时文件清理完成：过期任务 {} 个，孤儿分片目录 {} 个，残留文件 {} 个",
-                    removed, orphanDirs, tempFiles);
+        if (removed > 0 || orphanDirs > 0 || orphanFiles > 0 || tempFiles > 0) {
+            log.info("临时文件清理完成：过期任务 {} 个，孤儿分片目录 {} 个，孤儿成品 {} 个，残留文件 {} 个",
+                    removed, orphanDirs, orphanFiles, tempFiles);
         }
     }
 
@@ -518,10 +619,47 @@ public class FileStorageService {
                 if (row != null && row.getStatus() == FileInfo.STATUS_UPLOADING) {
                     return false;
                 }
-                storage.deleteChunks(fileId);
                 // 完成态任务理论上没有分片元数据了；崩溃残留的一并清掉
                 fileChunkMapper.deleteByFileId(fileId);
+                storage.deleteChunks(fileId);
                 log.info("回收孤儿分片目录：{}", fileId);
+                return true;
+            });
+            if (deleted) {
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * 回收 files/ 下没有数据库记录引用的成品文件。
+     *
+     * <p>正常流程不会产生：put 成功后必定 markDone，删除最后引用时也会删盘。但进程在
+     * 「put 完成、markDone 之前」被杀，或者数据库被手工改过，就会留下拿不回来的垃圾。
+     * 三道保险防止误删：</p>
+     * <ol>
+     *   <li>只处理超过 {@code orphan-file-grace-hours}（默认 7 天）没变化的文件；</li>
+     *   <li>拿该 fileId 的写锁，与 complete/delete 串行；</li>
+     *   <li>锁内再查一次引用计数，仍为 0 才删。</li>
+     * </ol>
+     */
+    private int cleanupOrphanFinishedFiles(Duration grace) {
+        Set<String> referenced = new HashSet<>(fileInfoMapper.findAllStoragePaths());
+        int removed = 0;
+        for (String path : storage.listFilePaths()) {
+            if (referenced.contains(path) || !storage.fileOlderThan(path, grace)) {
+                continue;
+            }
+            String fileId = path.substring(path.lastIndexOf('/') + 1);
+            boolean deleted = locks.write(fileId, () -> {
+                if (fileInfoMapper.countByStoragePath(path) > 0) {
+                    return false;
+                }
+                if (!storage.delete(path)) {
+                    return false;
+                }
+                log.info("回收孤儿成品文件：{}", path);
                 return true;
             });
             if (deleted) {
@@ -534,6 +672,9 @@ public class FileStorageService {
     public InputStream openForRead(FileInfo info) {
         if (info.getStatus() != FileInfo.STATUS_DONE) {
             throw new BizException(10006, "文件尚未上传完成，无法下载");
+        }
+        if (!isStorageIntact(info)) {
+            throw new BizException(20006, "存储中的文件缺失或大小不符，无法下载");
         }
         try {
             return storage.open(info.getStoragePath());

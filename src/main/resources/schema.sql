@@ -27,7 +27,11 @@ CREATE TABLE `file_info`
     -- 秒传的查询条件就是 (file_hash, file_size, status)，做成联合索引直接命中
     KEY `idx_hash_size_status` (`file_hash`, `file_size`, `status`),
     -- 删除时按 storage_path 数引用行数，秒传产生的多行会共享同一个物理文件
-    KEY `idx_storage_path` (`storage_path`)
+    KEY `idx_storage_path` (`storage_path`),
+    -- 定时清理的查询条件就是 (status = 0, update_time < cutoff)
+    KEY `idx_status_update` (`status`, `update_time`),
+    -- 列表按状态过滤后按 id 倒序分页
+    KEY `idx_status_id` (`status`, `id`)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='文件主表';
 

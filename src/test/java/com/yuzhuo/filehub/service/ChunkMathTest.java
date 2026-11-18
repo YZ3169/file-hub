@@ -1,10 +1,12 @@
 package com.yuzhuo.filehub.service;
 
+import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.entity.FileInfo;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * 分片总数由服务端推导。这几个边界是线上最容易出事的地方：
@@ -46,6 +48,23 @@ class ChunkMathTest {
     void largeFile() {
         long size = 30L * 1024 * 1024 * 1024;
         assertEquals(6144, FileStorageService.calcChunkTotal(size, CHUNK));
+    }
+
+    @Test
+    @DisplayName("分片数超过 int 上限：明确报错而不是静默截断")
+    void rejectsChunkTotalOverflow() {
+        // 分片数 = Integer.MAX_VALUE + 1，刚好越过 int 上限
+        long tooLarge = (long) Integer.MAX_VALUE * CHUNK + 1;
+        BizException ex = assertThrows(BizException.class,
+                () -> FileStorageService.calcChunkTotal(tooLarge, CHUNK));
+        assertEquals(10007, ex.getCode());
+    }
+
+    @Test
+    @DisplayName("非法参数：负数大小、0 分片大小")
+    void rejectsInvalidArgs() {
+        assertThrows(BizException.class, () -> FileStorageService.calcChunkTotal(-1, CHUNK));
+        assertThrows(BizException.class, () -> FileStorageService.calcChunkTotal(1, 0));
     }
 
     @Test

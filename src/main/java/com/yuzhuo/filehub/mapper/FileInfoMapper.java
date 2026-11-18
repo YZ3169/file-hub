@@ -14,10 +14,14 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
 
     /**
      * 秒传查询：同 hash + 同大小且已完成的文件才算命中。
+     *
+     * <p>返回多条而不是一条：正常情况下同一内容只有一份物理文件，但历史上可能留下
+     * 多条指向不同 storage_path 的记录（早期去重漏洞/手工操作）。调用方逐条检查
+     * 物理文件是否真的存在，避免命中的是一条「库里有、盘上没有」的坏记录。</p>
      */
     @Select("SELECT * FROM file_info WHERE file_hash = #{hash} AND file_size = #{size} "
-            + "AND status = 1 ORDER BY id LIMIT 1")
-    FileInfo findDoneByHashAndSize(String hash, long size);
+            + "AND status = 1 ORDER BY id LIMIT 50")
+    List<FileInfo> findDoneListByHashAndSize(@Param("hash") String hash, @Param("size") long size);
 
     /**
      * 数一下还有几行逻辑文件引用同一个物理文件——秒传会让多行共享一个 storage_path，
@@ -58,6 +62,11 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
     /** 仍在进行中的任务 id，用于判断 chunks/ 下哪些目录是孤儿 */
     @Select("SELECT file_id FROM file_info WHERE status = 0")
     List<String> findUploadingFileIds();
+
+    /** 所有被引用的物理文件路径，用于判断 files/ 下哪些成品是孤儿 */
+    @Select("SELECT DISTINCT storage_path FROM file_info "
+            + "WHERE status = 1 AND storage_path IS NOT NULL")
+    List<String> findAllStoragePaths();
 
     @Select("SELECT COUNT(*) FROM file_info WHERE status = 1")
     long countDone();

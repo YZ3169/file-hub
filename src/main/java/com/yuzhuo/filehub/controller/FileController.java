@@ -6,6 +6,7 @@ import com.yuzhuo.filehub.dto.CheckResponse;
 import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.dto.InitUploadResponse;
+import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.StatsResponse;
 import com.yuzhuo.filehub.dto.UploadStatusResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
@@ -99,9 +100,23 @@ public class FileController {
         return Result.ok(service.status(fileId));
     }
 
+    /**
+     * 分页文件列表。
+     *
+     * @param page    页码，从 1 开始（服务端会夹到 ≥ 1）
+     * @param size    每页条数，1–100（服务端会夹紧）
+     * @param keyword 可选，按文件名 / SHA-256 / fileId 模糊匹配
+     * @param status  可选，0=上传中 1=已完成
+     * @param sort    time_desc（默认）/ time_asc / size_desc / size_asc / name_asc
+     */
     @GetMapping("/list")
-    public Result<List<FileVO>> list() {
-        return Result.ok(service.list());
+    public Result<PageResponse<FileVO>> list(
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "size", defaultValue = "20") int size,
+            @RequestParam(value = "keyword", required = false) String keyword,
+            @RequestParam(value = "status", required = false) Integer status,
+            @RequestParam(value = "sort", defaultValue = "time_desc") String sort) {
+        return Result.ok(service.list(page, size, keyword, status, sort));
     }
 
     @GetMapping("/stats")

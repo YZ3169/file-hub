@@ -203,6 +203,26 @@ class LocalDiskStorageTest {
     }
 
     @Test
+    @DisplayName("成品扫描只认 UUID 文件名，并能按 mtime 判断是否过宽限期")
+    void listsFinishedFilesAndChecksAge() throws IOException {
+        Path src = Files.writeString(root.resolve("src.bin"), "payload");
+        String rel = storage.buildRelativePath(ID);
+        storage.put(rel, src);
+
+        Path ignored = root.resolve("files").resolve("2026/11/18/not-a-uuid");
+        Files.writeString(ignored, "manual");
+
+        assertEquals(List.of(rel), storage.listFilePaths());
+        assertFalse(storage.fileOlderThan(rel, Duration.ofHours(1)));
+
+        Files.setLastModifiedTime(root.resolve("files").resolve(rel),
+                FileTime.from(Instant.now().minus(Duration.ofHours(2))));
+        assertTrue(storage.fileOlderThan(rel, Duration.ofHours(1)));
+        assertFalse(storage.fileOlderThan("2026/11/18/" + OTHER_ID, Duration.ofHours(1)),
+                "不存在的成品不应被当成可删除的孤儿");
+    }
+
+    @Test
     @DisplayName("成品路径按日期分目录，不会全挤在一个目录里")
     void relativePathIsDateSharded() {
         String rel = storage.buildRelativePath(ID);

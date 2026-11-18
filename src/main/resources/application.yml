@@ -9,8 +9,10 @@ spring:
   servlet:
     multipart:
       enabled: true
-      max-file-size: 512MB        # 单个分片其实只有几 MB，这里给足余量
-      max-request-size: 512MB
+      # 只比 chunk-size（5MB）大 1MB：接口一次只收一个分片，没必要给 512MB 的余量，
+      # 否则一个超大请求就能把 Tomcat 的临时目录/堆打满。改 chunk-size 时同步调整这里。
+      max-file-size: 6MB
+      max-request-size: 6MB
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/file_hub?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false&rewriteBatchedStatements=true
@@ -32,6 +34,9 @@ file-hub:
   chunk-size: 5242880            # 5MB
   # 上传任务多久没动静就认为可以清理（分钟）
   upload-expire-minutes: 1440
+  # files/ 下没有任何数据库记录引用的成品文件，超过这个时长才回收（小时）。
+  # 给足 7 天，避免数据库临时不可用/配置指错库时误删仍在使用的文件。
+  orphan-file-grace-hours: 168
   # 定时回收废弃任务 / 残留临时文件的间隔
   cleanup-interval-ms: 600000
   cleanup-initial-delay-ms: 60000

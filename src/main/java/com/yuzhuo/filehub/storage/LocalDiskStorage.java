@@ -200,6 +200,35 @@ public class LocalDiskStorage implements StorageBackend {
     }
 
     /**
+     * files/ 下所有成品文件的相对路径（{@code yyyy/MM/dd/{fileId}}，统一用 / 分隔）。
+     * 只返回文件名是 UUID 形状的普通文件，避免把用户手工放进来的东西当成成品清理。
+     */
+    public List<String> listFilePaths() {
+        if (!Files.isDirectory(filesDir)) {
+            return List.of();
+        }
+        try (Stream<Path> s = Files.walk(filesDir)) {
+            return s.filter(Files::isRegularFile)
+                    .filter(p -> SAFE_ID.matcher(p.getFileName().toString()).matches())
+                    .map(p -> filesDir.relativize(p).toString().replace('\\', '/'))
+                    .toList();
+        } catch (IOException e) {
+            log.warn("读取成品根目录失败：{}", filesDir, e);
+            return List.of();
+        }
+    }
+
+    /** 成品文件是否已经超过 age 没有任何变化（用于孤儿文件回收的宽限期） */
+    public boolean fileOlderThan(String relativePath, Duration age) {
+        try {
+            FileTime t = Files.getLastModifiedTime(resolveSafe(relativePath));
+            return t.toInstant().isBefore(Instant.now().minus(age));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
      * 任务目录是否已经超过 age 没有任何变化。
      * 每片原子改名都会更新目录 mtime，所以长期不变的目录可以判定为无人使用。
      */

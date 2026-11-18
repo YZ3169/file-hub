@@ -258,9 +258,25 @@ R="$(api POST "/api/file/$LIAR_ID/complete")"
 check_eq "30003" "$(jget "$R" "['code']")" "摘要对不上时合并被拒绝（code=30003）"
 check_contains "$(jget "$R" "['msg']")" "校验失败" "错误信息说明了原因"
 
-# 被拒绝的坏文件不该出现在列表里，也不该留下半成品
-R="$(api GET /api/file/list)"
+# 被拒绝的坏文件不该出现在列表里，也不该留下半成品（列表现在是分页结构）
+R="$(api GET "/api/file/list?page=1&size=100")"
+check_eq "0" "$(jget "$R" "['code']")" "GET /api/file/list 返回成功"
 check_contains "$R" '"status":0' "坏文件仍停留在『上传中』，没有变成已完成"
+check_contains "$R" '"total"' "列表返回总条数（分页元数据）"
+
+# 分页参数必须真的生效：size=1 时只返回一条，且 total 是总数而不是当前页条数
+R="$(api GET "/api/file/list?page=1&size=1")"
+check_eq "1" "$(jget "$R" "['data']['items'].__len__()")" "分页 size=1 只返回 1 条"
+check_eq "True" "$(jget "$R" "['data']['total'] > 1")" "分页 total 是总条数而不是当前页条数"
+
+# 关键字搜索：按文件名命中
+R="$(api GET "/api/file/list?keyword=%E5%8E%8B%E5%8A%9B%E6%B5%8B%E8%AF%95&size=100")"
+check_eq "True" "$(jget "$R" "['data']['total'] > 0")" "按文件名关键字搜索能命中"
+
+# 状态过滤：status=0 只返回上传中的记录
+R="$(api GET "/api/file/list?status=0&size=100")"
+check_eq "True" "$(jget "$R" "['data']['items'] and all(x['status'] == 0 for x in d['data']['items'])")" \
+         "status=0 过滤后只剩上传中的记录"
 
 # ---------------------------------------------------------------- 4.5 分片级校验
 
@@ -369,6 +385,10 @@ check_contains "$R" '"code":10005' "最后一条引用删除后，文件不存�
 
 LEFT="$(find "$STORAGE_ROOT/files" -type f 2>/dev/null | wc -l)"
 echo "  ↳ 存储目录里还剩 $LEFT 个成品文件"
+
+# 完整性校验用例故意留下一个「上传中」任务，这里删掉，
+# 保证脚本可以反复执行而不在库里攒测试垃圾（删除上传中任务会连分片一起清）。
+api DELETE "/api/file/$LIAR_ID" > /dev/null
 
 # ---------------------------------------------------------------- 汇总
 
