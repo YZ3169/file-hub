@@ -523,6 +523,20 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 脚本固定了 MSI 的 `UpgradeCode`，以后改版本号发布时升级会替换旧版本，
 而不是并存两份。桌面版由 jpackage 自带的 JRE 启动，目标机器不需要装 Java。
 
+### 发布给别人下载
+
+把 `pom.xml` 的版本号和标签对齐后推 tag：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+`.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
+构建 MSI 和免安装 zip，并自动创建 GitHub Release——别人从 Releases 页面直接下载即可。
+版本号与 tag 不一致时流水线会失败，避免发出名字对不上的包。
+也可以在 Actions 页面手动 `workflow_dispatch`：只构建并保留产物，不创建 Release。
+
 本机验证结果（2026-11-18）：
 
 - `mvn test`：94 个测试全绿，其中 `DesktopDatabaseIntegrationTest` 用临时 H2 文件库

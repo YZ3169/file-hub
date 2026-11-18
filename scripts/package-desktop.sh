@@ -20,11 +20,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="FileHub"
-APP_VERSION="1.0.0"
-# 固定 UUID：以后发布新版本时 MSI 才能走「升级」而不是并存两份
-UPGRADE_UUID="6f1c2b9e-3a7d-4c5e-9b21-8d4f0a6c7e13"
-OUT="$ROOT/build/desktop"
-JAR="file-hub-${APP_VERSION}.jar"
 
 if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/jpackage" ]; then
     if [ -x "/d/safe/jdk/jdk17/bin/jpackage" ]; then
@@ -35,6 +30,18 @@ if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/jpackage" ]; then
     fi
 fi
 export PATH="$JAVA_HOME/bin:$PATH"
+
+# 版本跟 pom.xml 保持一致；发布 Tag 时由 CI 校验 tag 与它是否对应
+APP_VERSION="$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout 2>/dev/null | tr -d '\r' | tail -n1)"
+APP_VERSION="${APP_VERSION:-1.0.0}"
+if ! printf '%s' "$APP_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
+    echo "无法从 pom.xml 读取合法版本号：$APP_VERSION" >&2
+    exit 1
+fi
+# 固定 UUID：以后发布新版本时 MSI 才能走「升级」而不是并存两份
+UPGRADE_UUID="6f1c2b9e-3a7d-4c5e-9b21-8d4f0a6c7e13"
+OUT="$ROOT/build/desktop"
+JAR="file-hub-${APP_VERSION}.jar"
 
 echo "==> 1/4 构建前端"
 (cd web && npm run build)
