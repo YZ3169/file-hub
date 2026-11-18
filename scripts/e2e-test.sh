@@ -21,6 +21,8 @@ CHUNK=5242880                                   # 5MB，和 application.yml 保�
 BIG_MB=120                                      # 主用例文件大小
 SMALL_MB=12                                     # 完整性校验用例文件大小
 CONCURRENCY=4                                   # 分片上传并发度
+# 用来做「磁盘上的分片被改坏」用例；服务端不在本机时用 FILE_HUB_ROOT 指过去
+STORAGE_ROOT="${FILE_HUB_ROOT:-D:/Projects/file-hub-data}"
 
 WORK="$(mktemp -d)"
 PASS=0
@@ -112,9 +114,11 @@ while [ "$i" -lt "$CHUNK_TOTAL" ]; do
         idx=$((i + j))
         [ "$idx" -ge "$CHUNK_TOTAL" ] && continue
         part="$(printf '%s/big.part.%03d' "$WORK" "$idx")"
+        part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
         (
             r="$(curl -s -X POST "$BASE/api/file/chunk" \
-                    -F "fileId=$FILE_ID" -F "index=$idx" -F "chunk=@$part")"
+                    -F "fileId=$FILE_ID" -F "index=$idx" \
+                    -F "chunkHash=$part_hash" -F "chunk=@$part")"
             echo "$r" | grep -q '"code":0' || echo "分片 $idx 上传失败: $r" >&2
         ) &
         pids+=($!)
@@ -127,7 +131,9 @@ echo "  已上传 $uploaded 片"
 check_eq "$CHUNK_TOTAL" "$uploaded" "所有分片都提交了"
 
 # 1.5 重复上传同一个分片，应当幂等（不报错、不产生第二片）
-R="$(curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$FILE_ID" -F "index=0" -F "chunk=@$WORK/big.part.000")"
+DUP_HASH="$(sha256sum "$WORK/big.part.000" | cut -d' ' -f1)"
+R="$(curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$FILE_ID" -F "index=0" \
+        -F "chunkHash=$DUP_HASH" -F "chunk=@$WORK/big.part.000")"
 check_eq "0" "$(jget "$R" "['code']")" "重复上传同一分片被幂等处理"
 
 # 1.6 合并
@@ -146,6 +152,30 @@ check_eq "0" "$(jget "$R" "['code']")" "重复合并是幂等的"
 curl -s -o "$WORK/out.bin" "$BASE/api/file/$FILE_ID/download"
 OUT_HASH="$(sha256sum "$WORK/out.bin" | cut -d' ' -f1)"
 check_eq "$BIG_HASH" "$OUT_HASH" "下载回来的文件与原文件 SHA-256 一致"
+
+# 1.9 Range 下载：只取前 100 字节，应返回 206 + Content-Range，且字节完全一致
+RANGE_CODE="$(curl -s -D "$WORK/range.headers" -o "$WORK/range.bin" \
+    -H 'Range: bytes=0-99' -w '%{http_code}' "$BASE/api/file/$FILE_ID/download")"
+check_eq "206" "$RANGE_CODE" "Range 请求返回 206 Partial Content"
+check_contains "$(cat "$WORK/range.headers")" "Content-Range: bytes 0-99/$BIG_SIZE" \
+    "响应带正确的 Content-Range"
+check_eq "$(head -c 100 "$WORK/big.bin" | sha256sum | cut -d' ' -f1)" \
+    "$(sha256sum "$WORK/range.bin" | cut -d' ' -f1)" "Range 返回的前 100 字节与原文件一致"
+
+# 1.10 后缀 Range：最后 100 字节
+curl -s -o "$WORK/tail.bin" -H 'Range: bytes=-100' "$BASE/api/file/$FILE_ID/download"
+check_eq "$(tail -c 100 "$WORK/big.bin" | sha256sum | cut -d' ' -f1)" \
+    "$(sha256sum "$WORK/tail.bin" | cut -d' ' -f1)" "后缀 Range 取到最后 100 字节"
+
+# 1.11 不可满足的 Range 应返回 416，而不是 200 或 500
+RANGE_BAD="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H 'Range: bytes=999999999999-' "$BASE/api/file/$FILE_ID/download")"
+check_eq "416" "$RANGE_BAD" "越界 Range 返回 416"
+
+# 1.12 统计接口
+R="$(api GET /api/file/stats)"
+check_eq "0" "$(jget "$R" "['code']")" "GET /api/file/stats 返回成功"
+check_contains "$R" '"savedBytes"' "统计接口包含秒传节省字节数"
 
 # ---------------------------------------------------------------- 2. 秒传
 
@@ -190,6 +220,12 @@ check_eq "$HALF" "$(jget "$R" "['data']['uploadedIndexes'].__len__()")" \
          "服务端回传了 $HALF 个已传分片序号"
 echo "  ↳ uploadedIndexes = $UPLOADED"
 
+# /status 也应以磁盘为准给出同样的已传分片
+R="$(api GET "/api/file/$RS_ID/status")"
+check_eq "$HALF" "$(jget "$R" "['data']['uploadedIndexes'].__len__()")" \
+         "GET /status 以磁盘为准返回 $HALF 个已传分片"
+check_eq "False" "$(jget "$R" "['data']['done']")" "未合并前 /status 的 done=false"
+
 # 只补缺失的分片
 for idx in $(seq "$HALF" $((RS_TOTAL - 1))); do
     part="$(printf '%s/resume.part.%03d' "$WORK" "$idx")"
@@ -226,6 +262,96 @@ check_contains "$(jget "$R" "['msg']")" "校验失败" "错误信息说明了原
 R="$(api GET /api/file/list)"
 check_contains "$R" '"status":0' "坏文件仍停留在『上传中』，没有变成已完成"
 
+# ---------------------------------------------------------------- 4.5 分片级校验
+
+section "4.5 分片级校验（坏片在当前这一片就被拦下）"
+head -c $((SMALL_MB * 1024 * 1024)) /dev/urandom > "$WORK/badchunk.bin"
+BC_HASH="$(sha256sum "$WORK/badchunk.bin" | cut -d' ' -f1)"
+BC_SIZE="$(stat -c %s "$WORK/badchunk.bin")"
+split -b "$CHUNK" -d -a 3 "$WORK/badchunk.bin" "$WORK/badchunk.part."
+
+R="$(post_json /api/file/init "{\"fileName\":\"坏分片测试.bin\",\"fileSize\":$BC_SIZE,\"fileHash\":\"$BC_HASH\"}")"
+BC_ID="$(jget "$R" "['data']['fileId']")"
+BC_TOTAL="$(jget "$R" "['data']['chunkTotal']")"
+
+# 故意把 index=0 的摘要写成另一个文件的摘要：服务端落盘时复算，应当拒绝这一片
+WRONG_HASH="$(sha256sum "$WORK/liar-b.bin" | cut -d' ' -f1)"
+R="$(curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$BC_ID" -F "index=0" \
+        -F "chunkHash=$WRONG_HASH" -F "chunk=@$WORK/badchunk.part.000")"
+check_eq "30004" "$(jget "$R" "['code']")" "分片摘要不符时返回 30004"
+check_contains "$(jget "$R" "['msg']")" "请重传该分片" "错误信息提示只重传该分片"
+
+# 被拒绝的片不能落盘，也不能留下 .incoming 临时文件
+R="$(api GET "/api/file/$BC_ID/status")"
+check_eq "0" "$(jget "$R" "['data']['uploadedIndexes'].__len__()")" \
+         "坏分片没有计入已传列表"
+LEFT_IN="$(find "$STORAGE_ROOT/chunks/$BC_ID" -name '*.incoming' 2>/dev/null | wc -l | tr -d ' ')"
+check_eq "0" "$LEFT_IN" "坏分片没有留下 .incoming 临时文件"
+
+# 用正确的摘要重传，再把其余分片传完，最终仍应合并成功
+for idx in $(seq 0 $((BC_TOTAL - 1))); do
+    part="$(printf '%s/badchunk.part.%03d' "$WORK" "$idx")"
+    part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
+    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$BC_ID" -F "index=$idx" \
+        -F "chunkHash=$part_hash" -F "chunk=@$part" > /dev/null
+done
+R="$(api POST "/api/file/$BC_ID/complete")"
+check_eq "0" "$(jget "$R" "['code']")" "坏片重传后合并成功"
+
+# ---------------------------------------------------------------- 4.6 坏片自愈
+
+section "4.6 合并时发现磁盘分片损坏，只补坏片"
+head -c $((SMALL_MB * 1024 * 1024)) /dev/urandom > "$WORK/heal.bin"
+HEAL_HASH="$(sha256sum "$WORK/heal.bin" | cut -d' ' -f1)"
+HEAL_SIZE="$(stat -c %s "$WORK/heal.bin")"
+split -b "$CHUNK" -d -a 3 "$WORK/heal.bin" "$WORK/heal.part."
+
+R="$(post_json /api/file/init "{\"fileName\":\"坏片自愈测试.bin\",\"fileSize\":$HEAL_SIZE,\"fileHash\":\"$HEAL_HASH\"}")"
+HEAL_ID="$(jget "$R" "['data']['fileId']")"
+HEAL_TOTAL="$(jget "$R" "['data']['chunkTotal']")"
+for idx in $(seq 0 $((HEAL_TOTAL - 1))); do
+    part="$(printf '%s/heal.part.%03d' "$WORK" "$idx")"
+    part_hash="$(sha256sum "$part" | cut -d' ' -f1)"
+    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$HEAL_ID" -F "index=$idx" \
+        -F "chunkHash=$part_hash" -F "chunk=@$part" > /dev/null
+done
+
+# 模拟"落盘之后磁盘被悄悄改坏"：大小不变，只翻一个字节
+HEAL_CHUNK="$STORAGE_ROOT/chunks/$HEAL_ID/1.part"
+if [ -f "$HEAL_CHUNK" ]; then
+    # 用 Python 翻一个字节，比 dd 在 Git Bash 下更可移植
+    python - "$HEAL_CHUNK" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p, 'r+b') as f:
+    f.seek(128)
+    b = f.read(1)
+    f.seek(128)
+    f.write(bytes([b[0] ^ 0xFF]))
+PY
+    R="$(api POST "/api/file/$HEAL_ID/complete")"
+    check_eq "30005" "$(jget "$R" "['code']")" "合并时发现坏片并返回 30005"
+    check_contains "$(jget "$R" "['msg']")" "损坏分片" "错误信息说明是损坏分片"
+
+    R="$(api GET "/api/file/$HEAL_ID/status")"
+    check_eq "False" "$(jget "$R" "['data']['uploadedIndexes'].__contains__(1)")" \
+             "坏片已从已传列表中剔除"
+    check_eq "$((HEAL_TOTAL - 1))" "$(jget "$R" "['data']['uploadedIndexes'].__len__()")" \
+             "其余分片仍然保留，只需补传坏的那一片"
+
+    # 只补传 index=1，再合并
+    curl -s -X POST "$BASE/api/file/chunk" -F "fileId=$HEAL_ID" -F "index=1" \
+        -F "chunkHash=$(sha256sum "$WORK/heal.part.001" | cut -d' ' -f1)" \
+        -F "chunk=@$WORK/heal.part.001" > /dev/null
+    R="$(api POST "/api/file/$HEAL_ID/complete")"
+    check_eq "0" "$(jget "$R" "['code']")" "只补坏片后合并成功"
+    curl -s -o "$WORK/heal-out.bin" "$BASE/api/file/$HEAL_ID/download"
+    check_eq "$HEAL_HASH" "$(sha256sum "$WORK/heal-out.bin" | cut -d' ' -f1)" \
+             "自愈后的文件内容与原文件一致"
+else
+    bad "找不到分片文件 $HEAL_CHUNK（检查 STORAGE_ROOT / FILE_HUB_ROOT）"
+fi
+
 # ---------------------------------------------------------------- 5. 引用计数删除
 
 section "5. 删除与引用计数"
@@ -241,7 +367,6 @@ api DELETE "/api/file/$FILE_ID" > /dev/null
 R="$(api GET "/api/file/$FILE_ID/download")"
 check_contains "$R" '"code":10005' "最后一条引用删除后，文件不存在了"
 
-STORAGE_ROOT="D:/Projects/file-hub-data"
 LEFT="$(find "$STORAGE_ROOT/files" -type f 2>/dev/null | wc -l)"
 echo "  ↳ 存储目录里还剩 $LEFT 个成品文件"
 

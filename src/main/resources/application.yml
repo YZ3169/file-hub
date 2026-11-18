@@ -32,6 +32,9 @@ file-hub:
   chunk-size: 5242880            # 5MB
   # 上传任务多久没动静就认为可以清理（分钟）
   upload-expire-minutes: 1440
+  # 定时回收废弃任务 / 残留临时文件的间隔
+  cleanup-interval-ms: 600000
+  cleanup-initial-delay-ms: 60000
 
 logging:
   level:

@@ -1,5 +1,6 @@
 package com.yuzhuo.filehub.service;
 
+import com.yuzhuo.filehub.entity.FileInfo;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -45,5 +46,17 @@ class ChunkMathTest {
     void largeFile() {
         long size = 30L * 1024 * 1024 * 1024;
         assertEquals(6144, FileStorageService.calcChunkTotal(size, CHUNK));
+    }
+
+    @Test
+    @DisplayName("分片应有大小：只有最后一片按剩余字节截断")
+    void expectedChunkSize() {
+        FileInfo info = new FileInfo();
+        info.setChunkSize(CHUNK);
+        info.setFileSize(CHUNK * 2L + 123);
+
+        assertEquals(CHUNK, FileStorageService.expectedChunkSize(info, 0));
+        assertEquals(CHUNK, FileStorageService.expectedChunkSize(info, 1));
+        assertEquals(123, FileStorageService.expectedChunkSize(info, 2));
     }
 }

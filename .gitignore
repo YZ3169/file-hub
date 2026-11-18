@@ -9,3 +9,9 @@ target/
 # 存储根目录在 D:/Projects/file-hub-data，不在工程内，
 # 但如果有人改了配置指向工程内，别把上传的文件提交上去
 file-hub-data/
+
+# 前端依赖与本地缓存。构建产物不在这里：
+# vite.config.js 直接把产物写进 src/main/resources/static/，要提交的是那一份
+web/node_modules/
+web/dist/
+web/.vite/

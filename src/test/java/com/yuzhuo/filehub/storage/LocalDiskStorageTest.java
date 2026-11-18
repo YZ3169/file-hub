@@ -2,6 +2,7 @@ package com.yuzhuo.filehub.storage;
 
 import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.config.StorageProperties;
+import com.yuzhuo.filehub.util.HashUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -12,6 +13,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -66,9 +70,63 @@ class LocalDiskStorageTest {
         storage.saveChunk(ID, 0, in("ok"));
         // 手工造一个"写了一半"的中间产物，模拟进程被杀
         Path dir = storage.chunkFile(ID, 0).getParent();
-        Files.writeString(dir.resolve("3.part.incoming"), "half");
+        Files.writeString(dir.resolve("3.abc.part.incoming"), "half");
 
         assertEquals(List.of(0), storage.listChunksOnDisk(ID));
+    }
+
+    @Test
+    @DisplayName("分片摘要不匹配时拒绝落盘，并保留之前正确的旧分片")
+    void rejectsBadChunkWithoutOverwritingGoodChunk() throws IOException {
+        byte[] good = "correct-chunk".getBytes(StandardCharsets.UTF_8);
+        byte[] bad = "corrupted-bytes".getBytes(StandardCharsets.UTF_8);
+        String goodHash = HashUtil.sha256Hex(good);
+
+        LocalDiskStorage.ChunkWriteResult first =
+                storage.saveChunk(ID, 0, new ByteArrayInputStream(good), goodHash, good.length);
+        assertTrue(first.accepted());
+
+        // 客户端重传同一片时带了损坏的字节：服务端复算摘要对不上
+        LocalDiskStorage.ChunkWriteResult second =
+                storage.saveChunk(ID, 0, new ByteArrayInputStream(bad), goodHash, bad.length);
+        assertFalse(second.accepted());
+        assertEquals(goodHash, first.sha256());
+        assertEquals("correct-chunk", new String(Files.readAllBytes(storage.chunkFile(ID, 0)),
+                StandardCharsets.UTF_8), "坏重传不能把已经正确落盘的旧分片覆盖掉");
+    }
+
+    @Test
+    @DisplayName("分片大小不符时拒绝落盘，也不留 .incoming 垃圾")
+    void rejectsWrongSizeChunk() throws IOException {
+        byte[] data = "abc".getBytes(StandardCharsets.UTF_8);
+        LocalDiskStorage.ChunkWriteResult result = storage.saveChunk(
+                ID, 0, new ByteArrayInputStream(data), HashUtil.sha256Hex(data), data.length + 1);
+
+        assertFalse(result.accepted());
+        assertFalse(storage.chunkExists(ID, 0));
+
+        Path dir = storage.chunkFile(ID, 0).getParent();
+        try (var files = Files.list(dir)) {
+            assertTrue(files.noneMatch(p -> p.toString().endsWith(".incoming")));
+        }
+    }
+
+    @Test
+    @DisplayName("临时文件清理只删过期的 .incoming 和 .merging")
+    void cleanupTemporaryOnlyRemovesStaleFiles() throws IOException {
+        Path chunkDir = storage.chunkFile(ID, 0).getParent();
+        Files.createDirectories(chunkDir);
+        Path staleIncoming = Files.writeString(chunkDir.resolve("0.abc.part.incoming"), "half");
+        Path freshIncoming = Files.writeString(chunkDir.resolve("1.def.part.incoming"), "half");
+
+        Files.setLastModifiedTime(staleIncoming,
+                FileTime.from(Instant.now().minus(Duration.ofHours(2))));
+
+        int deleted = storage.cleanupTemporary(Duration.ofHours(1));
+
+        assertEquals(1, deleted);
+        assertFalse(Files.exists(staleIncoming));
+        assertTrue(Files.exists(freshIncoming));
     }
 
     @Test

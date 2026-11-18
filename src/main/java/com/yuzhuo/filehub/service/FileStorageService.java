@@ -7,6 +7,8 @@ import com.yuzhuo.filehub.dto.CheckResponse;
 import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.dto.InitUploadResponse;
+import com.yuzhuo.filehub.dto.StatsResponse;
+import com.yuzhuo.filehub.dto.UploadStatusResponse;
 import com.yuzhuo.filehub.entity.FileChunk;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.mapper.FileChunkMapper;
@@ -15,7 +17,7 @@ import com.yuzhuo.filehub.storage.LocalDiskStorage;
 import com.yuzhuo.filehub.util.HashUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DuplicateKeyException;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,10 +27,17 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.DigestInputStream;
 import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.IntStream;
@@ -141,10 +150,16 @@ public class FileStorageService {
     // ==================================================================
 
     /**
-     * 落盘一个分片。并发上传同一分片时靠 file_chunk 的唯一索引兜底——
-     * 第二个请求会撞唯一键，被当作"已经传过了"忽略掉，而不是写坏数据。
+     * 落盘一个分片，并做分片级完整性校验。
+     *
+     * <p>客户端把这一片的 SHA-256 一起带上来，服务端边落盘边复算。这样网络传输中出现
+     * 位翻转时，错误在这里就被拦住（返回 30004，可重试），而不是等到几十片拼完、
+     * 整文件哈希对不上才发现——那时用户只能整文件重传。</p>
+     *
+     * <p>并发上传同一分片时靠 file_chunk 的唯一索引 + upsert 兜底：
+     * 后到的会覆盖元数据，但磁盘上的分片仍是原子改名，不会出现半截文件。</p>
      */
-    public void saveChunk(String fileId, int index, InputStream in) {
+    public void saveChunk(String fileId, int index, InputStream in, String expectedChunkHash) {
         LocalDiskStorage.requireSafeId(fileId);
         FileInfo info = requireInfo(fileId);
 
@@ -157,24 +172,33 @@ public class FileStorageService {
             throw new BizException(10004, "分片序号越界：" + index + "，应在 [0, " + info.getChunkTotal() + ") 内");
         }
 
-        long written;
+        long expectedSize = expectedChunkSize(info, index);
+        LocalDiskStorage.ChunkWriteResult result;
         try {
-            written = storage.saveChunk(fileId, index, in);
+            result = storage.saveChunk(fileId, index, in, expectedChunkHash, expectedSize);
         } catch (IOException e) {
             throw new BizException(20003, "分片落盘失败：" + e.getMessage());
         }
 
-        try {
-            FileChunk c = new FileChunk();
-            c.setFileId(fileId);
-            c.setChunkIndex(index);
-            c.setChunkSize((int) written);
-            c.setCreateTime(LocalDateTime.now());
-            fileChunkMapper.insert(c);
-        } catch (DuplicateKeyException e) {
-            // 唯一索引 uk_file_chunk 拦下的重复分片。文件已经原子覆盖过，直接当成功
-            log.debug("分片重复上传，按幂等处理：fileId={} index={}", fileId, index);
+        if (!result.accepted()) {
+            // 注意：这种情况没有覆盖旧分片。客户端重传的坏字节不会把之前正确的那片弄丢
+            throw new BizException(30004,
+                    "分片 " + index + " 校验失败：收到 " + result.size() + " 字节 / SHA-256 " + result.sha256()
+                            + "，与声明的长度或摘要不一致，请重传该分片");
         }
+
+        fileChunkMapper.upsertChunk(fileId, index, result.size(), result.sha256());
+        fileInfoMapper.touchUploading(fileId);
+    }
+
+    public void saveChunk(String fileId, int index, InputStream in) {
+        saveChunk(fileId, index, in, null);
+    }
+
+    /** 第 index 片应有的字节数：除最后一片外都等于 chunkSize */
+    static long expectedChunkSize(FileInfo info, int index) {
+        long start = (long) index * info.getChunkSize();
+        return Math.min(info.getChunkSize(), info.getFileSize() - start);
     }
 
     // ==================================================================
@@ -214,9 +238,18 @@ public class FileStorageService {
             throw new BizException(30001, "还有 " + missing.size() + " 个分片没传完，缺失序号：" + abbreviate(missing));
         }
 
+        // 逐片摘要：数据库里记着每片上传时服务端复算过的 SHA-256
+        Map<Integer, String> expectedChunkHashes = new HashMap<>();
+        for (FileChunk c : fileChunkMapper.listChunkMeta(fileId)) {
+            if (c.getChunkHash() != null && !c.getChunkHash().isBlank()) {
+                expectedChunkHashes.put(c.getChunkIndex(), c.getChunkHash());
+            }
+        }
+
         Path merged = null;
         String actualHash;
         long actualSize = 0;
+        Set<Integer> corrupt = new HashSet<>();
         try {
             merged = storage.createMergeTmpFile(fileId);
             var digest = HashUtil.sha256();
@@ -224,15 +257,44 @@ public class FileStorageService {
                  BufferedOutputStream buffered = new BufferedOutputStream(fileOut, 1 << 16);
                  DigestOutputStream digestOut = new DigestOutputStream(buffered, digest)) {
                 for (int i = 0; i < info.getChunkTotal(); i++) {
-                    try (InputStream chunkIn = Files.newInputStream(storage.chunkFile(fileId, i))) {
-                        actualSize += chunkIn.transferTo(digestOut);
+                    // 每片单独算一次摘要，同时把字节写进整文件摘要流：
+                    // 磁盘只读一遍，却能同时回答"这一片对不对"和"整个文件对不对"
+                    MessageDigest chunkDigest = HashUtil.sha256();
+                    long chunkBytes;
+                    try (InputStream chunkIn = Files.newInputStream(storage.chunkFile(fileId, i));
+                         DigestInputStream digestIn = new DigestInputStream(chunkIn, chunkDigest)) {
+                        chunkBytes = digestIn.transferTo(digestOut);
+                    }
+                    actualSize += chunkBytes;
+
+                    if (chunkBytes != expectedChunkSize(info, i)) {
+                        corrupt.add(i);
+                    }
+                    String expectedChunkHash = expectedChunkHashes.get(i);
+                    if (expectedChunkHash != null) {
+                        String actualChunkHash = HexFormat.of().formatHex(chunkDigest.digest());
+                        if (!expectedChunkHash.equalsIgnoreCase(actualChunkHash)) {
+                            corrupt.add(i);
+                        }
                     }
                 }
             }
-            actualHash = java.util.HexFormat.of().formatHex(digest.digest());
+            actualHash = HexFormat.of().formatHex(digest.digest());
         } catch (IOException e) {
             deleteQuietly(merged);
             throw new BizException(20004, "合并分片失败：" + e.getMessage());
+        }
+
+        // --- 分片级校验失败：只删坏片，让客户端补传这几片，而不是整个文件重来 ---
+        if (!corrupt.isEmpty()) {
+            deleteQuietly(merged);
+            List<Integer> bad = corrupt.stream().sorted().toList();
+            for (int i : bad) {
+                storage.deleteChunk(fileId, i);
+                fileChunkMapper.deleteChunk(fileId, i);
+            }
+            throw new BizException(30005, "逐片校验发现 " + bad.size()
+                    + " 个损坏分片，已删除，请只补传这些分片：" + abbreviate(bad));
         }
 
         // --- 完整性校验：两道，都不能省 ---
@@ -297,6 +359,61 @@ public class FileStorageService {
     /** 已落盘的分片序号（以磁盘为准） */
     public List<Integer> uploadedIndexes(String fileId) {
         return storage.listChunksOnDisk(fileId);
+    }
+
+    /**
+     * 上传任务状态。以磁盘为准回答"现在到底有哪些片"——
+     * 暂停后继续、页面刷新重连、合并发现坏片后补传，都靠这个接口重新对齐。
+     */
+    public UploadStatusResponse status(String fileId) {
+        LocalDiskStorage.requireSafeId(fileId);
+        FileInfo info = requireInfo(fileId);
+        return new UploadStatusResponse(
+                info.getFileId(),
+                info.getFileName(),
+                info.getFileSize(),
+                info.getStatus(),
+                info.getStatus() == FileInfo.STATUS_DONE,
+                info.getChunkSize(),
+                info.getChunkTotal(),
+                storage.listChunksOnDisk(fileId));
+    }
+
+    public StatsResponse stats() {
+        long done = fileInfoMapper.countDone();
+        long uploading = fileInfoMapper.countUploading();
+        long logical = fileInfoMapper.sumLogicalBytes();
+        long physical = fileInfoMapper.sumPhysicalBytes();
+        return new StatsResponse(done, uploading, logical, physical, Math.max(0, logical - physical));
+    }
+
+    /**
+     * 回收「创建后再无动静」的上传任务。
+     *
+     * <p>判据是 update_time 而不是 create_time：用户可能花几小时传一个 20GB 的文件，
+     * 只要每片都在更新 update_time 就不该被回收。超过 upload-expire-minutes 一片都没落盘的，
+     * 才认为任务已废弃。</p>
+     */
+    @Scheduled(fixedDelayString = "${file-hub.cleanup-interval-ms:600000}",
+            initialDelayString = "${file-hub.cleanup-initial-delay-ms:60000}")
+    public void cleanupExpiredUploads() {
+        int removed = 0;
+        for (FileInfo stale : fileInfoMapper.findExpiredUploading(props.getUploadExpireMinutes())) {
+            try {
+                storage.deleteChunks(stale.getFileId());
+                fileChunkMapper.deleteByFileId(stale.getFileId());
+                fileInfoMapper.deleteById(stale.getId());
+                removed++;
+                log.info("回收过期上传任务：{}（{}，{} 字节）",
+                        stale.getFileId(), stale.getFileName(), stale.getFileSize());
+            } catch (Exception e) {
+                log.warn("回收上传任务失败：{}", stale.getFileId(), e);
+            }
+        }
+        int tempFiles = storage.cleanupTemporary(Duration.ofMinutes(props.getUploadExpireMinutes()));
+        if (removed > 0 || tempFiles > 0) {
+            log.info("临时文件清理完成：过期任务 {} 个，残留文件 {} 个", removed, tempFiles);
+        }
     }
 
     public InputStream openForRead(FileInfo info) {

@@ -21,5 +21,8 @@ public class FileChunk {
 
     private Integer chunkSize;
 
+    /** 分片内容的 SHA-256（hex 小写）。合并时逐片复算，坏哪片只补哪片 */
+    private String chunkHash;
+
     private LocalDateTime createTime;
 }

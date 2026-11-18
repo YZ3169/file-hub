@@ -39,6 +39,7 @@ CREATE TABLE `file_chunk`
     `file_id`     VARCHAR(64) NOT NULL COMMENT '所属文件标识',
     `chunk_index` INT         NOT NULL COMMENT '分片序号，从 0 开始',
     `chunk_size`  INT         NOT NULL COMMENT '该分片实际字节数（最后一片通常更小）',
+    `chunk_hash`  CHAR(64)             DEFAULT NULL COMMENT '该分片的 SHA-256（hex 小写）；上传时校验、合并时逐片复算',
     `create_time` DATETIME    NOT NULL COMMENT '落盘时间',
     PRIMARY KEY (`id`),
     -- 关键：靠这个唯一索引把"重复上传同一分片"变成幂等操作（并发下第二次会撞唯一键而不是写坏数据）

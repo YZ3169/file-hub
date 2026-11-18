@@ -18,4 +18,10 @@ public class StorageProperties {
 
     /** 上传任务超过这个时长没有新分片落盘，就认为已废弃，可被清理 */
     private int uploadExpireMinutes = 24 * 60;
+
+    /** 清理任务的执行间隔（毫秒） */
+    private long cleanupIntervalMs = 10 * 60 * 1000L;
+
+    /** 应用启动后第一次清理的延迟（毫秒），避免和启动自检抢 IO */
+    private long cleanupInitialDelayMs = 60 * 1000L;
 }

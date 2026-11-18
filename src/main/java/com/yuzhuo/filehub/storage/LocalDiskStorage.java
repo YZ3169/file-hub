@@ -13,11 +13,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
+import java.nio.file.attribute.FileTime;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+
+import com.yuzhuo.filehub.util.HashUtil;
 
 /**
  * 本地磁盘实现。
@@ -78,16 +86,63 @@ public class LocalDiskStorage implements StorageBackend {
         return chunksDir.resolve(requireSafeId(fileId)).resolve(index + ".part");
     }
 
-    /** 落盘一个分片。先写 .tmp 再原子改名，避免"半个分片"被当成完整分片 */
-    public long saveChunk(String fileId, int index, InputStream in) throws IOException {
+    /**
+     * 落盘一个分片并计算它的 SHA-256。
+     *
+     * <p>三个细节都是为了「传输过程中出问题」准备的：</p>
+     * <ul>
+     *   <li><b>先写临时文件，校验通过才原子改名</b>：不把半截分片暴露成完整分片；</li>
+     *   <li><b>临时文件名带 UUID</b>：同一片被并发重传时不会互相覆盖对方的 .incoming；</li>
+     *   <li><b>摘要不匹配时不覆盖旧分片</b>：旧片可能是好的，坏的是这次收到的字节，
+     *       删掉 incoming 即可，不能让一次坏重传把已经正确的分片也弄没。</li>
+     * </ul>
+     */
+    public ChunkWriteResult saveChunk(String fileId, int index, InputStream in,
+                                      String expectedSha256, long expectedSize) throws IOException {
         Path target = chunkFile(fileId, index);
         Files.createDirectories(target.getParent());
-        Path incoming = target.resolveSibling(index + ".part.incoming");
-        try (OutputStream out = Files.newOutputStream(incoming)) {
-            in.transferTo(out);
+        Path incoming = target.resolveSibling(index + "." + UUID.randomUUID() + ".part.incoming");
+
+        MessageDigest digest = HashUtil.sha256();
+        long written;
+        try (InputStream digestIn = new DigestInputStream(in, digest);
+             OutputStream out = Files.newOutputStream(incoming)) {
+            written = digestIn.transferTo(out);
         }
+        String actual = HexFormat.of().formatHex(digest.digest());
+
+        boolean hashOk = expectedSha256 == null || expectedSha256.isBlank()
+                || expectedSha256.equalsIgnoreCase(actual);
+        boolean sizeOk = expectedSize < 0 || expectedSize == written;
+        if (!hashOk || !sizeOk) {
+            Files.deleteIfExists(incoming);
+            return new ChunkWriteResult(written, actual, false);
+        }
+
         Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
-        return Files.size(target);
+        return new ChunkWriteResult(written, actual, true);
+    }
+
+    public ChunkWriteResult saveChunk(String fileId, int index, InputStream in, String expectedSha256)
+            throws IOException {
+        return saveChunk(fileId, index, in, expectedSha256, -1);
+    }
+
+    public ChunkWriteResult saveChunk(String fileId, int index, InputStream in) throws IOException {
+        return saveChunk(fileId, index, in, null, -1);
+    }
+
+    /** 一个分片的落盘结果：实际字节数、服务端复算的摘要、是否通过校验并原子落盘 */
+    public record ChunkWriteResult(long size, String sha256, boolean accepted) {
+    }
+
+    /** 删除单个分片（合并阶段发现它损坏时用），不存在也不报错 */
+    public void deleteChunk(String fileId, int index) {
+        try {
+            Files.deleteIfExists(chunkFile(fileId, index));
+        } catch (IOException e) {
+            log.warn("删除损坏分片失败：fileId={} index={}", fileId, index, e);
+        }
     }
 
     public boolean chunkExists(String fileId, int index) {
@@ -113,7 +168,9 @@ public class LocalDiskStorage implements StorageBackend {
                     .map(Path::toString)
                     .filter(n -> n.endsWith(".part"))
                     .map(n -> n.substring(0, n.length() - 5))
+                    .filter(n -> n.chars().allMatch(Character::isDigit))
                     .map(Integer::parseInt)
+                    .filter(i -> i >= 0)
                     .sorted()
                     .toList();
         } catch (IOException e) {
@@ -142,6 +199,62 @@ public class LocalDiskStorage implements StorageBackend {
             });
         } catch (IOException e) {
             log.warn("清理分片目录失败：{}", dir, e);
+        }
+    }
+
+    /**
+     * 回收两类「进程被杀/网络中断留下的垃圾」：
+     * <ul>
+     *   <li>{@code tmp/*.merging}：合并到一半的临时文件；</li>
+     *   <li>{@code chunks/*}{@code /N.<uuid>.part.incoming}：分片写了一半没来得及改名。</li>
+     * </ul>
+     * 判据是文件修改时间，不用数据库——这些文件本来就没进过数据库。
+     */
+    public int cleanupTemporary(Duration age) {
+        Instant cutoff = Instant.now().minus(age);
+        int[] deleted = {0};
+
+        try (Stream<Path> s = Files.list(tmpDir)) {
+            s.filter(Files::isRegularFile).forEach(p -> {
+                if (olderThan(p, cutoff) && deleteQuietly(p)) {
+                    deleted[0]++;
+                }
+            });
+        } catch (IOException e) {
+            log.warn("清理合并临时目录失败：{}", tmpDir, e);
+        }
+
+        if (Files.isDirectory(chunksDir)) {
+            try (Stream<Path> s = Files.walk(chunksDir)) {
+                s.filter(Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().endsWith(".part.incoming"))
+                        .forEach(p -> {
+                            if (olderThan(p, cutoff) && deleteQuietly(p)) {
+                                deleted[0]++;
+                            }
+                        });
+            } catch (IOException e) {
+                log.warn("清理残留 .incoming 分片失败：{}", chunksDir, e);
+            }
+        }
+        return deleted[0];
+    }
+
+    private static boolean olderThan(Path p, Instant cutoff) {
+        try {
+            FileTime t = Files.getLastModifiedTime(p);
+            return t.toInstant().isBefore(cutoff);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static boolean deleteQuietly(Path p) {
+        try {
+            return Files.deleteIfExists(p);
+        } catch (IOException e) {
+            log.warn("删除临时文件失败：{}", p, e);
+            return false;
         }
     }
 
