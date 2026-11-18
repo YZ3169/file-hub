@@ -47,6 +47,18 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
             + "ORDER BY id LIMIT 200")
     List<FileInfo> findExpiredUploading(@Param("minutes") int minutes);
 
+    /**
+     * 清理时的条件删除：从「查到过期」到「拿锁后删除」之间，分片可能刚刷新过 update_time。
+     * 只有仍然是上传中、且仍然过期的行才删；返回 0 表示任务已复活或已被处理。
+     */
+    @Update("DELETE FROM file_info WHERE id = #{id} AND status = 0 "
+            + "AND update_time < DATE_SUB(NOW(), INTERVAL #{minutes} MINUTE)")
+    int deleteExpiredById(@Param("id") Long id, @Param("minutes") int minutes);
+
+    /** 仍在进行中的任务 id，用于判断 chunks/ 下哪些目录是孤儿 */
+    @Select("SELECT file_id FROM file_info WHERE status = 0")
+    List<String> findUploadingFileIds();
+
     @Select("SELECT COUNT(*) FROM file_info WHERE status = 1")
     long countDone();
 

@@ -183,6 +183,35 @@ public class LocalDiskStorage implements StorageBackend {
         return Files.createTempFile(tmpDir, requireSafeId(fileId) + "-", ".merging");
     }
 
+    /** chunks/ 下所有合法任务目录名（只认 UUID 形状，避免误删别的东西） */
+    public List<String> listChunkDirs() {
+        if (!Files.isDirectory(chunksDir)) {
+            return List.of();
+        }
+        try (Stream<Path> s = Files.list(chunksDir)) {
+            return s.filter(Files::isDirectory)
+                    .map(p -> p.getFileName().toString())
+                    .filter(n -> SAFE_ID.matcher(n).matches())
+                    .toList();
+        } catch (IOException e) {
+            log.warn("读取分片根目录失败：{}", chunksDir, e);
+            return List.of();
+        }
+    }
+
+    /**
+     * 任务目录是否已经超过 age 没有任何变化。
+     * 每片原子改名都会更新目录 mtime，所以长期不变的目录可以判定为无人使用。
+     */
+    public boolean chunkDirOlderThan(String fileId, Duration age) {
+        try {
+            FileTime t = Files.getLastModifiedTime(chunksDir.resolve(requireSafeId(fileId)));
+            return t.toInstant().isBefore(Instant.now().minus(age));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** 删掉一个上传任务的全部分片目录（合并完 / 删除文件时调用） */
     public void deleteChunks(String fileId) {
         Path dir = chunksDir.resolve(requireSafeId(fileId));

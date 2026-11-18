@@ -31,6 +31,7 @@ class LocalDiskStorageTest {
     LocalDiskStorage storage;
 
     static final String ID = "1f0c2a3b-4d5e-6f70-8192-a3b4c5d6e7f8";
+    static final String OTHER_ID = "2f0c2a3b-4d5e-6f70-8192-a3b4c5d6e7f8";
 
     @BeforeEach
     void setUp() throws IOException {
@@ -127,6 +128,22 @@ class LocalDiskStorageTest {
         assertEquals(1, deleted);
         assertFalse(Files.exists(staleIncoming));
         assertTrue(Files.exists(freshIncoming));
+    }
+
+    @Test
+    @DisplayName("孤儿目录扫描只认 UUID 形状的目录，并能按 mtime 判断是否过期")
+    void listsChunkDirsAndChecksAge() throws IOException {
+        storage.saveChunk(ID, 0, in("a"));
+        Path orphan = storage.chunkFile(ID, 0).getParent();
+        Files.createDirectories(root.resolve("chunks").resolve("not-a-uuid"));
+
+        assertEquals(List.of(ID), storage.listChunkDirs());
+        assertFalse(storage.chunkDirOlderThan(ID, Duration.ofHours(1)));
+
+        Files.setLastModifiedTime(orphan, FileTime.from(Instant.now().minus(Duration.ofHours(2))));
+        assertTrue(storage.chunkDirOlderThan(ID, Duration.ofHours(1)));
+        assertFalse(storage.chunkDirOlderThan(OTHER_ID, Duration.ofHours(1)),
+                "不存在的目录不应被当成可删除的孤儿");
     }
 
     @Test
