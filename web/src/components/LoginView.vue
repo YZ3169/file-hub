@@ -86,7 +86,7 @@ async function submit() {
       </div>
 
       <p v-if="desktop" class="desktop-note" data-testid="desktop-note">
-        桌面版：第一个注册的账号会成为管理员；关闭浏览器不会退出程序，请使用系统托盘图标退出。
+        桌面版：第一个注册的账号会成为管理员；关闭窗口时可选择最小化到托盘或直接退出。
       </p>
 
       <div class="auth-tabs" role="tablist" aria-label="登录或注册">

@@ -44,14 +44,21 @@ import java.time.Duration;
  * 1. 把数据目录固定到 {@code %LOCALAPPDATA%\FileHubData}，在 Spring 初始化前设置系统属性；<br>
  * 2. 单实例：用文件锁阻止同一数据目录启动第二个 JVM；<br>
  * 3. 启动内嵌 Tomcat（desktop profile，127.0.0.1:18080）；<br>
- * 4. 自动打开浏览器，并放一个托盘图标用于退出——jpackage 窗口没有控制台，
+ * 4. 默认自动打开浏览器，并放一个托盘图标用于退出——jpackage 窗口没有控制台，
  *    没有托盘的话用户关不掉后台进程；<br>
  * 5. 启动失败时弹窗给出日志路径，而不是静默消失。</p>
+ *
+ * <p><b>外壳模式</b>（WebView2 外壳启动时设置 {@code FILE_HUB_DESKTOP_SHELL=1}）：
+ * 不打开浏览器、不创建托盘，窗口和托盘都由外壳负责；外壳关闭 stdin 时本进程收到 EOF，
+ * 优雅关闭 Spring 后退出。单独运行 FileHub.exe 时仍是原来的浏览器行为。</p>
  */
 public final class DesktopLauncher {
 
     private static final int PORT = 18080;
     private static final String APP_URL = "http://127.0.0.1:" + PORT;
+    private static final boolean SHELL_MODE =
+            Boolean.getBoolean("filehub.desktop.shell")
+                    || "1".equals(System.getenv("FILE_HUB_DESKTOP_SHELL"));
 
     private static ConfigurableApplicationContext context;
     private static FileChannel lockChannel;
@@ -78,9 +85,12 @@ public final class DesktopLauncher {
         System.setProperty("filehub.desktop", "true");
 
         if (!acquireInstanceLock(dataDir)) {
-            // 已有实例：等它把端口起好再开浏览器，然后本进程直接退出。
-            waitForServer(Duration.ofSeconds(15));
-            openBrowser();
+            // 已有实例：外壳模式由外壳负责显示窗口，这里什么都不做直接退出；
+            // 单独运行时等它把端口起好再开浏览器。
+            if (!SHELL_MODE) {
+                waitForServer(Duration.ofSeconds(15));
+                openBrowser();
+            }
             return;
         }
 
@@ -100,8 +110,31 @@ public final class DesktopLauncher {
             return;
         }
 
-        openBrowser();
-        installTrayOrWindow(dataDir);
+        if (SHELL_MODE) {
+            watchStdinForExit();
+        } else {
+            openBrowser();
+            installTrayOrWindow(dataDir);
+        }
+    }
+
+    /**
+     * 外壳模式：外壳持有子进程的 stdin 管道，关闭窗口时关掉管道。
+     * 这里读到 EOF 就优雅关闭 Spring；外壳被强杀时管道同样会断开，不会留下孤儿 Java 进程。
+     */
+    private static void watchStdinForExit() {
+        Thread watcher = new Thread(() -> {
+            try {
+                while (System.in.read() != -1) {
+                    // 忽略输入，只等 EOF
+                }
+            } catch (IOException ignored) {
+                // 管道异常也按外壳已退出处理
+            }
+            shutdown();
+        }, "desktop-shell-stdin");
+        watcher.setDaemon(true);
+        watcher.start();
     }
 
     /**
@@ -296,7 +329,8 @@ public final class DesktopLauncher {
 
     private static void showError(String message) {
         System.err.println(message);
-        if (GraphicsEnvironment.isHeadless()) {
+        // 外壳模式由外壳统一弹窗/报错，避免后台再冒一个没人管的对话框。
+        if (SHELL_MODE || GraphicsEnvironment.isHeadless()) {
             return;
         }
         Runnable dialog = () -> JOptionPane.showMessageDialog(null, message,

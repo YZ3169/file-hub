@@ -95,7 +95,8 @@ jobs:
             点「更多信息 → 仍要运行」即可。
 
             数据保存在 `%LOCALAPPDATA%\FileHubData`；第一次注册的账号自动成为管理员。
-            关闭浏览器不会退出程序，请用系统托盘的 FileHub 图标退出。
+            界面在独立窗口中打开，不占用默认浏览器；关闭窗口时可以选择最小化到系统托盘
+            或直接退出，托盘菜单也可以退出。
           files: |
             build/desktop/dist/*.msi
             build/desktop/dist/*-portable.zip

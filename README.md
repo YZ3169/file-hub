@@ -471,19 +471,21 @@ docker compose -f docker-compose.cluster.yml up --build
 ## Windows 桌面版（v7）
 
 给不想装 MySQL/Docker 的人用的单机版：同一个 Spring Boot + Vue 应用，内置 **H2 文件数据库**，
-只监听 `127.0.0.1:18080`，自动打开浏览器。服务器 / Docker 模式完全保留，两种形态互不影响。
+只监听 `127.0.0.1:18080`，在独立窗口中打开界面（WebView2，不依赖默认浏览器）。
+服务器 / Docker 模式完全保留，两种形态互不影响。
 
 ### 安装与使用
 
 1. 运行 `FileHub-1.0.0.msi`（构建产物在 `build/desktop/dist/`）。
-   按用户安装，装到 `%LOCALAPPDATA%\FileHub`，不需要管理员权限；
-   开始菜单会创建快捷方式。
-2. 双击 `FileHub`，程序启动后会自动打开 `http://127.0.0.1:18080`。
+   按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
+   开始菜单和桌面会创建快捷方式。
+2. 双击 `FileHub`，程序在独立窗口中打开 `http://127.0.0.1:18080`，不会占用默认浏览器。
 3. 第一次使用先注册。**第一个注册的账号自动成为管理员**（桌面版单人使用，
    不需要额外配置管理员密码）。
-4. 关闭浏览器不会退出程序。退出请右键系统托盘的 FileHub 图标 →「退出」；
-   托盘菜单里也可以打开数据目录。
-5. 重复双击只会打开已有实例的页面，不会启动第二个进程（数据目录上有文件锁）。
+4. 关闭窗口时会弹窗确认：可以「最小化到托盘」继续运行，或「直接退出」。
+   最小化后双击托盘图标恢复窗口；托盘菜单里还可以打开数据目录、退出程序。
+5. 重复双击只会把已有窗口调到前台，不会启动第二个进程
+   （外壳单实例互斥量 + 数据目录文件锁）。
 
 数据全部在 `%LOCALAPPDATA%\FileHubData`（**与安装目录 `%LOCALAPPDATA%\FileHub` 分开**）：
 
@@ -504,21 +506,32 @@ logs/filehub.log      滚动日志（排障用）
   点「更多信息 → 仍要运行」即可。这是预期行为。
 - 只监听回环地址，不能给局域网/公网访问；H2 和文件都是明文的，
   安全性依赖 Windows 用户目录权限。需要多用户/远程访问请用服务器模式。
+- 系统要求：Windows 10/11 x64。界面依赖 **Microsoft Edge WebView2 Runtime**
+  （Windows 11 和较新的 Windows 10 一般自带；缺失时启动会提示官方下载地址），
+  外壳依赖 **.NET Framework 4.8**（Windows 10 1903+ / Windows 11 自带）。
+  这两个都是系统组件，不需要用户装 Java。
 
 ### 构建安装包
 
-前置：JDK 17、Node/npm、Maven；MSI 还需要 WiX Toolset 3.x
-（`candle.exe` / `light.exe` 在 PATH，或设置 `WIX_BIN` 指向其 `bin` 目录）。
+前置：JDK 17、Node/npm、Maven、Windows 自带的 .NET Framework 4.x（`csc.exe`）；
+MSI 还需要 WiX Toolset 3.x（`candle.exe` / `light.exe` 在 PATH，或设置 `WIX_BIN` 指向其 `bin` 目录）。
 本机用官方 `wix314-binaries.zip` 解压到 `D:/Tools/wix314` 即可，不需要管理员安装。
+WebView2 SDK（NuGet）由脚本按固定版本下载并缓存到 `build/shell/cache`。
 
 ```bash
-# 前端 build → jar → jlink 运行时 → app-image → MSI
+# 前端 build → jar → jlink 运行时 → app-image → WebView2 外壳 → MSI
 WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
 #   build/desktop/dist/FileHub-1.0.0.msi           安装包
 ```
+
+安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
+`FileHubBackend.exe` 是 jpackage 原启动器（外壳用管道启动它，关窗口时关管道让它优雅退出）。
+脚本把 app-image 的启动器改名并补一份 `app/FileHubBackend.cfg`，再套上外壳，
+最后用 `jpackage --app-image` 出 MSI，所以 MSI 的快捷方式自然指向外壳。
+外壳的 `FileHub.exe.config`（Per-Monitor V2 DPI 缩放）由同一个脚本复制到安装目录。
 
 脚本固定了 MSI 的 `UpgradeCode`，以后改版本号发布时升级会替换旧版本，
 而不是并存两份。桌面版由 jpackage 自带的 JRE 启动，目标机器不需要装 Java。
@@ -553,13 +566,31 @@ git push origin v1.0.0
   与 MSI 安装目录**同名同路径**，卸载会把用户上传的文件一起删掉。现在数据固定到
   `%LOCALAPPDATA%\FileHubData`，与安装目录分开。
 
+本机验证结果（2026-11-19，WebView2 独立窗口版）：
+
+- 从桌面快捷方式启动：独立 `FileHub` 窗口，没有浏览器标签页/地址栏，后端 5–6 秒内
+  健康检查 200；登录态、管理员账号和原有 1 个文件（504.6 KB）在重装后完整保留。
+- 点窗口 X：弹出「最小化到系统托盘 / 直接退出 / 取消」确认框。选择最小化后窗口隐藏、
+  后端继续运行；再次双击快捷方式只恢复窗口（单例外壳，不会起第二套后端）。
+- 选择直接退出：外壳关闭 stdin，后端读到 EOF 后优雅退出（`code=0`），端口释放、
+  没有残留进程；外部强制结束外壳时同样走 EOF 优雅关闭。
+- 导航限制：只允许 `http://127.0.0.1:18080`（按 `Uri` 校验 scheme/host/port，拒绝
+  `http://127.0.0.1:18080@evil.com` 这类前缀绕过）；外部链接只交给默认浏览器打开
+  http/https/mailto。
+- 安装包内含 `FileHub.exe.config`，高 DPI/多显示器下按 Per-Monitor V2 缩放。
+
 ### 桌面版的实现位置
 
 - `src/main/resources/application-desktop.yml`：H2、回环端口、SQL 初始化、关闭 Swagger。
 - `src/main/resources/schema-h2.sql`：H2 建表（幂等，启动时自动执行）。
 - `src/main/java/com/yuzhuo/filehub/desktop/DesktopLauncher.java`：数据目录、单实例锁、
-  打开浏览器、系统托盘、启动失败弹窗。
-- `scripts/package-desktop.sh`：打包脚本。
+  启动 Spring、启动失败弹窗；单独运行时打开浏览器 + 托盘，被外壳启动时
+  （`FILE_HUB_DESKTOP_SHELL=1`）改为监听 stdin EOF 并优雅关闭。
+- `desktop-shell/FileHubShell.cs`：WebView2 独立窗口外壳（单实例、托盘、关闭确认、
+  限制导航到本机地址、退出时关管道让后端优雅关闭）。
+- `desktop-shell/app.manifest`：DPI 感知与 Windows 兼容性声明。
+- `scripts/build-shell.sh`：下载 WebView2 SDK、编译外壳、替换 app-image 启动器。
+- `scripts/package-desktop.sh`：打包脚本（app-image → 外壳 → MSI）。
 - 普通 `java -jar` 不带 `-Dfilehub.desktop=true`，走的仍然是最初的 MySQL 服务器流程。
 
 ---

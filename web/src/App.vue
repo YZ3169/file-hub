@@ -236,7 +236,7 @@ onMounted(() => {
           >
           <span><BaseIcon name="shield" :size="13" /> SHA-256 内容寻址</span>
           <span v-if="state.config.desktop" data-testid="desktop-badge">
-            <BaseIcon name="server" :size="13" /> 桌面版 · 退出请用系统托盘图标
+            <BaseIcon name="server" :size="13" /> 桌面版 · 关闭窗口可最小化到托盘
           </span>
         </div>
         <span class="footer-note">

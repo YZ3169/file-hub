@@ -3,7 +3,9 @@
 #   1) 前端产物打进 Spring Boot jar
 #   2) jlink 生成精简 JRE
 #   3) jpackage 生成免安装目录 build/desktop/dist/FileHub
-#   4) 如果找到 WiX 3.x，再生成 MSI（按用户安装，不需要管理员权限）
+#   4) 套上 WebView2 独立窗口外壳（scripts/build-shell.sh）
+#   5) 如果找到 WiX 3.x，从改好的 app-image 生成 MSI
+#      （按用户安装，不需要管理员权限，快捷方式指向外壳）
 #
 # 用法（Git Bash）：
 #   bash scripts/package-desktop.sh
@@ -43,13 +45,13 @@ UPGRADE_UUID="6f1c2b9e-3a7d-4c5e-9b21-8d4f0a6c7e13"
 OUT="$ROOT/build/desktop"
 JAR="file-hub-${APP_VERSION}.jar"
 
-echo "==> 1/4 构建前端"
+echo "==> 1/5 构建前端"
 (cd web && npm run build)
 
-echo "==> 2/4 打包 Spring Boot jar"
+echo "==> 2/5 打包 Spring Boot jar"
 mvn -B -q clean package -DskipTests
 
-echo "==> 3/4 生成运行时与 app-image"
+echo "==> 3/5 生成运行时与 app-image"
 rm -rf "$OUT"
 mkdir -p "$OUT/input" "$OUT/dist"
 cp "target/$JAR" "$OUT/input/$JAR"
@@ -73,9 +75,11 @@ jpackage \
     --java-options "-Dfile.encoding=UTF-8" \
     --dest "$OUT/dist"
 
+echo "==> 4/5 套上 WebView2 独立窗口外壳"
+bash "$ROOT/scripts/build-shell.sh" "$OUT/dist/$APP_NAME"
 echo "    免安装版：$OUT/dist/$APP_NAME/$APP_NAME.exe"
 
-echo "==> 4/4 生成 MSI"
+echo "==> 5/5 生成 MSI"
 WIX_BIN="${WIX_BIN:-}"
 if [ -z "$WIX_BIN" ]; then
     for candidate in "/c/Program Files (x86)/WiX Toolset v3.14/bin" "/d/Tools/wix314"; do
@@ -99,12 +103,7 @@ jpackage \
     --app-version "$APP_VERSION" \
     --vendor "file-hub" \
     --description "分片上传 / 秒传 / 断点续传的本地文件服务" \
-    --input "$OUT/input" \
-    --main-jar "$JAR" \
-    --main-class org.springframework.boot.loader.launch.JarLauncher \
-    --runtime-image "$OUT/runtime" \
-    --java-options "-Dfilehub.desktop=true" \
-    --java-options "-Dfile.encoding=UTF-8" \
+    --app-image "$OUT/dist/$APP_NAME" \
     --win-per-user-install \
     --win-shortcut \
     --win-menu \
