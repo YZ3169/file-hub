@@ -7,6 +7,7 @@ import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @Mapper
@@ -58,19 +59,23 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
     @Update("UPDATE file_info SET update_time = NOW() WHERE file_id = #{fileId} AND status = 0")
     int touchUploading(String fileId);
 
-    /** 长时间没有任何分片落盘的上传任务，交给定时任务回收 */
+    /**
+     * 长时间没有任何分片落盘的上传任务，交给定时任务回收。
+     * 截止时间由 Java 算好传入：DATE_SUB 是 MySQL 方言，桌面版 H2 没有；
+     * 直接比较列和参数也更容易命中 idx_status_update。
+     */
     @Select("SELECT * FROM file_info WHERE status = 0 "
-            + "AND update_time < DATE_SUB(NOW(), INTERVAL #{minutes} MINUTE) "
+            + "AND update_time < #{cutoff} "
             + "ORDER BY id LIMIT 200")
-    List<FileInfo> findExpiredUploading(@Param("minutes") int minutes);
+    List<FileInfo> findExpiredUploading(@Param("cutoff") LocalDateTime cutoff);
 
     /**
      * 清理时的条件删除：从「查到过期」到「拿锁后删除」之间，分片可能刚刷新过 update_time。
      * 只有仍然是上传中、且仍然过期的行才删；返回 0 表示任务已复活或已被处理。
      */
     @Update("DELETE FROM file_info WHERE id = #{id} AND status = 0 "
-            + "AND update_time < DATE_SUB(NOW(), INTERVAL #{minutes} MINUTE)")
-    int deleteExpiredById(@Param("id") Long id, @Param("minutes") int minutes);
+            + "AND update_time < #{cutoff}")
+    int deleteExpiredById(@Param("id") Long id, @Param("cutoff") LocalDateTime cutoff);
 
     /** 仍在进行中的任务 id，用于判断 chunks/ 下哪些目录是孤儿 */
     @Select("SELECT file_id FROM file_info WHERE status = 0")

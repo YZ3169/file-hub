@@ -1,0 +1,53 @@
+# Windows 桌面版：内置 H2 数据库，只监听回环地址，数据放在用户目录。
+#
+# 由 DesktopLauncher 在启动前设置：
+#   -Dfilehub.desktop=true
+#   -Dfilehub.data.dir=<%LOCALAPPDATA%/FileHubData，路径已转成 />
+#
+# 数据目录与 MSI 安装目录（%LOCALAPPDATA%\FileHub）是分开的：卸载只删程序。
+#
+# 端口固定 18080：localStorage 按 origin 隔离，换端口会让登录态和续传队列失效。
+
+server:
+  address: 127.0.0.1
+  port: 18080
+  shutdown: graceful
+
+spring:
+  datasource:
+    driver-class-name: org.h2.Driver
+    url: jdbc:h2:file:${filehub.data.dir:${user.home}/FileHub}/db/filehub;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    # 本地单文件数据库，依赖 Windows 用户目录 ACL；不对外监听，也不再设一层密码。
+    password:
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-h2.sql
+
+file-hub:
+  desktop: true
+  root: ${filehub.data.dir:${user.home}/FileHub}/storage
+  search:
+    # H2 没有 MySQL 的 FULLTEXT/ngram，关键词搜索统一走 LIKE
+    fulltext-enabled: false
+  auth:
+    allow-registration: true
+    # 单人桌面版：第一个注册的账号就是管理员
+    first-user-admin: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+logging:
+  level:
+    com.yuzhuo.filehub: info

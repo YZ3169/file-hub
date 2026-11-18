@@ -60,7 +60,10 @@ public class AuthService {
         UserAccount account = new UserAccount();
         account.setUsername(username);
         account.setPasswordHash(passwordEncoder.encode(password));
-        account.setRole(UserAccount.ROLE_USER);
+        // 桌面版单机使用：第一个注册的人就是管理员，否则完整性扫描等管理功能无人可用。
+        // 服务器模式默认关闭这个开关，仍由 FILE_HUB_ADMIN_PASSWORD 初始化管理员。
+        boolean firstUser = properties.isFirstUserAdmin() && userMapper.selectCount(null) == 0;
+        account.setRole(firstUser ? UserAccount.ROLE_ADMIN : UserAccount.ROLE_USER);
         account.setEnabled(1);
         account.setCreatedAt(now);
         account.setUpdatedAt(now);

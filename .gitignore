@@ -1,4 +1,8 @@
 target/
+
+# 桌面安装包构建中间产物与产物
+build/
+
 !.mvn/wrapper/maven-wrapper.jar
 *.log
 .idea/

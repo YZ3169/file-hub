@@ -42,6 +42,10 @@ file-hub:
   cleanup-interval-ms: 600000
   cleanup-initial-delay-ms: 60000
 
+  # 关键词搜索实现。MySQL 8 用 ngram 全文索引；桌面版 H2 没有 FULLTEXT，关掉后回退 LIKE。
+  search:
+    fulltext-enabled: true
+
   # 登录 / 会话 / 管理员初始化
   auth:
     # 会话有效期（小时）。Token 是不透明随机串，数据库只存 SHA-256。
@@ -54,6 +58,9 @@ file-hub:
     # 密码绝不写进配置文件，用环境变量 FILE_HUB_ADMIN_PASSWORD 注入。
     admin-username: ${FILE_HUB_ADMIN_USER:admin}
     admin-password: ${FILE_HUB_ADMIN_PASSWORD:}
+    # 桌面版单人使用：第一个注册的账号直接给 ADMIN，不用另配管理员密码。
+    # 服务器模式保持 false，管理员仍由上面的环境变量初始化。
+    first-user-admin: false
 
   # 多实例部署。默认 false：单进程内锁 + Caffeine 限流，不需要 Redis。
   # 打开后锁和限流都切到 Redis，所有实例必须指向同一个共享存储目录（root）和同一个 Redis。

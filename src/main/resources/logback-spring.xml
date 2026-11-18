@@ -30,4 +30,26 @@
             <appender-ref ref="CONSOLE"/>
         </root>
     </springProfile>
+
+    <!-- 桌面版由 jpackage 启动，没有控制台；文件日志是唯一排障入口。 -->
+    <springProfile name="desktop">
+        <springProperty scope="context" name="FILE_HUB_DATA_DIR" source="filehub.data.dir"
+                        defaultValue="./filehub-data"/>
+        <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+            <file>${FILE_HUB_DATA_DIR}/logs/filehub.log</file>
+            <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+                <fileNamePattern>${FILE_HUB_DATA_DIR}/logs/filehub.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+                <maxFileSize>10MB</maxFileSize>
+                <maxHistory>5</maxHistory>
+                <totalSizeCap>200MB</totalSizeCap>
+            </rollingPolicy>
+            <encoder>
+                <charset>UTF-8</charset>
+                <pattern>${LOG_PATTERN}</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="FILE"/>
+        </root>
+    </springProfile>
 </configuration>

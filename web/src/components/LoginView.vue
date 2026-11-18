@@ -1,7 +1,7 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
-import { login, register } from '../lib/api'
+import { getConfig, login, register } from '../lib/api'
 import { setSession } from '../lib/auth'
 import { startWorkspace } from '../stores/uploader'
 
@@ -12,6 +12,16 @@ const showPassword = ref(false)
 const loading = ref(false)
 const error = ref('')
 const notice = ref('')
+const desktop = ref(false)
+
+onMounted(async () => {
+  try {
+    // config 是公开接口；登录前就能判断是不是桌面版，用来提示首个账号为管理员
+    desktop.value = Boolean((await getConfig()).desktop)
+  } catch {
+    // 连不上时由提交动作给出错误，这里不重复提示
+  }
+})
 
 const isRegister = computed(() => mode.value === 'register')
 const canSubmit = computed(
@@ -52,7 +62,7 @@ async function submit() {
     if (e.status === 429) {
       error.value = '尝试过于频繁，请稍后再试'
     } else if (e.status === 0) {
-      error.value = '连不上服务端：请确认 file-hub 已在 8081 端口启动'
+      error.value = '连不上服务端：请确认 file-hub 已启动'
     } else if (e.status === 401) {
       error.value = '账号或密码错误'
     } else {
@@ -74,6 +84,10 @@ async function submit() {
           <p>文件按账号隔离；登录后即可继续未完成的上传。</p>
         </div>
       </div>
+
+      <p v-if="desktop" class="desktop-note" data-testid="desktop-note">
+        桌面版：第一个注册的账号会成为管理员；关闭浏览器不会退出程序，请使用系统托盘图标退出。
+      </p>
 
       <div class="auth-tabs" role="tablist" aria-label="登录或注册">
         <button
@@ -217,6 +231,17 @@ async function submit() {
   margin: 0;
   color: var(--muted);
   font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.desktop-note {
+  margin: 14px 0 0;
+  padding: 9px 11px;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 9px;
+  background: rgba(34, 211, 238, 0.08);
+  color: var(--muted);
+  font-size: 12px;
   line-height: 1.55;
 }
 

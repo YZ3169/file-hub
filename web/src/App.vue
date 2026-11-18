@@ -119,7 +119,7 @@ onMounted(() => {
 
     <div v-if="auth.token && !state.online" class="offline-banner">
       <BaseIcon name="alert" :size="16" />
-      <span>服务端未连接：请先在 8081 端口启动 file-hub，再重试。</span>
+      <span>服务端未连接：请确认 file-hub 正在运行，再重试。</span>
       <button class="btn btn-ghost btn-sm" type="button" @click="bootstrap">
         <BaseIcon name="refresh" :size="14" />
         重试连接
@@ -235,6 +235,9 @@ onMounted(() => {
             ><BaseIcon name="server" :size="13" /> {{ state.config.backend || '本地磁盘' }}</span
           >
           <span><BaseIcon name="shield" :size="13" /> SHA-256 内容寻址</span>
+          <span v-if="state.config.desktop" data-testid="desktop-badge">
+            <BaseIcon name="server" :size="13" /> 桌面版 · 退出请用系统托盘图标
+          </span>
         </div>
         <span class="footer-note">
           file-hub v2 · 分片级校验 / 自动重传 / 断点续传 / 多用户隔离

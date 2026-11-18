@@ -41,7 +41,7 @@ function uid() {
 export const state = reactive({
   booted: false,
   online: true,
-  config: { chunkSize: 5 * 1024 * 1024, backend: '' },
+  config: { chunkSize: 5 * 1024 * 1024, backend: '', desktop: false },
   tasks: [],
   files: [],
   filePage: {
@@ -804,7 +804,7 @@ export async function startWorkspace() {
   } catch (e) {
     if (!(e instanceof ApiError) || e.status === 0) {
       state.online = false
-      toast('无法连接服务端：请先启动 file-hub（8081）', 'error')
+      toast('无法连接服务端：请先启动 file-hub', 'error')
     }
   }
   await Promise.all([refreshFiles(), refreshStats()])
@@ -852,7 +852,7 @@ export async function bootstrap() {
     } catch (e) {
       if (e.status !== 401) {
         state.online = false
-        toast('无法连接服务端：请先启动 file-hub（8081）', 'error')
+        toast('无法连接服务端：请先启动 file-hub', 'error')
       }
     }
   }

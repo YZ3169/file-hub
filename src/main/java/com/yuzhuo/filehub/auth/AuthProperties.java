@@ -19,6 +19,9 @@ public class AuthProperties {
     /** 是否允许自助注册 */
     private boolean allowRegistration = true;
 
+    /** 桌面版：第一个注册的账号自动成为管理员（默认关闭，服务器模式不受影响） */
+    private boolean firstUserAdmin = false;
+
     private String adminUsername = "admin";
 
     /** 由 FILE_HUB_ADMIN_PASSWORD 注入；不要写进仓库 */

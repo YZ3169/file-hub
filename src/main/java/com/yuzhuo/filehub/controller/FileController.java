@@ -20,6 +20,7 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpRange;
@@ -68,12 +69,17 @@ public class FileController {
     private final StorageProperties props;
     private final DownloadTicketService ticketService;
 
+    /** desktop profile 下为 true；前端据此显示桌面版提示，不写死端口 */
+    @Value("${file-hub.desktop:false}")
+    private boolean desktop;
+
     /** 前端启动时读一次，拿到分片大小和存储后端标识 */
     @GetMapping("/config")
     public Result<Map<String, Object>> config() {
         return Result.ok(Map.of(
                 "chunkSize", props.getChunkSize(),
-                "backend", storageBackend.backendName()));
+                "backend", storageBackend.backendName(),
+                "desktop", desktop));
     }
 
     /** 秒传预检 */

@@ -31,9 +31,11 @@ public interface FileChunkMapper extends BaseMapper<FileChunk> {
      * 分片元数据的 upsert。重传同一分片时覆盖大小和摘要，
      * 这样"文件已经原子覆盖成功、数据库却没更新"的窗口不会留下过期摘要。
      */
+    // 直接引用参数而不是 VALUES(col)：MySQL 8.0.20 起 VALUES() 已弃用，
+    // H2 的 MySQL 兼容模式也认这种写法。
     @Insert("INSERT INTO file_chunk(file_id, chunk_index, chunk_size, chunk_hash, create_time) "
             + "VALUES(#{fileId}, #{index}, #{size}, #{hash}, NOW()) "
-            + "ON DUPLICATE KEY UPDATE chunk_size = VALUES(chunk_size), chunk_hash = VALUES(chunk_hash)")
+            + "ON DUPLICATE KEY UPDATE chunk_size = #{size}, chunk_hash = #{hash}")
     int upsertChunk(@Param("fileId") String fileId,
                     @Param("index") int index,
                     @Param("size") long size,

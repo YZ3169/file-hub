@@ -11,6 +11,7 @@ import com.yuzhuo.filehub.auth.AuthProperties;
 import com.yuzhuo.filehub.auth.RateLimitProperties;
 import com.yuzhuo.filehub.config.ClusterProperties;
 import com.yuzhuo.filehub.config.StorageProperties;
+import com.yuzhuo.filehub.desktop.DesktopLauncher;
 
 // 自己做密码校验，排除默认 UserDetailsService，避免启动日志里出现随机密码
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
@@ -21,6 +22,11 @@ import com.yuzhuo.filehub.config.StorageProperties;
 public class FileHubApplication {
 
     public static void main(String[] args) {
+        // jpackage 启动器会传 -Dfilehub.desktop=true；普通 java -jar / Docker 不受影响。
+        if (Boolean.getBoolean("filehub.desktop")) {
+            DesktopLauncher.run(args);
+            return;
+        }
         SpringApplication.run(FileHubApplication.class, args);
     }
 }

@@ -27,4 +27,16 @@ public class StorageProperties {
 
     /** 应用启动后第一次清理的延迟（毫秒），避免和启动自检抢 IO */
     private long cleanupInitialDelayMs = 60 * 1000L;
+
+    /** 关键词搜索相关配置 */
+    private Search search = new Search();
+
+    @Data
+    public static class Search {
+        /**
+         * 是否使用 MySQL 的 ngram 全文索引。桌面版 H2 不支持 MATCH...AGAINST，
+         * 关掉后统一回退 LIKE。
+         */
+        private boolean fulltextEnabled = true;
+    }
 }

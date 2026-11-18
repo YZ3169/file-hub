@@ -111,15 +111,15 @@ class FileStorageServiceTest {
     void cleanupSkipsTaskRefreshedAfterQuery() {
         FileInfo stale = uploadingInfo();
         stale.setId(9L);
-        when(fileInfoMapper.findExpiredUploading(60)).thenReturn(List.of(stale));
-        when(fileInfoMapper.deleteExpiredById(9L, 60)).thenReturn(0);
+        when(fileInfoMapper.findExpiredUploading(any(LocalDateTime.class))).thenReturn(List.of(stale));
+        when(fileInfoMapper.deleteExpiredById(eq(9L), any(LocalDateTime.class))).thenReturn(0);
         when(fileInfoMapper.findUploadingFileIds()).thenReturn(List.of());
         when(storage.listChunkDirs()).thenReturn(List.of());
         when(storage.cleanupTemporary(any(Duration.class))).thenReturn(0);
 
         service.cleanupExpiredUploads();
 
-        verify(fileInfoMapper).deleteExpiredById(9L, 60);
+        verify(fileInfoMapper).deleteExpiredById(eq(9L), any(LocalDateTime.class));
         verify(storage, never()).deleteChunks(anyString());
         verify(fileChunkMapper, never()).deleteByFileId(anyString());
     }
@@ -127,7 +127,7 @@ class FileStorageServiceTest {
     @Test
     @DisplayName("孤儿分片目录：无对应任务且足够旧才回收")
     void cleanupRemovesOnlyStaleOrphanChunkDirs() {
-        when(fileInfoMapper.findExpiredUploading(60)).thenReturn(List.of());
+        when(fileInfoMapper.findExpiredUploading(any(LocalDateTime.class))).thenReturn(List.of());
         when(fileInfoMapper.findUploadingFileIds()).thenReturn(List.of());
         when(storage.listChunkDirs()).thenReturn(List.of(OTHER_ID));
         when(storage.chunkDirOlderThan(eq(OTHER_ID), any(Duration.class))).thenReturn(true);

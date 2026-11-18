@@ -11,6 +11,8 @@
 不需要额外起 Node 服务；原来的单页演示保留在 `/classic.html`。
 运维侧带 Dockerfile / compose（单机与双实例）、Actuator + Prometheus 指标、
 请求 ID 与 JSON 日志、OpenAPI 文档，见下文「运维」和「Docker 一键启动」。
+另外提供 **Windows 桌面安装包**：内置 H2 数据库，双击即用，不需要 MySQL/Docker，
+见「Windows 桌面版」。
 
 > **关于 AI 辅助研发**
 > 本项目的代码由 Claude Code 按我给出的设计约束生成，我在其基础上逐文件阅读、调试、
@@ -463,6 +465,88 @@ docker compose -f docker-compose.cluster.yml up --build
 - `schema.sql` 里含 `DROP TABLE IF EXISTS`，但只会在 MySQL 首次初始化**空数据卷**时执行一次；
   已有数据请用 `scripts/migrate-v*.sql`，不要删卷重来。
 - 前端产物已经提交在 `src/main/resources/static`，镜像里不需要再跑 npm。
+
+---
+
+## Windows 桌面版（v7）
+
+给不想装 MySQL/Docker 的人用的单机版：同一个 Spring Boot + Vue 应用，内置 **H2 文件数据库**，
+只监听 `127.0.0.1:18080`，自动打开浏览器。服务器 / Docker 模式完全保留，两种形态互不影响。
+
+### 安装与使用
+
+1. 运行 `FileHub-1.0.0.msi`（构建产物在 `build/desktop/dist/`）。
+   按用户安装，装到 `%LOCALAPPDATA%\FileHub`，不需要管理员权限；
+   开始菜单会创建快捷方式。
+2. 双击 `FileHub`，程序启动后会自动打开 `http://127.0.0.1:18080`。
+3. 第一次使用先注册。**第一个注册的账号自动成为管理员**（桌面版单人使用，
+   不需要额外配置管理员密码）。
+4. 关闭浏览器不会退出程序。退出请右键系统托盘的 FileHub 图标 →「退出」；
+   托盘菜单里也可以打开数据目录。
+5. 重复双击只会打开已有实例的页面，不会启动第二个进程（数据目录上有文件锁）。
+
+数据全部在 `%LOCALAPPDATA%\FileHubData`（**与安装目录 `%LOCALAPPDATA%\FileHub` 分开**）：
+
+```
+db/filehub.mv.db      H2 数据库（账号、会话、文件元数据）
+storage/files/        合并后的成品文件（按年/月/日分层）
+storage/chunks/       上传中的临时分片
+logs/filehub.log      滚动日志（排障用）
+```
+
+- **备份**：关掉程序后复制整个 `%LOCALAPPDATA%\FileHubData` 目录。
+- **卸载**：Windows 设置里卸载只删程序目录，数据目录保留；要彻底清空就手动删除
+  `%LOCALAPPDATA%\FileHubData`。
+- **升级**：新版本 MSI 直接覆盖安装，数据库文件继续复用。
+- 桌面版关闭了 Swagger/OpenAPI（本地单机不需要暴露接口文档），
+  关键词搜索没有 MySQL ngram，自动回退 `LIKE`。
+- 未做代码签名，Windows SmartScreen 会提示“未知发布者”：
+  点「更多信息 → 仍要运行」即可。这是预期行为。
+- 只监听回环地址，不能给局域网/公网访问；H2 和文件都是明文的，
+  安全性依赖 Windows 用户目录权限。需要多用户/远程访问请用服务器模式。
+
+### 构建安装包
+
+前置：JDK 17、Node/npm、Maven；MSI 还需要 WiX Toolset 3.x
+（`candle.exe` / `light.exe` 在 PATH，或设置 `WIX_BIN` 指向其 `bin` 目录）。
+本机用官方 `wix314-binaries.zip` 解压到 `D:/Tools/wix314` 即可，不需要管理员安装。
+
+```bash
+# 前端 build → jar → jlink 运行时 → app-image → MSI
+WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
+
+# 产物
+#   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
+#   build/desktop/dist/FileHub-1.0.0.msi           安装包
+```
+
+脚本固定了 MSI 的 `UpgradeCode`，以后改版本号发布时升级会替换旧版本，
+而不是并存两份。桌面版由 jpackage 自带的 JRE 启动，目标机器不需要装 Java。
+
+本机验证结果（2026-11-18）：
+
+- `mvn test`：94 个测试全绿，其中 `DesktopDatabaseIntegrationTest` 用临时 H2 文件库
+  跑了注册、大小写登录、分片重传、合并、LIKE 搜索、下载、过期任务清理。
+- `npm run test:unit`：68 个前端单测全绿。
+- 桌面 profile 的 `scripts/e2e-test.sh`：92 项全绿。
+- 打包后的 `FileHub.exe`：自动建库、只监听 `127.0.0.1:18080`、托盘、日志、
+  单实例、重启后账号仍在；MSI 元数据为 `FileHub 1.0.0` + 固定 `UpgradeCode`。
+- MSI 已在本机做过完整安装/卸载冒烟：静默安装 → 开始菜单快捷方式 → 启动（4 秒内健康检查 200）
+  → 注册首个账号得到 ADMIN → 登录（含用户名大小写不敏感、错误密码返回 40004）
+  → 带 Token 访问列表成功、匿名请求被拒（40001）→ 卸载后程序目录和快捷方式消失、
+  数据目录 `%LOCALAPPDATA%\FileHubData` 完整保留。
+- ⚠️ 冒烟时发现并修掉一个真实问题：最初数据目录默认是 `%LOCALAPPDATA%\FileHub`，
+  与 MSI 安装目录**同名同路径**，卸载会把用户上传的文件一起删掉。现在数据固定到
+  `%LOCALAPPDATA%\FileHubData`，与安装目录分开。
+
+### 桌面版的实现位置
+
+- `src/main/resources/application-desktop.yml`：H2、回环端口、SQL 初始化、关闭 Swagger。
+- `src/main/resources/schema-h2.sql`：H2 建表（幂等，启动时自动执行）。
+- `src/main/java/com/yuzhuo/filehub/desktop/DesktopLauncher.java`：数据目录、单实例锁、
+  打开浏览器、系统托盘、启动失败弹窗。
+- `scripts/package-desktop.sh`：打包脚本。
+- 普通 `java -jar` 不带 `-Dfilehub.desktop=true`，走的仍然是最初的 MySQL 服务器流程。
 
 ---
 

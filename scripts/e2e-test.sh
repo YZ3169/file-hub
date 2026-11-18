@@ -169,8 +169,13 @@ curl -s -D "$WORK/rid-headers.txt" -o /dev/null -H "X-Request-Id: $REQ_ID" \
 check_contains "$(tr -d '\r' < "$WORK/rid-headers.txt")" "X-Request-Id: $REQ_ID" \
     "响应头回传调用方的 X-Request-Id"
 
-R="$(curl -s "$BASE/v3/api-docs")"
-check_contains "$R" '"title":"file-hub API"' "OpenAPI 文档可读取且标题正确"
+# 桌面 profile 主动关闭了 Swagger/OpenAPI（本地单机不需要暴露接口文档）
+if curl -s "$BASE/api/file/config" | grep -q '"desktop":true'; then
+    ok "桌面版未暴露 OpenAPI 文档（按设计跳过）"
+else
+    R="$(curl -s "$BASE/v3/api-docs")"
+    check_contains "$R" '"title":"file-hub API"' "OpenAPI 文档可读取且标题正确"
+fi
 
 # ---------------------------------------------------------------- 1. 全量上传
 

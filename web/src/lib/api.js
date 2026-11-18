@@ -124,7 +124,7 @@ async function request(path, options = {}) {
       throw new ApiError(50001, `请求超时（${Math.round(timeout / 1000)} 秒）`, 0)
     }
     if (e instanceof ApiError) throw e
-    throw new ApiError(-1, '无法连接服务端：请确认 Java 服务已在 8081 端口启动', 0)
+    throw new ApiError(-1, '无法连接服务端：请确认 file-hub 已启动', 0)
   } finally {
     combined.cleanup()
   }

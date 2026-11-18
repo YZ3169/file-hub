@@ -495,14 +495,15 @@ public class FileStorageService {
             if (kw.matches("^[0-9a-fA-F]{64}$")) {
                 // 完整的 SHA-256：精确匹配才能走 file_hash 索引，也避免把 64 位串当成分词拆碎
                 qw.eq(FileInfo::getFileHash, kw.toLowerCase(java.util.Locale.ROOT));
-            } else if (kw.codePointCount(0, kw.length()) >= 2) {
+            } else if (props.getSearch().isFulltextEnabled() && kw.codePointCount(0, kw.length()) >= 2) {
                 // 中文文件名用 ngram 全文索引：LIKE '%关键词%' 在几万行之后必然全表扫描。
                 // file_id / file_hash 仍保留 LIKE，方便按短标识前缀找文件。
                 qw.and(w -> w.apply("MATCH(file_name) AGAINST({0} IN NATURAL LANGUAGE MODE)", kw)
                         .or().like(FileInfo::getFileId, kw)
                         .or().like(FileInfo::getFileHash, kw));
             } else {
-                // 单个字/字符：ngram 最小分词长度是 2，全文索引查不到，回退 LIKE
+                // 单个字/字符：ngram 最小分词长度是 2，全文索引查不到，回退 LIKE。
+                // 桌面版 H2 没有 FULLTEXT，全文开关关闭后也走这里。
                 qw.and(w -> w.like(FileInfo::getFileName, kw)
                         .or().like(FileInfo::getFileHash, kw)
                         .or().like(FileInfo::getFileId, kw));
@@ -685,14 +686,16 @@ public class FileStorageService {
 
     private void doCleanup() {
         int minutes = props.getUploadExpireMinutes();
+        // 截止时间在 Java 里算，SQL 只做列与参数的比较：MySQL / H2 通用。
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(minutes);
         int removed = 0;
-        for (FileInfo stale : fileInfoMapper.findExpiredUploading(minutes)) {
+        for (FileInfo stale : fileInfoMapper.findExpiredUploading(cutoff)) {
             try {
                 // 拿到写锁后做条件删除：查询到拿锁之间，可能有分片刚提交过并刷新了 update_time。
                 // 条件 SQL 只删「仍在上传中且仍然过期」的行；删 0 行说明任务已复活/已完成。
                 // 删库、删盘、删元数据都在同一把写锁内，晚到的分片请求拿到读锁后会看到任务不存在。
                 int deleted = locks.write(stale.getFileId(), () -> {
-                    int n = fileInfoMapper.deleteExpiredById(stale.getId(), minutes);
+                    int n = fileInfoMapper.deleteExpiredById(stale.getId(), cutoff);
                     if (n == 0) {
                         return 0;
                     }
