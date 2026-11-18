@@ -635,7 +635,7 @@ CI 里的 MySQL 口令和 `FILE_HUB_ADMIN_PASSWORD` 都是一次性容器值，�
 > 任务完成后迟到分片不重建目录，以及真实定时清理的条件删除和孤儿目录回收。
 > 跑它需要一个已建库的环境，且脚本和服务端在同一台机器上（坏片用例要直接改磁盘分片）。
 
-Phase 3 的运维端点也在同一个实例上手工验证过（2026-11-18）：
+Phase 3 的运维端点在同一个实例上手工验证过（2026-11-18），当晚也补做了容器实测：
 
 - `/actuator/health` 200；管理员看到的 `storage` 组件含 root 路径，单机模式 `redis=disabled`；
 - 管理员 `/actuator/prometheus`、`/actuator/metrics` 200；不带 Token 返回 401（业务码 40001）；
@@ -645,8 +645,16 @@ Phase 3 的运维端点也在同一个实例上手工验证过（2026-11-18）�
 - 走完一次单分片小文件上传后，Prometheus 里出现
   `filehub_chunk_saved_total`、`filehub_upload_completed_total`、`filehub_upload_merge_duration_seconds`；
 - `--spring.profiles.active=json` 时输出单行 JSON，含 `requestId` / `traceId` / `spanId`。
-- **Docker Desktop 当时没有运行**：`docker compose config` 对两个 compose 文件语法校验通过，
-  但 `docker compose up --build` 没有在本机实际跑过；有 Docker 的环境请按上面的命令验证。
+- **单机 compose 实跑通过**：`docker compose up --build` 构建并启动成功，mysql / redis / app
+  三个容器均为 healthy；容器内 `/actuator/health` 显示 `storage.root=/data`、`redis=disabled`，
+  匿名访问 prometheus 401、管理员 200，`/v3/api-docs` 正常，`X-Request-Id` 回传且日志可见
+  `rid`/`trace`，`SPRING_PROFILES_ACTIVE=json` 输出含 `requestId`/`traceId`/`spanId`；
+  针对容器重跑完整 E2E，**101/101 通过**。
+  （E2E 里「直接改磁盘分片」的用例要求宿主机能看到存储目录，验证时临时把 `/data` 挂成
+  宿主机 bind mount；仓库里的默认 compose 仍是命名卷，行为不受影响。）
+- **集群 compose 也实跑过**：app1/app2 健康检查都是 200；在 8081 登录拿到的 Token 可直接
+  访问 8082，分片传 8082、status 查 8082、合并点 8081、下载回 8082，SHA-256 一致；
+  Redis 中出现 `filehub:` 前缀的限流键，说明集群模式确实走到了 Redis。
 
 ---
 
@@ -712,8 +720,9 @@ Phase 3 的运维端点也在同一个实例上手工验证过（2026-11-18）�
   并把 `/actuator/prometheus` 交给内网采集器而不是浏览器。
 - **接口文档在演示环境是公开的**：`/swagger-ui.html` 和 `/v3/api-docs` 当前 permitAll，
   方便面试演示和本地调试；生产应改成仅管理员/内网（`SecurityConfig` 一行）或关掉 swagger。
-- **Docker 只做了静态校验**：本机 Docker Desktop 未运行，`docker compose config` 通过，
-  但镜像构建和 `docker compose up` 没有实际跑过；CI 也没有加 `docker build` 任务。
+- **Docker 镜像没有进 CI**：镜像构建与单机/集群 compose 已在本机 Docker Desktop 实测通过
+  （2026-11-18），但 CI 没有加 `docker build` / `docker compose up` 任务，也没有推镜像仓库；
+  换机器或换架构（如 arm64）仍需自行验证。
 
 ---
 
