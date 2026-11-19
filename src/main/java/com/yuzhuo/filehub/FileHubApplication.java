@@ -10,13 +10,14 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import com.yuzhuo.filehub.auth.AuthProperties;
 import com.yuzhuo.filehub.auth.RateLimitProperties;
 import com.yuzhuo.filehub.config.ClusterProperties;
+import com.yuzhuo.filehub.config.ShareProperties;
 import com.yuzhuo.filehub.config.StorageProperties;
 import com.yuzhuo.filehub.desktop.DesktopLauncher;
 
 // 自己做密码校验，排除默认 UserDetailsService，避免启动日志里出现随机密码
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
 @EnableConfigurationProperties({StorageProperties.class, AuthProperties.class,
-        RateLimitProperties.class, ClusterProperties.class})
+        RateLimitProperties.class, ClusterProperties.class, ShareProperties.class})
 @EnableScheduling
 @MapperScan("com.yuzhuo.filehub.mapper")
 public class FileHubApplication {

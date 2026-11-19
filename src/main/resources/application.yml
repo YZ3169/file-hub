@@ -70,6 +70,25 @@ file-hub:
     redis-database: 0
     key-prefix: "filehub:"
 
+  # 提取码分享：4 位码 + 失败锁定；分享主战场是服务器/Docker 部署。
+  share:
+    # 连续输错多少次锁定（真正的防爆破在每分享的锁定，不在 IP 限流）
+    code-max-attempts: 10
+    # 锁定时长（分钟）
+    code-lock-minutes: 15
+    # 提取码的服务器端 pepper：设置后 BCrypt 摘要的是 HMAC(code, pepper)。
+    # 4 位码只有 100 万种，单靠 BCrypt 被拖库后离线穷举很快；密钥放环境变量
+    # （FILE_HUB_SHARE_PEPPER）而不进数据库。留空 = 不用，兼容已有数据；
+    # 修改该值会让已有分享的提取码全部失效。
+    code-pepper: ${FILE_HUB_SHARE_PEPPER:}
+    # 单个文件最多同时有几个有效分享；每个用户最多同时有几个（防止刷行 + BCrypt 编码）
+    max-active-per-file: 5
+    max-active-per-owner: 100
+    # 已取消/过期分享保留多少天后清理
+    stale-retention-days: 7
+    cleanup-interval-ms: 1800000
+    cleanup-initial-delay-ms: 60000
+
   # 限流默认值；本地 Caffeine 固定窗口，集群模式换 Redis 计数。
   rate-limit:
     enabled: true
@@ -78,6 +97,10 @@ file-hub:
     init-per-minute: 60
     chunk-per-minute: 2400
     api-per-minute: 600
+    # 匿名提取码校验：按 IP + 分享 token 计数，NAT 后多人同时提取不互相拖累
+    share-per-minute: 30
+    # 匿名提取的总闸：单个 IP 每分钟上限。token 的写法由客户端控制，不能只按 token 分桶
+    share-global-per-minute: 120
     # 默认不信任 X-Forwarded-For；只有放在可信反向代理后面时才打开。
     trust-forwarded-headers: false
 
@@ -102,7 +125,7 @@ management:
 info:
   app:
     name: file-hub
-    version: 1.0.1
+    version: 1.0.2
 
 springdoc:
   api-docs:

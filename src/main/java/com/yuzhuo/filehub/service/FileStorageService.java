@@ -536,6 +536,18 @@ public class FileStorageService {
         return info;
     }
 
+    /**
+     * 供匿名分享校验使用：只看文件本身，不校验调用者权限。
+     * 文件不存在、未完成，或磁盘内容缺失/大小不符，都返回 null。
+     */
+    public FileInfo findDoneForShare(String fileId) {
+        FileInfo info = findInfo(fileId);
+        if (info == null || info.getStatus() != FileInfo.STATUS_DONE || !isStorageIntact(info)) {
+            return null;
+        }
+        return info;
+    }
+
     private boolean canAccess(FileInfo info, UserPrincipal user) {
         if (user == null) {
             return false;

@@ -4,7 +4,7 @@ import lombok.Getter;
 
 /**
  * 业务异常。错误码约定：
- * 10xxx 参数/状态类，20xxx 存储类，30xxx 完整性类。
+ * 10xxx 参数/状态类，20xxx 存储类，30xxx 完整性类，42xxx 分享/提取类。
  */
 @Getter
 public class BizException extends RuntimeException {

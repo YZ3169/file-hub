@@ -1,6 +1,8 @@
 <script setup>
 import { computed, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
+import ShareDialog from './ShareDialog.vue'
+import SharesPanel from './SharesPanel.vue'
 import {
   deleteServerFile,
   downloadFile,
@@ -15,6 +17,9 @@ import { formatBytes, formatDate, shortHash } from '../lib/format'
 const keyword = ref(state.filePage.keyword)
 const sort = ref(state.filePage.sort)
 const statusFilter = ref(state.filePage.status === null ? '' : String(state.filePage.status))
+
+const shareFile = ref(null)
+const showShares = ref(false)
 
 const totalPages = computed(() =>
   Math.max(1, Math.ceil(state.filePage.total / state.filePage.size)),
@@ -76,10 +81,21 @@ function resetFilters() {
           · 秒传产生的多条记录共享同一份物理文件
         </span>
       </div>
-      <button class="btn btn-ghost btn-sm" type="button" @click="refresh">
-        <BaseIcon name="refresh" :size="14" />
-        刷新
-      </button>
+      <div class="head-actions">
+        <button
+          class="btn btn-ghost btn-sm"
+          type="button"
+          data-testid="my-shares-button"
+          @click="showShares = true"
+        >
+          <BaseIcon name="link" :size="14" />
+          我的分享
+        </button>
+        <button class="btn btn-ghost btn-sm" type="button" @click="refresh">
+          <BaseIcon name="refresh" :size="14" />
+          刷新
+        </button>
+      </div>
     </div>
 
     <div class="file-toolbar">
@@ -171,6 +187,17 @@ function resetFilters() {
                   v-if="file.status === 1"
                   class="icon-link"
                   type="button"
+                  title="分享（链接 + 提取码）"
+                  :aria-label="`分享 ${file.fileName}`"
+                  data-testid="share-file-button"
+                  @click="shareFile = file"
+                >
+                  <BaseIcon name="link" :size="15" />
+                </button>
+                <button
+                  v-if="file.status === 1"
+                  class="icon-link"
+                  type="button"
                   title="下载（支持 Range 断点续传）"
                   :aria-label="`下载 ${file.fileName}`"
                   @click="downloadFile(file)"
@@ -218,6 +245,9 @@ function resetFilters() {
       </div>
     </div>
   </section>
+
+  <ShareDialog v-if="shareFile" :file="shareFile" @close="shareFile = null" />
+  <SharesPanel v-if="showShares" @close="showShares = false" />
 </template>
 
 <style scoped>
@@ -247,6 +277,12 @@ function resetFilters() {
 .section-head span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
 }
 
 .file-toolbar {

@@ -292,6 +292,16 @@ KEY idx_status_id (status, id)
 
 -- 分片表：靠唯一索引把"重复上传同一分片"变成幂等操作
 UNIQUE KEY uk_file_chunk (file_id, chunk_index)
+
+-- 分享：token 原文存库（「我的分享」要能重新拼出链接），它只是定位符；
+-- 真正的口令是 4 位提取码，只存 BCrypt 摘要。token 用 ascii_bin，大小写敏感
+UNIQUE KEY uk_share_token (share_token)   -- share_token 为 ascii_bin
+KEY idx_share_owner (owner_id, id)
+KEY idx_share_file (file_id)
+KEY idx_share_status_expires (status, expires_at)
+-- 清理任务分别按取消时间 / 过期时间扫
+KEY idx_share_update_time (update_time)
+KEY idx_share_expires (expires_at)
 ```
 
 老库不用重建表：`scripts/migrate-v3-indexes.sql` 会先查 `information_schema.statistics`，
@@ -343,6 +353,50 @@ UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 
 ---
 
+## 提取码分享（v8）
+
+类似百度网盘的「链接 + 提取码」：上传者生成分享，别人拿到链接和 4 位提取码就能**免注册**下载。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/share` | `{fileId, expiresInDays}`，取值 `1/7/30/0`（0=永久），默认 7 天；仅文件所有者可创建 |
+| GET | `/api/share/mine?page=1&size=20` | 我的分享（不返回提取码，库里只有 BCrypt 摘要） |
+| DELETE | `/api/share/{token}` | 取消分享，链接立即失效 |
+| POST | `/api/share/{token}/reset-code` | 换一个提取码，同时清零失败次数、解除锁定 |
+| GET | `/api/public/share/{token}` | 匿名查询状态；只返回 `state/expiresAt/locked/lockedUntil`，**不返回文件名、大小、所有者** |
+| POST | `/api/public/share/{token}/verify` | `{code}`，成功才返回文件名/大小和一张 5 分钟票据下载地址 |
+
+- **链接形态**是 `index.html#/s/<43 位随机 token>`，用当前浏览器 origin 拼出来。反向代理部署时
+  必须用对外域名访问，否则拼出来的是 `localhost`。
+- **提取码** 4 位，字母表去掉了 `0/O/1/I` 等易混字符；输入会 `trim` + 转大写。库里只存 BCrypt
+  摘要，明文只在创建/重置时返回一次。忘了只能重置，不能找回。
+- **防爆破**：每个分享连续错 10 次锁 15 分钟（`file-hub.share.*` 可调），匿名接口再按
+  IP + token 限流 30 次/分钟、按 IP 总量 120 次/分钟（token 写法由客户端控制，只按 token
+  分桶可以被编码变体绕过）。4 位码只有约 20 bit 熵，靠这两层兜底，别把它当高安全的口令。
+- **拖库防护（可选）**：设置环境变量 `FILE_HUB_SHARE_PEPPER` 后，BCrypt 摘要的是
+  `HMAC-SHA256(code, pepper)`，密钥只在进程环境里。4 位码空间只有约 100 万，单靠 BCrypt
+  被拖库后离线穷举很快；加 pepper 后光有数据库无法还原。修改该值会让已有分享的提取码全部失效。
+- **创建配额**：单个文件最多 5 个有效分享、每个用户最多 100 个（`max-active-per-file` /
+  `max-active-per-owner`），防止刷分享行和 BCrypt 编码拖垮 CPU。
+- **已知取舍**：锁定是按分享的，拿到链接的人可以故意输错把分享锁 15 分钟。这是防爆破和
+  可用性之间选的边；被恶意锁定时，所有者重置提取码即可立刻解锁。
+- **下载完全复用现有链路**：校验通过后以**文件所有者**身份签发原有 5 分钟下载票据，所以 Range、
+  多段 Range、流式下载的行为与登录下载一模一样，没有第二套下载代码。
+- **失效语义**：取消/过期后新校验立即失败，但已经签发出去的票据最多还能再用 5 分钟；
+  要即时吊销，需要下一版把 `share_id` 写进票据表并在下载入口复查。
+- **桌面版**的分享链接是 `127.0.0.1:18080`，只能在同一台机器打开；界面会明确提示，
+  跨机器分享请部署服务器版（Docker）。
+- 服务器部署建议套 HTTPS：提取码和票据都在 URL/请求体里，明文 HTTP 在不可信网络上没有保密性。
+  未配 HTTPS 时前端复制链接会回退到 `execCommand`，功能可用但仅限可信局域网。
+- 已有 MySQL 库执行 `scripts/migrate-v6-share.sql`（只建新表，幂等）；桌面版 H2 启动时自动建表。
+  定时任务每 30 分钟清理已取消/过期超过 7 天的记录和文件已不存在的孤儿分享。
+
+错误码：`42001` 不存在或已取消、`42002` 已过期、`42003` 提取码错误（带剩余次数）、
+`42004` 次数过多已锁定、`42005` 文件已失效、`42006` 提取码格式不对、`42007` 不是文件所有者、
+`42008` 有效分享数量达到上限。
+
+---
+
 ## 管理员完整性扫描与修复（v5）
 
 数据库是索引、磁盘才是事实，所以磁盘被外部误删/改坏的记录迟早会和库对不上。管理员入口：
@@ -387,13 +441,13 @@ UNIQUE KEY uk_file_chunk (file_id, chunk_index)
 
 ```bash
 export MYSQL_PWD=你的口令
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.2.jar \
   --server.port=8081 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
   --file-hub.cluster.redis-address=redis://127.0.0.1:6379
 
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.2.jar \
   --server.port=8082 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
@@ -476,7 +530,7 @@ docker compose -f docker-compose.cluster.yml up --build
 
 ### 安装与使用
 
-1. 运行 `FileHub-1.0.1.msi`（构建产物在 `build/desktop/dist/`）。
+1. 运行 `FileHub-1.0.2.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
    开始菜单和桌面会创建快捷方式。
 2. 双击 `FileHub`，程序在独立窗口中打开 `http://127.0.0.1:18080`，不会占用默认浏览器。
@@ -527,7 +581,7 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
-#   build/desktop/dist/FileHub-1.0.1.msi           安装包
+#   build/desktop/dist/FileHub-1.0.2.msi           安装包
 ```
 
 安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
@@ -544,8 +598,8 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 把 `pom.xml` 的版本号和标签对齐后推 tag：
 
 ```bash
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 `.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
@@ -617,6 +671,8 @@ mysql -uroot -p < scripts/migrate-v3-indexes.sql
 mysql -uroot -p < scripts/migrate-v4-auth.sql
 #    已经跑过 v4 的库，补文件名 ngram 全文索引（需要 MySQL 8，同样幂等）：
 mysql -uroot -p < scripts/migrate-v5-fulltext.sql
+#    已经跑过 v5 的库，补提取码分享表（只建新表，同样幂等）：
+mysql -uroot -p < scripts/migrate-v6-share.sql
 
 # 2. 数据库口令走环境变量，不落盘（application.yml 里写的是 ${MYSQL_PWD}）
 export MYSQL_PWD=你的口令
@@ -625,7 +681,7 @@ export MYSQL_PWD=你的口令
 mvn clean package -DskipTests
 # 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
 export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.1.jar
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.2.jar
 # → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
 # → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
 ```

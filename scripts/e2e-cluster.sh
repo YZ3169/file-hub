@@ -155,6 +155,44 @@ download_to "$BASE2" "$FILE_ID" "$WORK/downloaded.bin"
 check_eq "$MAIN_HASH" "$(sha256sum "$WORK/downloaded.bin" | cut -d' ' -f1)" \
     "从节点 2 下载回来 SHA-256 一致"
 
+# ---------------------------------------------------------------- 2.5 提取码分享跨节点
+
+section "2.5 提取码分享：A 创建，B 匿名提取，A 取消后 B 立即失效"
+R="$(post_json_to "$BASE1" "$TOKEN" /api/share \
+    "{\"fileId\":\"$FILE_ID\",\"expiresInDays\":7}")"
+check_eq "0" "$(jget "$R" "['code']")" "节点 1 创建提取码分享"
+SHARE_CODE="$(jget "$R" "['data']['code']")"
+SHARE_TOKEN="$(jget "$R" "['data']['token']")"
+if [ -z "$SHARE_CODE" ] || [ -z "$SHARE_TOKEN" ]; then
+    bad "创建分享未返回 code/token" "$R"; echo "集群 E2E 失败"; exit 1
+fi
+
+R="$(curl -s "$BASE2/api/public/share/$SHARE_TOKEN")"
+check_eq "ACTIVE" "$(jget "$R" "['data']['state']")" "节点 2 已能看到分享状态"
+case "$R" in *fileName*) bad "meta 泄露文件名" "$R";; *) ok "meta 不包含文件名";; esac
+
+R="$(post_json_to "$BASE2" "" "/api/public/share/$SHARE_TOKEN/verify" \
+    "{\"code\":\"$SHARE_CODE\"}")"
+check_eq "0" "$(jget "$R" "['code']")" "节点 2 匿名校验提取码通过"
+TICKET_URL="$(jget "$R" "['data']['downloadUrl']")"
+check_eq "cluster-main.bin" "$(jget "$R" "['data']['fileName']")" "匿名接口返回文件名"
+
+curl -s -o "$WORK/share-downloaded.bin" "$BASE2$TICKET_URL"
+check_eq "$MAIN_HASH" "$(sha256sum "$WORK/share-downloaded.bin" | cut -d' ' -f1)" \
+    "用节点 2 签发的票据从节点 2 下载，内容一致"
+curl -s -o "$WORK/share-range.bin" -H 'Range: bytes=100-199' "$BASE2$TICKET_URL"
+dd if="$WORK/main.bin" of="$WORK/share-expect.bin" bs=1 skip=100 count=100 status=none
+check_eq "$(sha256sum "$WORK/share-expect.bin" | cut -d' ' -f1)" \
+    "$(sha256sum "$WORK/share-range.bin" | cut -d' ' -f1)" "匿名票据的 Range 下载跨节点正确"
+
+R="$(api_to "$BASE1" "$TOKEN" DELETE "/api/share/$SHARE_TOKEN")"
+check_eq "0" "$(jget "$R" "['code']")" "节点 1 取消分享"
+R="$(curl -s "$BASE2/api/public/share/$SHARE_TOKEN")"
+check_eq "42001" "$(jget "$R" "['code']")" "取消后节点 2 的 meta 立即返回 42001"
+R="$(post_json_to "$BASE2" "" "/api/public/share/$SHARE_TOKEN/verify" \
+    "{\"code\":\"$SHARE_CODE\"}")"
+check_eq "42001" "$(jget "$R" "['code']")" "取消后节点 2 用正确码也无法提取"
+
 # ---------------------------------------------------------------- 3. 秒传 / 去重
 
 section "3. 跨节点秒传与物理去重"

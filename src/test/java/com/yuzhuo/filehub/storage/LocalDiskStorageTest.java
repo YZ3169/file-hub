@@ -210,7 +210,9 @@ class LocalDiskStorageTest {
         String rel = storage.buildRelativePath(ID);
         storage.put(rel, src);
 
-        Path ignored = root.resolve("files").resolve("2026/11/18/not-a-uuid");
+        // 用当前日期的分片目录，别写死日期（跨过零点后目录不存在，测试会假红）
+        String shard = rel.substring(0, rel.lastIndexOf('/'));
+        Path ignored = root.resolve("files").resolve(shard).resolve("not-a-uuid");
         Files.writeString(ignored, "manual");
 
         assertEquals(List.of(rel), storage.listFilePaths());
@@ -219,7 +221,7 @@ class LocalDiskStorageTest {
         Files.setLastModifiedTime(root.resolve("files").resolve(rel),
                 FileTime.from(Instant.now().minus(Duration.ofHours(2))));
         assertTrue(storage.fileOlderThan(rel, Duration.ofHours(1)));
-        assertFalse(storage.fileOlderThan("2026/11/18/" + OTHER_ID, Duration.ofHours(1)),
+        assertFalse(storage.fileOlderThan(shard + "/" + OTHER_ID, Duration.ofHours(1)),
                 "不存在的成品不应被当成可删除的孤儿");
     }
 

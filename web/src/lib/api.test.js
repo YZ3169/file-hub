@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, listFiles, login, uploadChunk } from './api'
+import {
+  ApiError,
+  getPublicConfig,
+  getPublicShareMeta,
+  listFiles,
+  login,
+  uploadChunk,
+  verifyShareCode,
+} from './api'
 import { clearSession, getToken, onUnauthorized, setSession } from './auth'
 
 function response(body, status = 200) {
@@ -147,5 +155,23 @@ describe('api request', () => {
     expect(body.get('index')).toBe('2')
     expect(body.get('chunkHash')).toBe('abc')
     expect(body.get('chunk')).toBeInstanceOf(Blob)
+  })
+
+  it('匿名分享接口即使本地有会话也不带 Authorization', async () => {
+    setSession({ token: 'tok-9', user: { id: 1, username: 'alice', role: 'USER' } })
+    fetchMock.mockResolvedValue(ok({ state: 'ACTIVE' }))
+
+    await getPublicConfig()
+    await getPublicShareMeta('A'.repeat(43))
+    fetchMock.mockResolvedValue(ok({ fileId: 'f-1' }))
+    await verifyShareCode('A'.repeat(43), 'K7Q2')
+
+    for (const [, options] of fetchMock.mock.calls) {
+      expect(options.headers.get('Authorization')).toBeNull()
+    }
+    const [verifyPath, verifyOptions] = fetchMock.mock.calls[2]
+    expect(verifyPath).toBe(`/api/public/share/${'A'.repeat(43)}/verify`)
+    expect(verifyOptions.method).toBe('POST')
+    expect(JSON.parse(verifyOptions.body)).toEqual({ code: 'K7Q2' })
   })
 })

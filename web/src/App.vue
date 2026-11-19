@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import BaseIcon from './components/BaseIcon.vue'
 import UploadZone from './components/UploadZone.vue'
 import StatsBar from './components/StatsBar.vue'
@@ -9,9 +9,35 @@ import ToastHost from './components/ToastHost.vue'
 import LoginView from './components/LoginView.vue'
 import UserMenu from './components/UserMenu.vue'
 import AdminIntegrityPanel from './components/AdminIntegrityPanel.vue'
-import { bootstrap, clearFinished, state, toggleTheme } from './stores/uploader'
+import ShareView from './components/ShareView.vue'
+import { applyTheme, bootstrap, clearFinished, state, toggleTheme } from './stores/uploader'
 import { auth } from './lib/auth'
 import { formatBytes } from './lib/format'
+
+/** 分享链接是纯前端 hash 路由：#/s/<token>，不引入 vue-router */
+const SHARE_HASH = /^#\/s\/([A-Za-z0-9_-]{16,64})$/
+const SHARE_PREFIX = '#/s/'
+
+function parseShareHash() {
+  const hash = window.location.hash
+  const match = SHARE_HASH.exec(hash)
+  if (match) return match[1]
+  // 链接被聊天软件截断、或手改坏了，也要留在分享页让后端给出「链接无效」，
+  // 而不是把访客带到登录页——他可能根本没有账号。
+  if (hash.startsWith(SHARE_PREFIX)) {
+    return hash.slice(SHARE_PREFIX.length) || 'invalid-share-link'
+  }
+  return null
+}
+
+const shareToken = ref(parseShareHash())
+
+function onHashChange() {
+  const token = parseShareHash()
+  shareToken.value = token
+  // 从分享页回到工作台：之前跳过了 bootstrap，这里补上
+  if (!token && !state.booted) bootstrap()
+}
 
 const flow = [
   { icon: 'hash', title: '增量哈希', text: '4MB 一段，内存恒定' },
@@ -35,7 +61,14 @@ const finishedCount = computed(
 )
 
 onMounted(() => {
-  bootstrap()
+  applyTheme()
+  window.addEventListener('hashchange', onHashChange)
+  // 分享页可能来自未登录的访客：不要触发工作区 bootstrap
+  if (!shareToken.value) bootstrap()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('hashchange', onHashChange)
 })
 </script>
 
@@ -126,7 +159,11 @@ onMounted(() => {
       </button>
     </div>
 
-    <main v-if="!auth.ready" class="page boot-page">
+    <main v-if="shareToken" class="page page-share">
+      <ShareView :key="shareToken" :token="shareToken" />
+    </main>
+
+    <main v-else-if="!auth.ready" class="page boot-page">
       <div class="boot-screen" data-testid="boot-screen">
         <span class="boot-ring"></span>
         <span>正在恢复会话…</span>

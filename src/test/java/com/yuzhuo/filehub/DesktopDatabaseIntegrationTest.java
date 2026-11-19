@@ -2,24 +2,34 @@ package com.yuzhuo.filehub;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.yuzhuo.filehub.auth.AuthService;
+import com.yuzhuo.filehub.auth.DownloadTicketService;
 import com.yuzhuo.filehub.auth.UserPrincipal;
+import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.dto.AuthResponse;
+import com.yuzhuo.filehub.dto.CreateShareRequest;
 import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.dto.InitUploadResponse;
 import com.yuzhuo.filehub.dto.LoginRequest;
 import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.RegisterRequest;
+import com.yuzhuo.filehub.dto.ShareCreatedResponse;
+import com.yuzhuo.filehub.dto.ShareMetaResponse;
+import com.yuzhuo.filehub.dto.ShareVerifyResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.mapper.FileInfoMapper;
 import com.yuzhuo.filehub.service.FileStorageService;
+import com.yuzhuo.filehub.service.ShareService;
 import com.yuzhuo.filehub.util.HashUtil;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.web.servlet.MockMvc;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -30,10 +40,16 @@ import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.Comparator;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
  * 桌面版真实数据库冒烟：不起 MySQL，用 H2 文件库把「注册 → 分片 → 合并 →
@@ -50,6 +66,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 "file-hub.rate-limit.enabled=false"
         })
 @ActiveProfiles("desktop")
+@AutoConfigureMockMvc
 class DesktopDatabaseIntegrationTest {
 
     private static final Path DATA_DIR;
@@ -74,7 +91,16 @@ class DesktopDatabaseIntegrationTest {
     FileInfoMapper fileInfoMapper;
 
     @Autowired
+    ShareService shareService;
+
+    @Autowired
+    DownloadTicketService ticketService;
+
+    @Autowired
     JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    MockMvc mockMvc;
 
     @Test
     @DisplayName("桌面 H2：注册/大小写登录/分片重传/合并/搜索/下载/清理")
@@ -125,6 +151,91 @@ class DesktopDatabaseIntegrationTest {
         assertNull(removed, "过期上传任务应被删除");
 
         assertNotNull(done.getStoragePath());
+    }
+
+    @Test
+    @DisplayName("桌面 H2：分享创建/校验/票据下载/锁定/重置/取消")
+    void shareFlow() throws Exception {
+        AuthResponse registered = authService.register(
+                new RegisterRequest("ShareUser", "filehub-share-pass"));
+        UserPrincipal user = new UserPrincipal(
+                registered.user().id(), registered.user().username(), registered.user().role());
+
+        byte[] content = "share 分享测试内容".getBytes(StandardCharsets.UTF_8);
+        String fileHash = HashUtil.sha256Hex(content);
+        InitUploadResponse init = service.init(
+                new InitUploadRequest("分享测试.bin", (long) content.length, fileHash), user);
+        service.saveChunk(init.fileId(), 0, new ByteArrayInputStream(content),
+                HashUtil.sha256Hex(content), user);
+        service.complete(init.fileId(), user);
+
+        ShareCreatedResponse created = shareService.create(
+                new CreateShareRequest(init.fileId(), 7), user);
+        assertEquals(4, created.code().length());
+        assertNotNull(created.expiresAt());
+
+        ShareMetaResponse meta = shareService.meta(created.token());
+        assertEquals(ShareService.STATE_ACTIVE, meta.state());
+
+        String wrong = "AAAA".equals(created.code()) ? "BBBB" : "AAAA";
+        BizException wrongEx = assertThrows(BizException.class,
+                () -> shareService.verify(created.token(), wrong));
+        assertEquals(42003, wrongEx.getCode());
+
+        // 提取码大小写归一后应通过；票据兑换回创建者身份
+        ShareVerifyResponse ok = shareService.verify(created.token(), created.code().toLowerCase());
+        assertEquals("分享测试.bin", ok.fileName());
+        assertTrue(ok.downloadUrl().contains(
+                "/api/file/" + init.fileId() + "/download?ticket="));
+        String ticket = ok.downloadUrl().substring(
+                ok.downloadUrl().indexOf("ticket=") + "ticket=".length());
+        assertNotNull(ticketService.resolve(init.fileId(), ticket));
+        try (InputStream in = service.openForRead(service.requireInfo(init.fileId(), user))) {
+            assertArrayEquals(content, in.readAllBytes());
+        }
+
+        shareService.cancel(created.token(), user);
+        assertEquals(42001, assertThrows(BizException.class,
+                () -> shareService.meta(created.token())).getCode());
+
+        // 永久分享：连续错 10 次锁定，重置提取码后立即恢复
+        ShareCreatedResponse permanent = shareService.create(
+                new CreateShareRequest(init.fileId(), 0), user);
+        assertNull(permanent.expiresAt());
+        String wrong2 = "AAAA".equals(permanent.code()) ? "BBBB" : "AAAA";
+        for (int i = 0; i < 9; i++) {
+            BizException ex = assertThrows(BizException.class,
+                    () -> shareService.verify(permanent.token(), wrong2));
+            assertEquals(42003, ex.getCode());
+        }
+        assertEquals(42004, assertThrows(BizException.class,
+                () -> shareService.verify(permanent.token(), wrong2)).getCode());
+        assertEquals(42004, assertThrows(BizException.class,
+                () -> shareService.verify(permanent.token(), permanent.code())).getCode());
+
+        var reset = shareService.resetCode(permanent.token(), user);
+        assertEquals(4, reset.code().length());
+        ShareVerifyResponse afterReset = shareService.verify(permanent.token(), reset.code());
+        assertEquals(init.fileId(), afterReset.fileId());
+    }
+
+    @Test
+    @DisplayName("匿名分享接口放行，管理接口仍需登录")
+    void shareSecurity() throws Exception {
+        String token = "AAAABBBBCCCCDDDDEEEEFFFF";
+
+        mockMvc.perform(get("/api/public/share/" + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(42001));
+
+        mockMvc.perform(post("/api/public/share/" + token + "/verify")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"code\":\"ABCD\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(42001));
+
+        mockMvc.perform(get("/api/share/mine"))
+                .andExpect(status().isUnauthorized());
     }
 
     @AfterAll

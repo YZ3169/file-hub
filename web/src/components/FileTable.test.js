@@ -21,8 +21,16 @@ vi.mock('../stores/uploader', async () => {
     refreshFiles: vi.fn(() => Promise.resolve()),
     refreshStats: vi.fn(() => Promise.resolve()),
     updateFileQuery: vi.fn(),
+    toast: vi.fn(),
   }
 })
+
+vi.mock('../lib/api', () => ({
+  createShare: vi.fn(),
+  listShares: vi.fn(() => Promise.resolve({ items: [], total: 0, page: 1, size: 20 })),
+  cancelShare: vi.fn(),
+  resetShareCode: vi.fn(),
+}))
 
 import { goFilePage, state, updateFileQuery } from '../stores/uploader'
 import FileTable from './FileTable.vue'
@@ -127,5 +135,26 @@ describe('FileTable', () => {
 
     expect(updateFileQuery).toHaveBeenCalledWith({ status: 1 })
     expect(updateFileQuery).toHaveBeenCalledWith({ sort: 'size_asc' })
+  })
+
+  it('分享按钮只对已完成文件显示，点击打开分享弹窗', async () => {
+    state.files = [file(), file({ fileId: 'f-2', fileName: 'archive.zip', status: 0 })]
+    state.filePage.total = 2
+    const wrapper = mount(FileTable)
+
+    const rows = wrapper.findAll('tbody tr')
+    expect(rows[0].find('[data-testid="share-file-button"]').exists()).toBe(true)
+    expect(rows[1].find('[data-testid="share-file-button"]').exists()).toBe(false)
+
+    await rows[0].find('[data-testid="share-file-button"]').trigger('click')
+    expect(wrapper.find('[data-testid="share-dialog"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="share-dialog"]').text()).toContain('report.pdf')
+  })
+
+  it('「我的分享」按钮打开分享管理面板', async () => {
+    const wrapper = mount(FileTable)
+
+    await wrapper.find('[data-testid="my-shares-button"]').trigger('click')
+    expect(wrapper.find('[data-testid="shares-panel"]').exists()).toBe(true)
   })
 })

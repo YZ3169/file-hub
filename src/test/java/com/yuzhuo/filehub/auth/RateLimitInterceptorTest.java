@@ -100,6 +100,54 @@ class RateLimitInterceptorTest {
     }
 
     @Test
+    @DisplayName("匿名提取按 IP + 分享 token 计数（token 先解码再小写）")
+    void shareIsLimitedByIpAndToken() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST",
+                "/api/public/share/AAAABBBBCCCCDDDDEEEEFFFF/verify");
+        request.setRemoteAddr("203.0.113.9");
+        when(limiter.tryAcquire("share-ip:ip:203.0.113.9", 120, 60))
+                .thenReturn(new RateLimiter.Decision(true, 0));
+        when(limiter.tryAcquire("share:ip:203.0.113.9:t:aaaabbbbccccddddeeeeffff", 30, 60))
+                .thenReturn(new RateLimiter.Decision(true, 0));
+
+        assertTrue(interceptor.preHandle(request, new MockHttpServletResponse(), new Object()));
+        verify(limiter).tryAcquire("share-ip:ip:203.0.113.9", 120, 60);
+        verify(limiter).tryAcquire("share:ip:203.0.113.9:t:aaaabbbbccccddddeeeeffff", 30, 60);
+    }
+
+    @Test
+    @DisplayName("百分号编码的大小写变体落到同一个限流桶")
+    void shareTokenIsDecodedAndNormalized() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST",
+                "/api/public/share/%61aaabbbbccccddddeeeeffff/verify");
+        request.setRemoteAddr("203.0.113.9");
+        when(limiter.tryAcquire("share-ip:ip:203.0.113.9", 120, 60))
+                .thenReturn(new RateLimiter.Decision(true, 0));
+        when(limiter.tryAcquire("share:ip:203.0.113.9:t:aaaabbbbccccddddeeeeffff", 30, 60))
+                .thenReturn(new RateLimiter.Decision(true, 0));
+
+        assertTrue(interceptor.preHandle(request, new MockHttpServletResponse(), new Object()));
+        verify(limiter).tryAcquire("share:ip:203.0.113.9:t:aaaabbbbccccddddeeeeffff", 30, 60);
+    }
+
+    @Test
+    @DisplayName("匿名提取的总闸按 IP 计，token 变体绕不过去")
+    void shareGlobalLimitBlocksIp() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET",
+                "/api/public/share/AAAABBBBCCCCDDDDEEEEFFFF");
+        request.setRemoteAddr("203.0.113.9");
+        when(limiter.tryAcquire("share-ip:ip:203.0.113.9", 120, 60))
+                .thenReturn(new RateLimiter.Decision(false, 42));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(request, response, new Object()));
+        assertTrue(response.getHeader("Retry-After").equals("42"));
+        verify(limiter, never()).tryAcquire(
+                org.mockito.ArgumentMatchers.startsWith("share:"),
+                anyInt(), anyLong());
+    }
+
+    @Test
     @DisplayName("把 limiter 的 key 和窗口参数原样传下去")
     void forwardsConfiguredLimit() throws Exception {
         properties.setInitPerMinute(3);

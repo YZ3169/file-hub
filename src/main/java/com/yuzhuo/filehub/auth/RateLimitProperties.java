@@ -22,6 +22,15 @@ public class RateLimitProperties {
 
     private int apiPerMinute = 600;
 
+    /** 匿名提取码校验：按 IP + 分享 token 计数 */
+    private int sharePerMinute = 30;
+
+    /**
+     * 匿名提取的总闸：单个 IP 每分钟最多多少次。token 是客户端可控的 key 维度，
+     * 只用 token 计数等于让攻击者决定分桶，所以必须另有一条按 IP 的全局上限。
+     */
+    private int shareGlobalPerMinute = 120;
+
     /**
      * 默认只信任 remoteAddr。只有部署在明确配置过 X-Forwarded-For 的反向代理后面时才打开，
      * 否则客户端可以伪造该头绕过按 IP 的登录限流。

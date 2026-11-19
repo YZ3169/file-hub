@@ -12,8 +12,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class LocalRateLimiter implements RateLimiter {
 
+    // 匿名分享按「IP + token」计数，token 可由攻击者构造出大量不同 key；
+    // 上限给宽一些，避免随机 token 把登录/上传等其它 scope 的计数器挤出缓存。
     private final Cache<String, AtomicInteger> counters = Caffeine.newBuilder()
-            .maximumSize(50_000)
+            .maximumSize(200_000)
             .expireAfterWrite(Duration.ofHours(2))
             .build();
 

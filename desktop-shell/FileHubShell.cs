@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Text;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -90,12 +91,12 @@ namespace FileHubShell
             Icon = LoadAppIcon();
 
             loadingLabel = new Label();
-            loadingLabel.Text = "正在启动 FileHub...";
+            loadingLabel.Text = ShellUi.T("正在启动 FileHub...", "Starting FileHub...");
             loadingLabel.ForeColor = Color.White;
             loadingLabel.BackColor = Color.Transparent;
             loadingLabel.Dock = DockStyle.Fill;
             loadingLabel.TextAlign = ContentAlignment.MiddleCenter;
-            loadingLabel.Font = new Font("Microsoft YaHei UI", 12F);
+            loadingLabel.Font = ShellUi.Font(12F);
             Controls.Add(loadingLabel);
 
             webView = new WebView2();
@@ -136,10 +137,15 @@ namespace FileHubShell
             trayIcon.Visible = true;
 
             ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add("打开 FileHub", null, delegate { RestoreFromTray(); });
-            menu.Items.Add("打开数据目录", null, delegate { OpenDataDir(); });
+            // 系统默认字体不一定含中文字形：英文/精简版 Windows 上会显示方块。
+            // 显式指定一个确定存在的中文字体（或按语言回退英文文案）。
+            menu.Font = ShellUi.Font(9F);
+            menu.Items.Add(ShellUi.T("打开 FileHub", "Open FileHub"), null,
+                    delegate { RestoreFromTray(); });
+            menu.Items.Add(ShellUi.T("打开数据目录", "Open data folder"), null,
+                    delegate { OpenDataDir(); });
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出", null, delegate { ExitApplication(); });
+            menu.Items.Add(ShellUi.T("退出", "Exit"), null, delegate { ExitApplication(); });
             trayIcon.ContextMenuStrip = menu;
             trayIcon.DoubleClick += delegate { RestoreFromTray(); };
         }
@@ -172,9 +178,14 @@ namespace FileHubShell
                 }
                 catch (WebView2RuntimeNotFoundException)
                 {
-                    ShowStartupError("未找到 Microsoft Edge WebView2 运行时。"
-                            + "Windows 11 一般自带；精简版系统或部分 Windows 10 需要先安装：\n"
-                            + "https://developer.microsoft.com/microsoft-edge/webview2/");
+                    ShowStartupError(ShellUi.T(
+                            "未找到 Microsoft Edge WebView2 运行时。"
+                                    + "Windows 11 一般自带；精简版系统或部分 Windows 10 需要先安装：\n"
+                                    + "https://developer.microsoft.com/microsoft-edge/webview2/",
+                            "Microsoft Edge WebView2 Runtime was not found. "
+                                    + "Windows 11 usually includes it; slim or older Windows 10 "
+                                    + "builds need to install it first:\n"
+                                    + "https://developer.microsoft.com/microsoft-edge/webview2/"));
                     return;
                 }
                 webReady = true;
@@ -267,7 +278,9 @@ namespace FileHubShell
                     Path.GetFullPath(Application.ExecutablePath),
                     StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidOperationException("找不到后台程序 FileHubBackend.exe。");
+                throw new InvalidOperationException(ShellUi.T(
+                        "找不到后台程序 FileHubBackend.exe。",
+                        "FileHubBackend.exe was not found."));
             }
 
             ProcessStartInfo info = new ProcessStartInfo(backendExe);
@@ -304,7 +317,8 @@ namespace FileHubShell
                 {
                     if (!exiting)
                     {
-                        ShowStartupError("后台服务意外退出。");
+                        ShowStartupError(ShellUi.T("后台服务意外退出。",
+                                "The backend service exited unexpectedly."));
                     }
                 }));
             }
@@ -322,7 +336,7 @@ namespace FileHubShell
             {
                 if (exiting)
                 {
-                    return "窗口已关闭。";
+                    return ShellUi.T("窗口已关闭。", "The window has been closed.");
                 }
                 if (IsServerUp())
                 {
@@ -332,11 +346,15 @@ namespace FileHubShell
                 {
                     int code = backend.ExitCode;
                     Log("backend exited during startup, code=" + code);
-                    return "后台服务启动失败（进程已退出，退出码 " + code + "），请查看应用日志。";
+                    return ShellUi.T(
+                            "后台服务启动失败（进程已退出，退出码 " + code + "），请查看应用日志。",
+                            "The backend failed to start (process exited with code " + code + "). "
+                                    + "Please check the application log.");
                 }
                 await Task.Delay(300);
             }
-            return "后台服务没有在 90 秒内就绪，请查看应用日志。";
+            return ShellUi.T("后台服务没有在 90 秒内就绪，请查看应用日志。",
+                    "The backend was not ready within 90 seconds. Please check the application log.");
         }
 
         private static bool IsServerUp()
@@ -392,7 +410,10 @@ namespace FileHubShell
             Hide();
             if (trayIcon != null)
             {
-                trayIcon.ShowBalloonTip(2500, "FileHub", "已最小化到系统托盘，双击图标可重新打开。",
+                // 气泡提示无法指定字体；这里靠语言回退，保证英文系统上不出现方块
+                trayIcon.ShowBalloonTip(2500, "FileHub",
+                        ShellUi.T("已最小化到系统托盘，双击图标可重新打开。",
+                                "Minimized to the system tray. Double-click the icon to reopen."),
                         ToolTipIcon.Info);
             }
         }
@@ -418,8 +439,10 @@ namespace FileHubShell
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "无法打开数据目录：" + ex.Message, "FileHub",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this,
+                        ShellUi.T("无法打开数据目录：", "Could not open the data folder: ")
+                                + ex.Message,
+                        "FileHub", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -502,9 +525,11 @@ namespace FileHubShell
             string logPath = Path.Combine(dataDir != null ? dataDir : GetDataDir(), "logs", "filehub.log");
             Log("startup error: " + detail);
             MessageBox.Show(this,
-                    detail + "\n\n应用日志：" + logPath
-                            + "\n外壳日志：" + Path.Combine(GetDataDir(), "logs", "shell.log"),
-                    "FileHub 启动失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    detail + ShellUi.T("\n\n应用日志：", "\n\nApplication log: ") + logPath
+                            + ShellUi.T("\n外壳日志：", "\nShell log: ")
+                            + Path.Combine(GetDataDir(), "logs", "shell.log"),
+                    ShellUi.T("FileHub 启动失败", "FileHub failed to start"),
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             ExitApplication();
         }
 
@@ -567,51 +592,81 @@ namespace FileHubShell
 
         private ClosePrompt()
         {
-            Text = "关闭 FileHub";
+            Text = ShellUi.T("关闭 FileHub", "Close FileHub");
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new Size(500, 160);
+            // 不用固定像素布局：中英文按钮宽度差异很大，交给自动布局
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Font = ShellUi.Font(9F);
+            Padding = new Padding(20, 18, 20, 16);
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.AutoSize = true;
+            layout.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            layout.ColumnCount = 1;
+            layout.RowCount = 2;
+            layout.Dock = DockStyle.Fill;
+            Controls.Add(layout);
 
             Label label = new Label();
-            label.Text = "要最小化到系统托盘继续运行，还是直接退出 FileHub？";
-            label.SetBounds(20, 22, 460, 44);
-            Controls.Add(label);
+            label.Text = ShellUi.T(
+                    "要最小化到系统托盘继续运行，还是直接退出 FileHub？",
+                    "Minimize FileHub to the system tray, or exit now?");
+            label.AutoSize = true;
+            label.MaximumSize = new Size(460, 0);
+            label.Margin = new Padding(0);
+            layout.Controls.Add(label, 0, 0);
 
-            Button trayButton = new Button();
-            trayButton.Text = "最小化到托盘";
-            trayButton.SetBounds(30, 92, 160, 34);
+            FlowLayoutPanel buttons = new FlowLayoutPanel();
+            buttons.AutoSize = true;
+            buttons.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            buttons.FlowDirection = FlowDirection.RightToLeft;
+            buttons.WrapContents = false;
+            buttons.Anchor = AnchorStyles.Right;
+            buttons.Margin = new Padding(0, 14, 0, 0);
+            layout.Controls.Add(buttons, 0, 1);
+
+            Button trayButton = CreateButton(ShellUi.T("最小化到托盘", "Minimize to tray"));
             trayButton.Click += delegate
             {
                 choice = CloseChoice.MinimizeToTray;
                 Close();
             };
-            Controls.Add(trayButton);
+            buttons.Controls.Add(trayButton);
 
-            Button exitButton = new Button();
-            exitButton.Text = "直接退出";
-            exitButton.SetBounds(210, 92, 110, 34);
+            Button exitButton = CreateButton(ShellUi.T("直接退出", "Exit"));
             exitButton.Click += delegate
             {
                 choice = CloseChoice.Exit;
                 Close();
             };
-            Controls.Add(exitButton);
+            buttons.Controls.Add(exitButton);
 
-            Button cancelButton = new Button();
-            cancelButton.Text = "取消";
-            cancelButton.SetBounds(340, 92, 110, 34);
+            Button cancelButton = CreateButton(ShellUi.T("取消", "Cancel"));
             cancelButton.Click += delegate
             {
                 choice = CloseChoice.Cancel;
                 Close();
             };
-            Controls.Add(cancelButton);
+            buttons.Controls.Add(cancelButton);
 
             AcceptButton = trayButton;
             CancelButton = cancelButton;
+        }
+
+        private static Button CreateButton(string text)
+        {
+            Button button = new Button();
+            button.Text = text;
+            button.AutoSize = true;
+            button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            button.MinimumSize = new Size(88, 32);
+            button.Margin = new Padding(6, 0, 0, 0);
+            return button;
         }
 
         internal static CloseChoice Show(Form owner)
@@ -621,6 +676,121 @@ namespace FileHubShell
                 prompt.ShowDialog(owner);
                 return prompt.choice;
             }
+        }
+    }
+
+    /// <summary>
+    /// 外壳文案与字体。ContextMenuStrip / MessageBox / 托盘气泡用的是系统默认字体，
+    /// 在缺少中文字体的 Windows 上会把中文画成方块；这里显式挑一个已安装的中文字体，
+    /// 找不到就把整个外壳切到英文（气泡和 MessageBox 无法单独指定字体）。
+    /// 调试时可用 FILE_HUB_SHELL_LANG=zh|en 强制语言。
+    /// </summary>
+    internal static class ShellUi
+    {
+        private static readonly string[] CjkFamilies = new string[]
+        {
+            "Microsoft YaHei UI", "Microsoft YaHei",
+            "Microsoft JhengHei UI", "Microsoft JhengHei",
+            "SimSun", "NSimSun", "SimHei", "Noto Sans CJK SC"
+        };
+
+        private static bool cjkChecked;
+        private static string cjkFamily;
+        private static bool langChecked;
+        private static bool useChinese;
+
+        internal static string AvailableCjkFamily()
+        {
+            if (cjkChecked)
+            {
+                return cjkFamily;
+            }
+            cjkChecked = true;
+            try
+            {
+                using (InstalledFontCollection fonts = new InstalledFontCollection())
+                {
+                    FontFamily[] families = fonts.Families;
+                    for (int i = 0; i < CjkFamilies.Length && cjkFamily == null; i++)
+                    {
+                        for (int j = 0; j < families.Length; j++)
+                        {
+                            if (string.Equals(families[j].Name, CjkFamilies[i],
+                                    StringComparison.OrdinalIgnoreCase))
+                            {
+                                cjkFamily = families[j].Name;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // 字体枚举失败就当作没有中文字体，走英文回退
+            }
+            return cjkFamily;
+        }
+
+        internal static bool HasCjkFont()
+        {
+            return AvailableCjkFamily() != null;
+        }
+
+        internal static bool UseChinese
+        {
+            get
+            {
+                if (langChecked)
+                {
+                    return useChinese;
+                }
+                langChecked = true;
+                string forced = Environment.GetEnvironmentVariable("FILE_HUB_SHELL_LANG");
+                if (!string.IsNullOrEmpty(forced))
+                {
+                    string lang = forced.Trim().ToLowerInvariant();
+                    if (lang == "zh" || lang.StartsWith("zh-"))
+                    {
+                        useChinese = true;
+                        return useChinese;
+                    }
+                    if (lang == "en" || lang.StartsWith("en-"))
+                    {
+                        useChinese = false;
+                        return useChinese;
+                    }
+                }
+                useChinese = HasCjkFont();
+                return useChinese;
+            }
+        }
+
+        internal static Font Font(float size)
+        {
+            string family = UseChinese ? AvailableCjkFamily() : null;
+            if (family != null)
+            {
+                try
+                {
+                    return new Font(family, size);
+                }
+                catch (ArgumentException)
+                {
+                    // 字体名在这台机器上不可用，退回系统 UI 字体
+                }
+            }
+            Font baseFont = SystemFonts.MessageBoxFont;
+            if (baseFont != null)
+            {
+                return new Font(baseFont.FontFamily, size, baseFont.Style);
+            }
+            return new Font(FontFamily.GenericSansSerif, size);
+        }
+
+        internal static string T(string chinese, string english)
+        {
+            return UseChinese ? chinese : english;
         }
     }
 }

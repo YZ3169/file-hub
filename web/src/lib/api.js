@@ -222,6 +222,40 @@ export const deleteFile = (fileId) =>
 export const createDownloadTicket = (fileId) =>
   request(`/api/file/${encodeURIComponent(fileId)}/download-ticket`)
 
+// ---- 提取码分享（管理端，需登录）----
+
+export const createShare = (fileId, expiresInDays = 7) =>
+  request('/api/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileId, expiresInDays }),
+  })
+
+export const listShares = ({ page = 1, size = 20 } = {}) =>
+  request(`/api/share/mine?page=${page}&size=${size}`)
+
+export const cancelShare = (token) =>
+  request(`/api/share/${encodeURIComponent(token)}`, { method: 'DELETE' })
+
+export const resetShareCode = (token) =>
+  request(`/api/share/${encodeURIComponent(token)}/reset-code`, { method: 'POST' })
+
+// ---- 提取码分享（匿名，绝不带 Authorization）----
+// 匿名页可能同时存在已登录会话；带上 Bearer 只会让 401 误清会话，没有意义。
+
+export const getPublicConfig = () => request('/api/file/config', { auth: false })
+
+export const getPublicShareMeta = (token) =>
+  request(`/api/public/share/${encodeURIComponent(token)}`, { auth: false })
+
+export const verifyShareCode = (token, code) =>
+  request(`/api/public/share/${encodeURIComponent(token)}/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+    auth: false,
+  })
+
 // ---- 管理员：完整性检查 ----
 
 /**

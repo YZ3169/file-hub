@@ -66,6 +66,9 @@ public class SecurityConfig {
                                 "/actuator/info").permitAll()
                         .requestMatchers("/api/auth/login", "/api/auth/register").permitAll()
                         .requestMatchers("/api/file/config").permitAll()
+                        // 匿名提取：只放行公共前缀；管理接口 /api/share/** 仍需登录
+                        .requestMatchers(HttpMethod.GET, "/api/public/share/*").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/public/share/*/verify").permitAll()
                         // 下载接口由 Controller 内部校验 Bearer 或短期票据
                         .requestMatchers(HttpMethod.GET, "/api/file/*/download").permitAll()
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")

@@ -56,6 +56,13 @@ check_contains() {  # check_contains 文本 子串 说明
     case "$1" in *"$2"*) ok "$3";; *) bad "$3" "未包含 [$2]，实际：$(echo "$1" | head -c 200)";; esac
 }
 
+# 反向断言：整段响应里都不能出现某个字段名。
+# 错误响应的 data 是 null，拿 'data'['field'] 去判断会抛异常（null 没有 __contains__），
+# 所以直接看响应原文。
+check_not_contains() {  # check_not_contains 文本 子串 说明
+    case "$1" in *"$2"*) bad "$3" "不应包含 [$2]，实际：$(echo "$1" | head -c 200)";; *) ok "$3";; esac
+}
+
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 api_as() {  # api_as TOKEN METHOD PATH [curl args...]
@@ -412,6 +419,85 @@ check_eq "40001" "$(jget "$R" "['code']")" "伪造票据被拒绝（40001，未�
 
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/file/$FILE_ID/download")"
 check_eq "401" "$CODE" "既无 Bearer 又无票据时下载返回 401"
+
+# ---------------------------------------------------------------- 2.7 提取码分享
+
+section "2.7 提取码分享（链接 + 4 位码，免登录下载）"
+
+R="$(post_json /api/share "{\"fileId\":\"$FILE_ID\",\"expiresInDays\":7}")"
+SHARE_TOKEN="$(jget "$R" "['data']['token']")"
+SHARE_CODE="$(jget "$R" "['data']['code']")"
+check_eq "0" "$(jget "$R" "['code']")" "创建 7 天有效的分享"
+check_eq "4" "${#SHARE_CODE}" "提取码是 4 位"
+check_contains "$(jget "$R" "['data']['sharePath']")" "#/s/$SHARE_TOKEN" "分享链接指向 #/s/<token>"
+
+R="$(api GET "/api/share/mine?page=1&size=20")"
+check_eq "0" "$(jget "$R" "['code']")" "GET /api/share/mine 返回成功"
+check_eq "ACTIVE" "$(jget "$R" "['data']['items'][0]['state']")" "我的分享里状态是 ACTIVE"
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/share/mine")"
+check_eq "401" "$CODE" "未登录不能管理分享"
+
+# 匿名只能看状态，不能看到文件名/大小/所有者
+R="$(api_as "" GET "/api/public/share/$SHARE_TOKEN")"
+check_eq "ACTIVE" "$(jget "$R" "['data']['state']")" "匿名可以查询分享状态"
+check_not_contains "$R" "fileName" "匿名 meta 不返回文件名"
+check_not_contains "$R" "fileSize" "匿名 meta 不返回文件大小"
+check_not_contains "$R" "owner" "匿名 meta 不暴露所有者"
+
+WRONG_CODE="AAAA"
+[ "$SHARE_CODE" = "AAAA" ] && WRONG_CODE="BBBB"
+
+R="$(post_json_as "" "/api/public/share/$SHARE_TOKEN/verify" "{\"code\":\"$WRONG_CODE\"}")"
+check_eq "42003" "$(jget "$R" "['code']")" "提取码错误返回 42003"
+check_not_contains "$R" "fileName" "校验失败不泄露文件名"
+check_not_contains "$R" "downloadUrl" "校验失败不签发下载地址"
+
+# 提取码大小写不敏感：小写输入也应当通过
+LOWER_CODE="$(echo "$SHARE_CODE" | tr 'A-Z' 'a-z')"
+R="$(post_json_as "" "/api/public/share/$SHARE_TOKEN/verify" "{\"code\":\"$LOWER_CODE\"}")"
+check_eq "0" "$(jget "$R" "['code']")" "正确提取码（小写）校验通过"
+SHARE_URL="$(jget "$R" "['data']['downloadUrl']")"
+check_contains "$SHARE_URL" "/download?ticket=" "校验返回的是现有票据下载地址"
+
+# 不带任何 Bearer，仅凭票据下载
+curl -s -o "$WORK/share.bin" "$BASE$SHARE_URL"
+check_eq "$BIG_HASH" "$(sha256sum "$WORK/share.bin" | cut -d' ' -f1)" \
+         "提取人免登录下载，内容与原文件一致"
+
+# 取消后立即失效
+R="$(api DELETE "/api/share/$SHARE_TOKEN")"
+check_eq "0" "$(jget "$R" "['code']")" "所有者取消分享"
+R="$(api_as "" GET "/api/public/share/$SHARE_TOKEN")"
+check_eq "42001" "$(jget "$R" "['code']")" "取消后匿名访问变成 42001"
+R="$(post_json_as "" "/api/public/share/$SHARE_TOKEN/verify" "{\"code\":\"$SHARE_CODE\"}")"
+check_eq "42001" "$(jget "$R" "['code']")" "取消后正确提取码也不能再下载"
+
+# 永久分享 + 连续错码锁定 + 重置提取码解锁
+R="$(post_json /api/share "{\"fileId\":\"$FILE_ID\",\"expiresInDays\":0}")"
+SHARE2="$(jget "$R" "['data']['token']")"
+CODE2="$(jget "$R" "['data']['code']")"
+check_eq "0" "$(jget "$R" "['code']")" "创建永久分享"
+check_eq "None" "$(jget "$R" "['data']['expiresAt']")" "永久分享的 expiresAt 为空"
+
+WRONG2="AAAA"
+[ "$CODE2" = "AAAA" ] && WRONG2="BBBB"
+for i in $(seq 1 9); do
+    R="$(post_json_as "" "/api/public/share/$SHARE2/verify" "{\"code\":\"$WRONG2\"}")"
+done
+check_eq "42003" "$(jget "$R" "['code']")" "第 9 次错码仍是 42003"
+R="$(post_json_as "" "/api/public/share/$SHARE2/verify" "{\"code\":\"$WRONG2\"}")"
+check_eq "42004" "$(jget "$R" "['code']")" "第 10 次错码触发锁定（42004）"
+R="$(post_json_as "" "/api/public/share/$SHARE2/verify" "{\"code\":\"$CODE2\"}")"
+check_eq "42004" "$(jget "$R" "['code']")" "锁定期间正确码同样被拒绝"
+
+R="$(api POST "/api/share/$SHARE2/reset-code")"
+CODE3="$(jget "$R" "['data']['code']")"
+check_eq "0" "$(jget "$R" "['code']")" "所有者重置提取码"
+R="$(post_json_as "" "/api/public/share/$SHARE2/verify" "{\"code\":\"$CODE3\"}")"
+check_eq "0" "$(jget "$R" "['code']")" "重置后立刻解锁并能下载"
+R="$(api DELETE "/api/share/$SHARE2")"
+check_eq "0" "$(jget "$R" "['code']")" "清理永久分享"
 
 # ---------------------------------------------------------------- 3. 断点续传
 
