@@ -532,6 +532,8 @@ docker compose -f docker-compose.cluster.yml up --build
 
 1. 运行 `FileHub-1.0.2.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
+   选择的目录是**上级目录**，安装程序会自动在其中创建 `FileHub` 子文件夹
+   （例如选 `D:\` 会装到 `D:\FileHub`），不需要手动新建文件夹；
    开始菜单和桌面会创建快捷方式。
 2. 双击 `FileHub`，程序在独立窗口中打开 `http://127.0.0.1:18080`，不会占用默认浏览器。
 3. 第一次使用先注册。**第一个注册的账号自动成为管理员**（桌面版单人使用，

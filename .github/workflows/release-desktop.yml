@@ -36,6 +36,11 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # 给 MSI 后处理用（在所选目录下自动创建 FileHub 子文件夹）
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: 安装前端依赖
         working-directory: web
         run: npm ci
@@ -89,6 +94,8 @@ jobs:
 
             - `FileHub-${{ env.APP_VERSION }}.msi`：推荐。按用户安装，不需要管理员权限，
               从开始菜单启动，卸载只删程序、不删数据。
+              安装时选择的目录是上级目录，安装程序会自动创建 `FileHub` 子文件夹
+              （例如选择 `D:\` 会安装到 `D:\FileHub`）。
             - `FileHub-${{ env.APP_VERSION }}-portable.zip`：免安装，解压后双击 `FileHub.exe`。
 
             首次运行可能被 SmartScreen 提示「未知发布者」（安装包未做代码签名）：

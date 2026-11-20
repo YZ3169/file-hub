@@ -13,6 +13,7 @@
 # 前置：
 #   - JDK 17（JAVA_HOME；本机默认 D:/safe/jdk/jdk17）
 #   - Node/npm、Maven
+#   - Python 3（可选，只有生成 MSI 时用；用来做安装目录后处理）
 #   - WiX Toolset 3.14（可选；没有就只出 app-image）
 #     本机可把官方 wix314-binaries.zip 解压到 D:/Tools/wix314，
 #     或用 WIX_BIN=/path/to/wix/bin 指定。
@@ -97,6 +98,25 @@ if [ -z "$WIX_BIN" ]; then
 fi
 export PATH="$WIX_BIN:$PATH"
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "生成自动子文件夹版 MSI 需要 Python 3（找不到 $PYTHON_BIN）" >&2
+    exit 1
+fi
+
+win_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+MSI_WORK="$OUT/wix"
+MSI_FILE="$OUT/dist/$APP_NAME-$APP_VERSION.msi"
+
+# --temp 让 jpackage 保留生成的 WiX 源码，下面补一步：
+# 选择 D:\ 时自动装到 D:\FileHub，而不是直接铺到 D:\ 根目录。
 jpackage \
     --type msi \
     --name "$APP_NAME" \
@@ -110,7 +130,15 @@ jpackage \
     --win-menu-group "$APP_NAME" \
     --win-dir-chooser \
     --win-upgrade-uuid "$UPGRADE_UUID" \
+    --temp "$MSI_WORK" \
     --dest "$OUT/dist"
+
+echo "==> 5.1/5 让安装程序在所选目录下自动创建 $APP_NAME 子文件夹"
+"$PYTHON_BIN" "$ROOT/scripts/patch-msi-install-parent.py" \
+    --work "$(win_path "$MSI_WORK")" \
+    --msi "$(win_path "$MSI_FILE")" \
+    --wix-bin "$(win_path "$WIX_BIN")" \
+    --app-name "$APP_NAME"
 
 echo
 echo "完成："
