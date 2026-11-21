@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import { cancelShare, listShares, resetShareCode } from '../lib/api'
 import { buildShareUrl, copyText } from '../lib/clipboard'
@@ -18,25 +18,34 @@ const STATE_LABEL = {
 const items = ref([])
 const total = ref(0)
 const page = ref(1)
-const loading = ref(false)
+const loading = ref(true)
 const error = ref('')
 const newCode = ref(null)
 const busyToken = ref('')
+const closeButton = ref(null)
+let loadSequence = 0
+let retryPage = 1
+let disposed = false
+let previousFocus = null
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / SIZE)))
 
 async function load(target = page.value) {
+  const requestId = ++loadSequence
+  retryPage = target
   loading.value = true
   error.value = ''
   try {
     const data = await listShares({ page: target, size: SIZE })
+    if (disposed || requestId !== loadSequence) return
     items.value = data.items
     total.value = data.total
     page.value = data.page
   } catch (e) {
+    if (disposed || requestId !== loadSequence) return
     error.value = e.message
   } finally {
-    loading.value = false
+    if (!disposed && requestId === loadSequence) loading.value = false
   }
 }
 
@@ -54,14 +63,16 @@ function copyLink(item) {
 }
 
 async function regenerate(item) {
-  if (busyToken.value) return
+  if (busyToken.value || loading.value) return
   busyToken.value = item.token
   try {
     const resp = await resetShareCode(item.token)
+    if (disposed) return
     newCode.value = { token: item.token, code: resp.code, expiresAt: resp.expiresAt }
     toast('已生成新的提取码，旧提取码立即失效', 'success')
     await load()
   } catch (e) {
+    if (disposed) return
     toast(`重置失败：${e.message}`, 'error')
   } finally {
     busyToken.value = ''
@@ -69,22 +80,33 @@ async function regenerate(item) {
 }
 
 async function cancel(item) {
-  if (busyToken.value) return
+  if (busyToken.value || loading.value) return
   if (!window.confirm(`取消分享「${item.fileName}」？链接和提取码会立即失效。`)) return
   busyToken.value = item.token
   try {
     await cancelShare(item.token)
+    if (disposed) return
     if (newCode.value?.token === item.token) newCode.value = null
     toast('分享已取消', 'success')
     await load()
   } catch (e) {
+    if (disposed) return
     toast(`取消失败：${e.message}`, 'error')
   } finally {
     busyToken.value = ''
   }
 }
 
-onMounted(() => load(1))
+onMounted(() => {
+  previousFocus = document.activeElement
+  closeButton.value?.focus()
+  load(1)
+})
+onBeforeUnmount(() => {
+  disposed = true
+  loadSequence++
+  if (previousFocus?.isConnected) previousFocus.focus()
+})
 </script>
 
 <template>
@@ -95,13 +117,21 @@ onMounted(() => load(1))
       aria-modal="true"
       aria-labelledby="shares-title"
       data-testid="shares-panel"
+      :aria-busy="loading || Boolean(busyToken)"
+      @keydown.esc.prevent="emit('close')"
     >
       <header class="panel-head">
         <div>
           <h2 id="shares-title">我的分享</h2>
           <span>共 {{ total }} 个分享 · 取消或过期后链接立即失效</span>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭我的分享" @click="emit('close')">
+        <button
+          ref="closeButton"
+          class="icon-btn"
+          type="button"
+          aria-label="关闭我的分享"
+          @click="emit('close')"
+        >
           <BaseIcon name="x" :size="16" />
         </button>
       </header>
@@ -118,15 +148,19 @@ onMounted(() => load(1))
         </button>
       </div>
 
-      <p v-if="error" class="error" role="alert">{{ error }}</p>
+      <div v-if="error" class="error" role="alert">
+        <p>分享列表加载失败：{{ error }}</p>
+        <button class="btn btn-sm" type="button" @click="load(retryPage)">重试加载</button>
+      </div>
 
-      <div v-if="!loading && !items.length" class="empty">
+      <div v-if="loading" class="empty" role="status">正在加载分享…</div>
+      <div v-else-if="!error && !items.length" class="empty">
         <BaseIcon name="link" :size="22" />
         <strong>还没有分享</strong>
         <span>在文件列表点「分享」，生成链接和 4 位提取码</span>
       </div>
 
-      <div v-else class="table-wrap">
+      <div v-else-if="!error" class="table-wrap">
         <table>
           <thead>
             <tr>
@@ -170,7 +204,7 @@ onMounted(() => load(1))
                       class="icon-link"
                       type="button"
                       title="换一个提取码"
-                      :disabled="busyToken === item.token"
+                      :disabled="Boolean(busyToken) || loading"
                       :aria-label="`重置 ${item.fileName} 的提取码`"
                       @click="regenerate(item)"
                     >
@@ -180,7 +214,7 @@ onMounted(() => load(1))
                       class="icon-link danger"
                       type="button"
                       title="取消分享"
-                      :disabled="busyToken === item.token"
+                      :disabled="Boolean(busyToken) || loading"
                       :aria-label="`取消 ${item.fileName} 的分享`"
                       @click="cancel(item)"
                     >
@@ -203,7 +237,7 @@ onMounted(() => load(1))
         <button
           class="btn btn-ghost btn-sm"
           type="button"
-          :disabled="page <= 1 || loading"
+          :disabled="page <= 1 || loading || Boolean(busyToken)"
           aria-label="上一页"
           @click="load(page - 1)"
         >
@@ -213,7 +247,7 @@ onMounted(() => load(1))
         <button
           class="btn btn-ghost btn-sm"
           type="button"
-          :disabled="page >= totalPages || loading"
+          :disabled="page >= totalPages || loading || Boolean(busyToken)"
           aria-label="下一页"
           @click="load(page + 1)"
         >

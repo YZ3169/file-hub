@@ -21,6 +21,8 @@ const MAX_CHUNK_RETRIES = 4
 const MAX_HEAL_ROUNDS = 2
 const ACTIVE_STATES = new Set(['queued', 'hashing', 'checking', 'uploading', 'merging'])
 const FINISHED_STATES = new Set(['done', 'instant', 'canceled'])
+let workspaceEpoch = 0
+let workspaceToken = auth.token
 
 class StoppedError extends Error {
   constructor(reason = 'stopped') {
@@ -95,7 +97,11 @@ function refreshPending() {
 }
 
 function isStopped(task) {
-  return task.canceled || task.paused
+  return !isCurrentTask(task) || task.canceled || task.paused || task.controller?.signal.aborted
+}
+
+function isCurrentTask(task) {
+  return task._workspaceEpoch === workspaceEpoch && task._token === auth.token
 }
 
 function isStopError(e) {
@@ -131,6 +137,8 @@ function sleep(ms, task) {
 function newTask(file, fingerprint, saved) {
   return {
     id: uid(),
+    _workspaceEpoch: workspaceEpoch,
+    _token: auth.token,
     file: markRaw(file),
     fingerprint,
     name: file.name,
@@ -310,8 +318,11 @@ async function callWithRetry(fn, task, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     if (isStopped(task)) throw stopError(task)
     try {
-      return await fn()
+      const result = await fn()
+      if (isStopped(task)) throw stopError(task)
+      return result
     } catch (e) {
+      if (isStopped(task)) throw stopError(task)
       lastError = e
       if (isStopError(e)) throw e
       const canRetry = !(e instanceof ApiError) || e.retriable
@@ -355,7 +366,7 @@ async function uploadOneChunk(task, index) {
         chunkHash,
         signal: task.controller?.signal,
       })
-
+      if (isStopped(task)) throw stopError(task)
       task.chunkStates[index] = 'done'
       task.uploadedChunks += 1
       task.completedBytes += expectedBytes
@@ -368,6 +379,7 @@ async function uploadOneChunk(task, index) {
       persistProgress(task)
       return
     } catch (e) {
+      if (isStopped(task)) throw stopError(task)
       if (isStopError(e)) throw e
       const canRetry = !(e instanceof ApiError) || e.retriable
       if (attempt >= MAX_CHUNK_RETRIES || !canRetry) {
@@ -416,14 +428,17 @@ async function uploadMissing(task) {
     }
   }
 
-  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  // 暂停后先等同一轮的所有分片退出，避免慢回调串入“继续”后的新一轮。
+  const results = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()))
 
   if (isStopped(task)) throw stopError(task)
+  const rejected = results.find((result) => result.status === 'rejected')
+  if (rejected) throw rejected.reason
   if (task._chunkError) throw task._chunkError
 }
 
 async function realignWithServer(task) {
-  const st = await callWithRetry(() => api.getStatus(task.fileId), task, 3)
+  const st = await callWithRetry(() => api.getStatus(task.fileId, task.controller?.signal), task, 3)
   task.chunkSize = st.chunkSize
   task.chunkTotal = st.chunkTotal
 
@@ -462,8 +477,11 @@ async function completeOnce(task) {
   for (let i = 0; i < 3; i++) {
     if (isStopped(task)) throw stopError(task)
     try {
-      return await api.completeUpload(task.fileId, task.controller?.signal)
+      const result = await api.completeUpload(task.fileId, task.controller?.signal)
+      if (isStopped(task)) throw stopError(task)
+      return result
     } catch (e) {
+      if (isStopped(task)) throw stopError(task)
       lastError = e
       if (isStopError(e)) throw e
       if (e instanceof ApiError && [30001, 30002, 30003, 30005].includes(e.code)) throw e
@@ -479,6 +497,7 @@ async function completeWithHeal(task) {
     try {
       return await completeOnce(task)
     } catch (e) {
+      if (isStopped(task)) throw stopError(task)
       if (e.code === 30003 && task.hashFromCache) {
         removeCachedHash(task.fingerprint)
         task.hash = null
@@ -502,7 +521,7 @@ async function completeWithHeal(task) {
 }
 
 async function runTask(task) {
-  if (task._running) return
+  if (task._running || !isCurrentTask(task)) return
   task._running = true
   task.canceled = false
   task.paused = false
@@ -515,6 +534,7 @@ async function runTask(task) {
     // 1) 哈希：有缓存就跳过。缓存只当加速，最终仍由服务端整文件校验兜底
     if (!task.hash) {
       task.hash = await hashFile(task)
+      if (isStopped(task)) throw stopError(task)
       setCachedHash(task.fingerprint, task.hash)
       task.hashFromCache = false
     }
@@ -527,11 +547,14 @@ async function runTask(task) {
       : '正在校验秒传并初始化任务…'
     const init = await callWithRetry(
       () =>
-        api.initUpload({
-          fileName: task.name,
-          fileSize: task.size,
-          fileHash: task.hash,
-        }),
+        api.initUpload(
+          {
+            fileName: task.name,
+            fileSize: task.size,
+            fileHash: task.hash,
+          },
+          task.controller?.signal,
+        ),
       task,
       3,
     )
@@ -580,6 +603,7 @@ async function runTask(task) {
     task.state = 'merging'
     task.message = '分片已齐，正在流式合并并逐片 + 整文件校验 SHA-256…'
     await completeWithHeal(task)
+    if (isStopped(task)) throw stopError(task)
 
     task.state = 'done'
     task.finishedAt = Date.now()
@@ -596,6 +620,8 @@ async function runTask(task) {
     refreshFiles()
     refreshStats()
   } catch (e) {
+    // 退出/切换账号后的回调不能写入当前用户的缓存、断点记录或提示。
+    if (!isCurrentTask(task)) return
     if (task.canceled) {
       task.state = 'canceled'
       task.message = '已取消'
@@ -617,7 +643,7 @@ async function runTask(task) {
     task.controller = null
     if (task._resumeRequested) {
       task._resumeRequested = false
-      if (!task.canceled) {
+      if (!task.canceled && isCurrentTask(task)) {
         task.paused = false
         task.state = 'queued'
       }
@@ -627,15 +653,18 @@ async function runTask(task) {
 
 async function processQueue() {
   if (state.processing) return
+  const epoch = workspaceEpoch
   state.processing = true
   try {
-    while (true) {
-      const task = state.tasks.find((t) => t.state === 'queued' && !t.paused && !t.canceled)
+    while (epoch === workspaceEpoch) {
+      const task = state.tasks.find(
+        (t) => isCurrentTask(t) && t.state === 'queued' && !t.paused && !t.canceled,
+      )
       if (!task) break
       await runTask(task)
     }
   } finally {
-    state.processing = false
+    if (epoch === workspaceEpoch) state.processing = false
   }
 }
 
@@ -721,7 +750,6 @@ export function clearAllTasks() {
   state.tasks = []
 }
 
-let workspaceEpoch = 0
 let filesRequest = 0
 let statsRequest = 0
 let filesController = null
@@ -793,11 +821,14 @@ export async function deleteServerFile(file) {
     `确认删除「${file.fileName}」？\n若已没有其他记录引用同一份物理文件，磁盘上的文件会一并删除。`,
   )
   if (!ok) return
+  const epoch = workspaceEpoch
   try {
     await api.deleteFile(file.fileId)
+    if (epoch !== workspaceEpoch) return
     toast(`已删除 ${file.fileName}`, 'success')
     await Promise.all([refreshFiles(), refreshStats()])
   } catch (e) {
+    if (epoch !== workspaceEpoch) return
     toast(`删除失败：${e.message}`, 'error')
   }
 }
@@ -846,13 +877,20 @@ export function clearDownloadHistory() {
 
 /** 登录后加载该用户的工作区：配置、本地断点记录、文件列表、统计 */
 export async function startWorkspace() {
-  if (!auth.user) return
+  if (!auth.token || !auth.user) return
+  if (workspaceToken !== auth.token) resetWorkspace()
+  const token = auth.token
+  const epoch = workspaceEpoch
+  const isCurrent = () => token === auth.token && epoch === workspaceEpoch
   setStorageUser(auth.user.id)
   state.pendingResumable = loadPendingTasks()
   try {
-    state.config = await api.getConfig()
+    const config = await api.getConfig()
+    if (!isCurrent()) return
+    state.config = config
     state.online = true
   } catch (e) {
+    if (!isCurrent()) return
     if (!(e instanceof ApiError) || e.status === 0) {
       state.online = false
       toast('无法连接服务端：请先启动 file-hub', 'error')
@@ -864,6 +902,7 @@ export async function startWorkspace() {
 /** 退出登录/会话失效：停止传输并清空内存态，但保留本用户的本地断点记录 */
 export function resetWorkspace() {
   workspaceEpoch++
+  workspaceToken = auth.token
   filesRequest++
   statsRequest++
   filesController?.abort()
@@ -872,10 +911,12 @@ export function resetWorkspace() {
     task.controller?.abort()
   }
   state.tasks = []
+  state.processing = false
   state.files = []
   state.filesLoading = false
   state.filesError = ''
   state.downloads = []
+  state.toasts = []
   state.filePage = {
     page: 1,
     size: 10,
@@ -890,33 +931,45 @@ export function resetWorkspace() {
 }
 
 export async function logout() {
+  // 先以当前凭证发出撤销请求，再立即停止本地任务；网络慢不应阻塞退出。
+  const revoke = api.logout()
+  clearSession({ notify: false })
+  resetWorkspace()
+  auth.ready = true
+  state.booted = true
   try {
-    await api.logout()
+    await revoke
   } catch {
     // 网络不通或 Token 已失效都不阻塞退出
   }
-  clearSession({ notify: false })
-  resetWorkspace()
 }
 
 export async function bootstrap() {
   applyTheme()
   startTicker()
-  if (auth.token) {
-    try {
+  const token = auth.token
+  const epoch = workspaceEpoch
+  const isCurrent = () => token === auth.token && epoch === workspaceEpoch
+  try {
+    if (token) {
       const user = await api.me()
+      if (!isCurrent()) return
       // 服务端是唯一权威：本地角色只是缓存，每次启动都刷新一次
-      setSession({ token: auth.token, user })
+      setSession({ token, user })
       await startWorkspace()
-    } catch (e) {
-      if (e.status !== 401) {
-        state.online = false
-        toast('无法连接服务端：请先启动 file-hub', 'error')
-      }
+    }
+  } catch (e) {
+    if (!isCurrent()) return
+    if (e.status !== 401) {
+      state.online = false
+      toast('无法连接服务端：请先启动 file-hub', 'error')
+    }
+  } finally {
+    if (token === auth.token || !auth.token) {
+      auth.ready = true
+      state.booted = true
     }
   }
-  auth.ready = true
-  state.booted = true
 }
 
 let tickerStarted = false

@@ -41,6 +41,8 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -258,6 +260,31 @@ class FileStorageServiceTest {
         service.check("a".repeat(64), 5, ADMIN);
 
         verify(fileInfoMapper).findDoneListByOwnerAndHashAndSize("a".repeat(64), 5, 1L, true);
+    }
+
+    @Test
+    @DisplayName("主动删除未完成上传时同时清除分片元数据和磁盘目录")
+    void deleteUploadingClearsChunkMetadata() {
+        when(fileInfoMapper.selectOne(any())).thenReturn(uploadingInfo());
+
+        service.delete(ID, USER);
+
+        var order = inOrder(fileInfoMapper, fileChunkMapper, storage);
+        order.verify(fileInfoMapper).deleteById(1L);
+        order.verify(fileChunkMapper).deleteByFileId(ID);
+        order.verify(storage).deleteChunks(ID);
+    }
+
+    @Test
+    @DisplayName("分片元数据删除失败时保留目录，让孤儿回收可以重试")
+    void deleteMetadataFailureKeepsDirectoryForCleanup() {
+        when(fileInfoMapper.selectOne(any())).thenReturn(uploadingInfo());
+        doThrow(new IllegalStateException("database unavailable"))
+                .when(fileChunkMapper).deleteByFileId(ID);
+
+        assertThrows(IllegalStateException.class, () -> service.delete(ID, USER));
+
+        verify(storage, never()).deleteChunks(ID);
     }
 
     private static FileInfo doneInfo() {

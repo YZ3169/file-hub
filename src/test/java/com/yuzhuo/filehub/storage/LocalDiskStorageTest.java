@@ -160,6 +160,58 @@ class LocalDiskStorageTest {
         assertEquals(List.of(), storage.listChunksOnDisk(ID));
     }
 
+    @Test
+    @DisplayName("上传中断时清理临时片，并保留原来的正确分片")
+    void interruptedChunkCleansIncomingAndKeepsExisting() throws IOException {
+        storage.saveChunk(ID, 0, in("good"));
+        InputStream interrupted = new InputStream() {
+            int remaining = 16;
+            @Override
+            public int read() throws IOException {
+                if (remaining-- > 0) return 'x';
+                throw new IOException("connection interrupted");
+            }
+        };
+        IOException error = assertThrows(IOException.class,
+                () -> storage.saveChunk(ID, 0, interrupted));
+        assertEquals("connection interrupted", error.getMessage());
+        assertEquals("good", Files.readString(storage.chunkFile(ID, 0)));
+        assertNoIncomingFiles();
+    }
+
+    @Test
+    @DisplayName("输入流关闭失败时清理临时片，不发布新分片")
+    void closeFailureCleansIncoming() {
+        InputStream badClose = new ByteArrayInputStream(new byte[]{1, 2, 3}) {
+            @Override
+            public void close() throws IOException {
+                throw new IOException("close failed");
+            }
+        };
+        assertThrows(IOException.class, () -> storage.saveChunk(ID, 0, badClose));
+        assertFalse(storage.chunkExists(ID, 0));
+        assertNoIncomingFiles();
+    }
+
+    @Test
+    @DisplayName("最终移动失败时也不残留本次临时片")
+    void moveFailureCleansIncoming() throws IOException {
+        Path target = storage.chunkFile(ID, 0);
+        Files.createDirectories(target);
+        Files.writeString(target.resolve("keep.txt"), "existing data");
+        assertThrows(IOException.class, () -> storage.saveChunk(ID, 0, in("new")));
+        assertEquals("existing data", Files.readString(target.resolve("keep.txt")));
+        assertNoIncomingFiles();
+    }
+
+    private void assertNoIncomingFiles() {
+        try (var paths = Files.list(storage.chunkFile(ID, 0).getParent())) {
+            assertTrue(paths.noneMatch(p -> p.getFileName().toString().endsWith(".incoming")));
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     // ---------------- 路径安全 ----------------
 
     @Test

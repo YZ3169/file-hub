@@ -794,9 +794,9 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 ### 验证
 
 ```bash
-mvn test                      # 122 个单元/集成测试（含大文件单段续传、分享过期边界、H2 桌面数据库）
+mvn test                      # 127 个单元/集成测试（含续传、分享过期边界、分片清理、H2 桌面数据库）
 cd web && npm run lint && npm run format:check && npm run test:unit && npm run build
-                              # 前端：102 个单元/组件测试 + 生产构建
+                              # 前端：116 个单元/组件测试（含账号切换、暂停/续传、分享加载）+ 生产构建
 bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB，逐项断言，含跨用户隔离）
 bash scripts/e2e-cluster.sh   # 多实例验收（两个 JVM + 共享目录 + Redis）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格

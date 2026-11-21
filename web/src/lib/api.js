@@ -11,7 +11,7 @@ export class ApiError extends Error {
   /** 哪些错误值得重试：网络/5xx/超时/分片校验失败/存储瞬时失败 */
   get retriable() {
     if (this.status >= 500 || this.status === 429) return true
-    return [50001, 30004, 30005, 20003, 50000].includes(this.code)
+    return [-1, 50001, 30004, 30005, 20003, 50000].includes(this.code)
   }
 }
 
@@ -158,11 +158,12 @@ export const getConfig = () => request('/api/file/config')
 export const checkInstant = (hash, size) =>
   request(`/api/file/check?hash=${encodeURIComponent(hash)}&size=${size}`)
 
-export const initUpload = (payload) =>
+export const initUpload = (payload, signal) =>
   request('/api/file/init', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal,
   })
 
 export const uploadChunk = ({ fileId, index, blob, chunkHash, signal }) => {
@@ -186,7 +187,8 @@ export const completeUpload = (fileId, signal) =>
     timeout: MERGE_TIMEOUT,
   })
 
-export const getStatus = (fileId) => request(`/api/file/${fileId}/status`, { timeout: 60_000 })
+export const getStatus = (fileId, signal) =>
+  request(`/api/file/${fileId}/status`, { timeout: 60_000, signal })
 
 /**
  * 分页文件列表。

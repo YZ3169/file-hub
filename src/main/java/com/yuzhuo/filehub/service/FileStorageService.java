@@ -866,6 +866,8 @@ public class FileStorageService {
                     }
                 });
             } else {
+                // 先清元数据再删目录；若数据库失败，保留目录供孤儿清理任务重试。
+                fileChunkMapper.deleteByFileId(fileId);
                 storage.deleteChunks(fileId);
             }
         });

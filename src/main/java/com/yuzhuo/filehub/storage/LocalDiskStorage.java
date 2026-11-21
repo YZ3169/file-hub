@@ -107,31 +107,38 @@ public class LocalDiskStorage implements StorageBackend {
         Files.createDirectories(target.getParent());
         Path incoming = target.resolveSibling(index + "." + UUID.randomUUID() + ".part.incoming");
 
-        MessageDigest digest = HashUtil.sha256();
-        long written;
-        try (InputStream digestIn = new DigestInputStream(in, digest);
-             OutputStream out = Files.newOutputStream(incoming)) {
-            written = digestIn.transferTo(out);
-        }
-        String actual = HexFormat.of().formatHex(digest.digest());
-
-        boolean hashOk = expectedSha256 == null || expectedSha256.isBlank()
-                || expectedSha256.equalsIgnoreCase(actual);
-        boolean sizeOk = expectedSize < 0 || expectedSize == written;
-        if (!hashOk || !sizeOk) {
-            Files.deleteIfExists(incoming);
-            return new ChunkWriteResult(written, actual, false);
-        }
-
-        // 共享目录下必须原子替换：否则另一个实例读分片时可能看到写了一半的文件。
-        // 个别文件系统不支持 ATOMIC_MOVE（例如跨挂载点），才退回普通替换。
         try {
-            Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
+            MessageDigest digest = HashUtil.sha256();
+            long written;
+            try (InputStream digestIn = new DigestInputStream(in, digest);
+                 OutputStream out = Files.newOutputStream(incoming)) {
+                written = digestIn.transferTo(out);
+            }
+            String actual = HexFormat.of().formatHex(digest.digest());
+
+            boolean hashOk = expectedSha256 == null || expectedSha256.isBlank()
+                    || expectedSha256.equalsIgnoreCase(actual);
+            boolean sizeOk = expectedSize < 0 || expectedSize == written;
+            if (!hashOk || !sizeOk) {
+                return new ChunkWriteResult(written, actual, false);
+            }
+
+            // 校验通过后才替换旧片；不支持原子移动的文件系统降级为普通替换。
+            try {
+                Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(incoming, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return new ChunkWriteResult(written, actual, true);
+        } finally {
+            // 读取中断、关闭失败、移动失败都必须清理本次临时片，不触碰已有完整片。
+            try {
+                Files.deleteIfExists(incoming);
+            } catch (IOException e) {
+                log.warn("清理本次上传的临时分片失败：{}", incoming, e);
+            }
         }
-        return new ChunkWriteResult(written, actual, true);
     }
 
     public ChunkWriteResult saveChunk(String fileId, int index, InputStream in, String expectedSha256)
