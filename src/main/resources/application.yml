@@ -125,7 +125,7 @@ management:
 info:
   app:
     name: file-hub
-    version: 1.0.2
+    version: 1.0.3
 
 springdoc:
   api-docs:
