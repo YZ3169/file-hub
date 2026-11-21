@@ -293,7 +293,8 @@ public class ShareService {
         }
 
         // 计数带过期兜底：验码期间分享刚好过期时不能签发票据
-        if (shareMapper.incrementDownload(share.getId(), now) == 0) {
+        // BCrypt 与文件检查可能耗时，不能复用请求开始时的时间。
+        if (shareMapper.incrementDownload(share.getId(), LocalDateTime.now()) == 0) {
             FileShare after = shareMapper.selectById(share.getId());
             if (after == null || !isActive(after)) {
                 throw new BizException(42001, "分享不存在或已取消");

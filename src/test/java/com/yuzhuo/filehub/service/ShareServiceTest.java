@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
@@ -38,7 +39,9 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -309,6 +312,33 @@ class ShareServiceTest {
 
         BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
         assertEquals(42002, e.getCode());
+        verify(ticketService, never()).issue(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("校验：签发前按当前时间检查过期，不复用请求开始时间")
+    void verifyChecksCurrentTimeBeforeIssuingTicket() {
+        LocalDateTime startedAt = LocalDateTime.of(2026, 1, 1, 12, 0);
+        LocalDateTime expiresAt = startedAt.plusSeconds(1);
+        FileShare share = shareWithCode("ABCD");
+        share.setExpiresAt(expiresAt);
+        when(shareMapper.findByToken(TOKEN)).thenReturn(share);
+        when(fileStorageService.findDoneForShare("f1"))
+                .thenReturn(file("f1", 1L, FileInfo.STATUS_DONE));
+        when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
+        // 模拟数据库 WHERE expires_at > now，旧代码传请求开始时间会错误放行。
+        when(shareMapper.incrementDownload(eq(share.getId()), any())).thenAnswer(inv ->
+                expiresAt.isAfter(inv.getArgument(1, LocalDateTime.class)) ? 1 : 0);
+        lenient().when(shareMapper.selectById(share.getId())).thenReturn(share);
+        lenient().when(ticketService.issue(eq("f1"), any())).thenReturn(
+                new DownloadTicketResponse("t", expiresAt.plusMinutes(5), "/download?ticket=t"));
+
+        try (MockedStatic<LocalDateTime> clock = mockStatic(LocalDateTime.class, CALLS_REAL_METHODS)) {
+            // 第一次读取在校验前；之后已经到达过期边界，不依赖真实睡眠。
+            clock.when(LocalDateTime::now).thenReturn(startedAt, expiresAt);
+            BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
+            assertEquals(42002, e.getCode());
+        }
         verify(ticketService, never()).issue(anyString(), any());
     }
 

@@ -10,6 +10,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.core.io.InputStreamResource;
@@ -19,6 +21,7 @@ import org.springframework.http.ResponseEntity;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -104,6 +107,26 @@ class FileControllerRangeTest {
                 + "567\r\n"
                 + "--" + boundary + "--\r\n";
         assertEquals(expected, new String(raw, StandardCharsets.US_ASCII));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"bytes=1048576-", "bytes=1048576-209715199", "bytes=-208666624"})
+    @DisplayName("大文件单段续传不受多段 64MB 总量上限限制")
+    void largeSingleRangeCanResume(String range) throws Exception {
+        long size = 200L * 1024 * 1024;
+        long offset = 1024L * 1024;
+        info.setFileSize(size);
+        when(service.openRangeForRead(info, offset, size - offset))
+                .thenReturn(InputStream.nullInputStream());
+
+        ResponseEntity<InputStreamResource> resp = controller.download(ID, null, range, USER);
+
+        assertEquals(HttpStatus.PARTIAL_CONTENT, resp.getStatusCode());
+        assertEquals("bytes " + offset + "-" + (size - 1) + "/" + size,
+                resp.getHeaders().getFirst(HttpHeaders.CONTENT_RANGE));
+        assertEquals(size - offset, resp.getHeaders().getContentLength());
+        assertNotNull(resp.getBody());
+        resp.getBody().getInputStream().close();
     }
 
     @Test

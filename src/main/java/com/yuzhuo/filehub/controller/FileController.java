@@ -229,7 +229,8 @@ public class FileController {
                 return rangeNotSatisfiable(size);
             }
             total += end - start + 1;
-            if (total > MAX_MULTIPART_BYTES) {
+            // 单段续传是一个流，剩余文件可能远大于 64MB；总量限制只约束多段响应。
+            if (ranges.size() > 1 && total > MAX_MULTIPART_BYTES) {
                 return rangeNotSatisfiable(size);
             }
             spans[i] = new long[]{start, end};
