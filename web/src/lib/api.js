@@ -77,10 +77,8 @@ async function request(path, options = {}) {
   const combined = combineSignals(externalSignal, timeout)
 
   const headers = new Headers(rest.headers || {})
-  if (withAuth) {
-    const token = getToken()
-    if (token) headers.set('Authorization', `Bearer ${token}`)
-  }
+  const requestToken = withAuth ? getToken() : null
+  if (requestToken) headers.set('Authorization', `Bearer ${requestToken}`)
 
   let res
   try {
@@ -98,7 +96,8 @@ async function request(path, options = {}) {
     if (!res.ok) {
       // 401 代表会话失效；清空本地会话并通知 App 回登录页。
       // 登录/注册接口用 auth:false，密码错误不会被误判成「登录过期」。
-      if (res.status === 401 && withAuth) {
+      // 账号切换后，旧请求迟到的 401 不能撤销新会话。
+      if (res.status === 401 && withAuth && getToken() === requestToken) {
         clearSession()
       }
       throw new ApiError(

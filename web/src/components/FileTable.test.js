@@ -6,6 +6,9 @@ vi.mock('../stores/uploader', async () => {
   return {
     state: reactive({
       files: [],
+      filesLoading: false,
+      filesError: '',
+      downloads: [],
       filePage: {
         page: 1,
         size: 10,
@@ -17,6 +20,7 @@ vi.mock('../stores/uploader', async () => {
     }),
     deleteServerFile: vi.fn(),
     downloadFile: vi.fn(),
+    clearDownloadHistory: vi.fn(),
     goFilePage: vi.fn(),
     refreshFiles: vi.fn(() => Promise.resolve()),
     refreshStats: vi.fn(() => Promise.resolve()),
@@ -32,7 +36,7 @@ vi.mock('../lib/api', () => ({
   resetShareCode: vi.fn(),
 }))
 
-import { goFilePage, state, updateFileQuery } from '../stores/uploader'
+import { downloadFile, goFilePage, refreshFiles, state, updateFileQuery } from '../stores/uploader'
 import FileTable from './FileTable.vue'
 
 function file(overrides = {}) {
@@ -50,6 +54,9 @@ function file(overrides = {}) {
 describe('FileTable', () => {
   beforeEach(() => {
     state.files = []
+    state.filesLoading = false
+    state.filesError = ''
+    state.downloads = []
     state.filePage = {
       page: 1,
       size: 10,
@@ -156,5 +163,53 @@ describe('FileTable', () => {
 
     await wrapper.find('[data-testid="my-shares-button"]').trigger('click')
     expect(wrapper.find('[data-testid="shares-panel"]').exists()).toBe(true)
+  })
+
+  it('加载时不误报空列表，失败时提供重试', async () => {
+    state.filesLoading = true
+    const wrapper = mount(FileTable)
+    expect(wrapper.text()).toContain('正在加载文件')
+    expect(wrapper.text()).not.toContain('还没有文件')
+    state.filesLoading = false
+    state.filesError = '请求过于频繁，请稍后再试'
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('[role="alert"]').text()).toContain(state.filesError)
+    expect(wrapper.text()).not.toContain('还没有文件')
+    await wrapper.find('[role="alert"] button').trigger('click')
+    expect(refreshFiles).toHaveBeenCalledOnce()
+  })
+
+  it('准备期间禁用下载，上传中的文件不能下载', async () => {
+    state.files = [file(), file({ fileId: 'f-2', status: 0 })]
+    state.downloads = [{ id: 'd-1', fileId: 'f-1', fileName: 'report.pdf', status: 'preparing' }]
+    const wrapper = mount(FileTable)
+    const button = wrapper.find('button[aria-label="下载 report.pdf"]')
+    expect(button.attributes('disabled')).toBeDefined()
+    expect(wrapper.findAll('.download-button')).toHaveLength(1)
+    expect(wrapper.text()).toContain('上传完成后可下载')
+    await button.trigger('click')
+    expect(downloadFile).not.toHaveBeenCalled()
+    state.downloads = []
+    await wrapper.vm.$nextTick()
+    await button.trigger('click')
+    expect(downloadFile).toHaveBeenCalledWith(state.files[0])
+  })
+
+  it('下载失败可在最近下载中重试', async () => {
+    state.downloads = [
+      {
+        id: 'd-1',
+        fileId: 'f-1',
+        fileName: 'report.pdf',
+        fileSize: 2048,
+        status: 'error',
+        error: '网络中断',
+      },
+    ]
+    const wrapper = mount(FileTable)
+    const panel = wrapper.find('[aria-label="最近下载"]')
+    expect(panel.text()).toContain('网络中断')
+    await panel.find('button[aria-label="重试下载 report.pdf"]').trigger('click')
+    expect(downloadFile).toHaveBeenCalledWith(expect.objectContaining({ fileId: 'f-1', status: 1 }))
   })
 })

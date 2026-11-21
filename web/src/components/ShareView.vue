@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import { ApiError, getPublicConfig, getPublicShareMeta, verifyShareCode } from '../lib/api'
 import { formatBytes, formatDate } from '../lib/format'
@@ -16,9 +16,16 @@ const code = ref('')
 const busy = ref(false)
 const verifyError = ref('')
 const result = ref(null)
-const ticketExpired = ref(false)
+const now = ref(Date.now())
+const ticketDeadline = ref(0)
+const downloadRequested = ref(false)
+const codeInput = ref(null)
+const resultHeading = ref(null)
 
-let ticketTimer = null
+let clockTimer = null
+let disposed = false
+
+const ticketExpired = computed(() => Boolean(result.value) && now.value >= ticketDeadline.value)
 
 const isLocalHost = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname)
 const localOnlyHint = computed(() => desktop.value || isLocalHost)
@@ -32,13 +39,23 @@ const errorTitle = computed(() => {
   return titleByCode[loadError.value?.code] || '无法打开分享'
 })
 
-const lockedUntil = computed(() => meta.value?.lockedUntil || null)
+const lockedUntil = computed(() => {
+  const value = meta.value?.lockedUntil
+  if (!value) return null
+  const at = new Date(value).getTime()
+  return Number.isFinite(at) && at > now.value ? value : null
+})
+const locked = computed(() =>
+  Boolean(lockedUntil.value || (meta.value?.locked && !meta.value?.lockedUntil)),
+)
+const canRetry = computed(() => ![42001, 42002].includes(loadError.value?.code))
 
 async function loadMeta() {
   loading.value = true
   loadError.value = null
   try {
     meta.value = await getPublicShareMeta(props.token)
+    now.value = Date.now()
   } catch (e) {
     loadError.value = {
       code: e instanceof ApiError ? e.code : 0,
@@ -59,26 +76,21 @@ function onCodeInput(event) {
   verifyError.value = ''
 }
 
-function scheduleTicketExpiry() {
-  if (ticketTimer) clearTimeout(ticketTimer)
-  const at = new Date(result.value?.ticketExpiresAt || '')
-  const delay = Number.isNaN(at.getTime()) ? 5 * 60_000 : at.getTime() - Date.now()
-  ticketTimer = setTimeout(
-    () => {
-      ticketExpired.value = true
-    },
-    Math.max(0, Math.min(delay, 10 * 60_000)),
-  )
-}
-
 async function submit() {
-  if (busy.value || code.value.length !== 4 || lockedUntil.value) return
+  now.value = Date.now()
+  if (busy.value || code.value.length !== 4 || locked.value) return
   busy.value = true
   verifyError.value = ''
   try {
-    result.value = await verifyShareCode(props.token, code.value)
-    ticketExpired.value = false
-    scheduleTicketExpiry()
+    const verified = await verifyShareCode(props.token, code.value)
+    if (disposed) return
+    now.value = Date.now()
+    const deadline = new Date(verified.ticketExpiresAt || '').getTime()
+    ticketDeadline.value = Number.isFinite(deadline) ? deadline : now.value + 5 * 60_000
+    result.value = verified
+    downloadRequested.value = false
+    await nextTick()
+    resultHeading.value?.focus()
   } catch (e) {
     verifyError.value = e.message
     if (e instanceof ApiError && e.code === 42004) {
@@ -90,24 +102,32 @@ async function submit() {
   }
 }
 
-function reset() {
+async function reset() {
   result.value = null
   code.value = ''
   verifyError.value = ''
-  if (ticketTimer) clearTimeout(ticketTimer)
+  downloadRequested.value = false
+  await nextTick()
+  codeInput.value?.focus()
 }
 
 function download() {
-  if (!result.value) return
+  // Background tabs may suspend timers; check the actual time again on every click.
+  now.value = Date.now()
+  if (!result.value || ticketExpired.value) return
   const a = document.createElement('a')
   a.href = result.value.downloadUrl
   a.download = result.value.fileName
   document.body.appendChild(a)
   a.click()
   a.remove()
+  downloadRequested.value = true
 }
 
 onMounted(async () => {
+  clockTimer = setInterval(() => {
+    now.value = Date.now()
+  }, 1000)
   getPublicConfig()
     .then((cfg) => {
       desktop.value = cfg?.desktop === true
@@ -119,21 +139,22 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (ticketTimer) clearTimeout(ticketTimer)
+  disposed = true
+  clearInterval(clockTimer)
 })
 </script>
 
 <template>
   <div class="share-view">
-    <section class="share-card" data-testid="share-view">
+    <section class="share-card" data-testid="share-view" :aria-busy="loading || busy">
       <div class="card-brand">
         <span class="brand-dot"></span>
         <strong>file-hub</strong>
         <span>文件提取</span>
       </div>
 
-      <div v-if="loading" class="state-box">
-        <span class="spinner"></span>
+      <div v-if="loading" class="state-box" role="status">
+        <span class="spinner" aria-hidden="true"></span>
         正在读取分享…
       </div>
 
@@ -141,26 +162,45 @@ onBeforeUnmount(() => {
         <BaseIcon name="alert" :size="22" />
         <strong>{{ errorTitle }}</strong>
         <span>{{ loadError.message }}</span>
-        <button v-if="loadError.code === 42004" class="btn btn-ghost btn-sm" @click="loadMeta">
-          重新检查
+        <button v-if="canRetry" class="btn btn-ghost" type="button" @click="loadMeta">
+          <BaseIcon name="refresh" :size="16" />
+          重试加载
         </button>
       </div>
 
       <template v-else>
-        <p class="lead">分享者设置了提取码，输入后即可下载到本机。</p>
+        <div class="share-heading">
+          <span class="heading-icon"
+            ><BaseIcon :name="result ? 'check' : 'lock'" :size="24"
+          /></span>
+          <h1 v-if="!result">提取你的文件</h1>
+          <h1 v-else ref="resultHeading" tabindex="-1">文件已准备好</h1>
+          <p class="lead">
+            {{
+              result
+                ? '核对文件信息，然后保存到你的设备。'
+                : '输入分享者提供的 4 位提取码，即可查看并下载文件。'
+            }}
+          </p>
+        </div>
 
-        <p v-if="lockedUntil" class="locked" role="alert">
+        <div v-if="locked" class="locked" role="alert">
           <BaseIcon name="lock" :size="15" />
-          <span
-            >输错次数过多，已锁定到
-            {{ formatDate(lockedUntil) }}；请稍后再试或联系分享者重置提取码。</span
-          >
-        </p>
+          <div>
+            <p>
+              输错次数过多，暂时无法提取。<template v-if="lockedUntil"
+                >请在 {{ formatDate(lockedUntil) }} 后重试。</template
+              >
+            </p>
+            <button class="link-btn" type="button" @click="loadMeta">重新检查锁定状态</button>
+          </div>
+        </div>
 
         <form v-if="!result" class="code-form" @submit.prevent="submit">
           <label class="code-label" for="share-code-input">提取码</label>
           <input
             id="share-code-input"
+            ref="codeInput"
             class="code-input"
             type="text"
             inputmode="text"
@@ -170,15 +210,20 @@ onBeforeUnmount(() => {
             maxlength="4"
             placeholder="4 位字母或数字"
             :value="code"
-            :disabled="busy || Boolean(lockedUntil)"
+            :disabled="busy || locked"
+            :aria-invalid="Boolean(verifyError)"
+            :aria-describedby="verifyError ? 'share-code-error' : 'share-code-hint'"
             data-testid="share-code-input"
             @input="onCodeInput"
           />
-          <p v-if="verifyError" class="error" role="alert">{{ verifyError }}</p>
+          <p id="share-code-hint" class="hint">字母不区分大小写，无需登录。</p>
+          <p v-if="verifyError" id="share-code-error" class="error" role="alert">
+            {{ verifyError }}
+          </p>
           <button
             class="btn btn-primary"
             type="submit"
-            :disabled="busy || code.length !== 4 || Boolean(lockedUntil)"
+            :disabled="busy || code.length !== 4 || locked"
             data-testid="share-submit"
           >
             <BaseIcon name="download" :size="15" />
@@ -187,24 +232,43 @@ onBeforeUnmount(() => {
         </form>
 
         <div v-else class="file-result" data-testid="share-result">
-          <div class="file-icon"><BaseIcon name="file" :size="22" /></div>
-          <div class="file-copy">
-            <strong :title="result.fileName">{{ result.fileName }}</strong>
-            <span>{{ formatBytes(result.fileSize) }}</span>
+          <div class="file-details">
+            <div class="file-icon"><BaseIcon name="file" :size="28" /></div>
+            <div class="file-copy">
+              <strong>{{ result.fileName }}</strong>
+              <span>{{ formatBytes(result.fileSize) }}</span>
+            </div>
           </div>
-          <button class="btn btn-primary btn-sm" type="button" @click="download">
+          <button
+            class="btn btn-primary download-button"
+            type="button"
+            :disabled="ticketExpired"
+            data-testid="share-download"
+            @click="download"
+          >
             <BaseIcon name="download" :size="15" />
-            下载
+            {{ ticketExpired ? '下载凭证已过期' : downloadRequested ? '再次下载' : '下载' }}
           </button>
-          <p v-if="ticketExpired" class="hint warn">
-            下载凭证已过期，重新输入提取码即可再取一次。
+          <p v-if="downloadRequested" class="download-feedback" role="status">
+            <BaseIcon name="check" :size="16" />
+            已请求下载，请在浏览器或桌面窗口的下载列表中查看进度。
+          </p>
+          <p v-if="ticketExpired" class="hint warn" role="status">
+            下载凭证已过期，请重新校验提取码后下载。
             <button class="link-btn" type="button" @click="reset">重新校验</button>
           </p>
           <p v-else class="hint">
-            下载凭证 5 分钟内有效；链接失效后重新输入提取码即可。
-            <button class="link-btn" type="button" @click="reset">换一次</button>
+            <template v-if="result.ticketExpiresAt"
+              >下载凭证有效至 {{ formatDate(result.ticketExpiresAt) }}。</template
+            >
+            <template v-else>下载凭证 5 分钟内有效。</template>
+            <button class="link-btn" type="button" @click="reset">重新校验</button>
           </p>
         </div>
+        <p v-if="meta.expiresAt" class="hint share-expiry">
+          <BaseIcon name="clock" :size="14" />
+          分享有效至 {{ formatDate(meta.expiresAt) }}
+        </p>
       </template>
 
       <p v-if="localOnlyHint" class="hint local">
@@ -229,11 +293,11 @@ onBeforeUnmount(() => {
 }
 
 .share-card {
-  width: min(460px, 100%);
+  width: min(560px, 100%);
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 24px 24px 18px;
+  gap: 24px;
+  padding: 30px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -255,7 +319,29 @@ onBeforeUnmount(() => {
 
 .card-brand span:last-child {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 13px;
+}
+
+.share-heading {
+  text-align: center;
+}
+
+.heading-icon {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 16px;
+  border: 1px solid color-mix(in srgb, var(--brand-light) 30%, transparent);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
+  color: var(--brand-light);
+}
+
+.share-heading h1 {
+  margin: 0 0 10px;
+  font-size: clamp(24px, 4vw, 30px);
+  letter-spacing: -0.03em;
 }
 
 .brand-dot {
@@ -269,7 +355,7 @@ onBeforeUnmount(() => {
 .lead {
   margin: 0;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 14px;
   line-height: 1.7;
 }
 
@@ -280,7 +366,7 @@ onBeforeUnmount(() => {
   gap: 7px;
   padding: 30px 12px;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 14px;
   text-align: center;
 }
 
@@ -317,22 +403,39 @@ onBeforeUnmount(() => {
   border-radius: 10px;
   background: color-mix(in srgb, var(--warn) 10%, var(--panel));
   color: var(--text);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.6;
+}
+
+.locked p {
+  margin: 0 0 6px;
+}
+
+.locked > svg {
+  flex: none;
+  margin-top: 3px;
 }
 
 .code-form {
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 12px;
+}
+
+.code-form > .btn,
+.download-button {
+  min-height: 46px;
+  font-size: 14px;
 }
 
 .code-label {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 14px;
 }
 
 .code-input {
+  width: 100%;
+  min-width: 0;
   padding: 11px 14px;
   border: 1px solid var(--border);
   border-radius: 11px;
@@ -343,6 +446,12 @@ onBeforeUnmount(() => {
   letter-spacing: 0.4em;
   text-align: center;
   text-transform: uppercase;
+}
+
+.code-input::placeholder {
+  font-family: inherit;
+  font-size: 16px;
+  letter-spacing: 0.04em;
 }
 
 .code-input:focus {
@@ -361,25 +470,31 @@ onBeforeUnmount(() => {
   border-radius: 9px;
   background: color-mix(in srgb, var(--bad) 10%, var(--panel));
   color: var(--bad);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .file-result {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 11px;
-  padding: 13px;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel-2);
 }
 
+.file-details {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
 .file-icon {
   display: grid;
   place-items: center;
-  width: 40px;
-  height: 40px;
+  width: 54px;
+  height: 60px;
   flex: none;
   border-radius: 11px;
   background: color-mix(in srgb, var(--brand-2) 12%, transparent);
@@ -394,23 +509,45 @@ onBeforeUnmount(() => {
 }
 
 .file-copy strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  line-height: 1.5;
 }
 
 .file-copy span {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 14px;
 }
 
 .hint {
   width: 100%;
   margin: 0;
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 13px;
   line-height: 1.6;
+}
+
+.download-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: var(--ok);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.download-feedback svg,
+.hint.local svg {
+  flex: none;
+  margin-top: 3px;
+}
+
+.share-expiry {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .hint.local {
@@ -445,6 +582,21 @@ onBeforeUnmount(() => {
   padding-top: 12px;
   border-top: 1px solid var(--border);
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 13px;
+}
+
+@media (max-width: 480px) {
+  .share-view {
+    padding: 8px 0 24px;
+  }
+
+  .share-card {
+    padding: 22px 18px;
+    gap: 20px;
+  }
+
+  .file-result {
+    padding: 16px;
+  }
 }
 </style>

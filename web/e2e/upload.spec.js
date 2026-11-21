@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import fs from 'node:fs/promises'
 import { gotoWorkspace, injectSession, registerViaApi } from './helpers'
 
 test.describe('上传工作台', () => {
@@ -33,6 +34,18 @@ test.describe('上传工作台', () => {
     await page.getByRole('button', { name: `下载 ${fileName}` }).click()
     const download = await downloadPromise
     expect(download.suggestedFilename()).toBe(fileName)
+    expect(await fs.readFile(await download.path(), 'utf8')).toBe(content)
+    await expect(page.getByRole('region', { name: '最近下载' })).toContainText('已发起下载')
+
+    // 队列里的完成任务也能下载，两个入口都经过下载票据。
+    const taskDownloadPromise = page.waitForEvent('download')
+    await page
+      .locator('.task-card')
+      .filter({ hasText: fileName })
+      .getByRole('button', { name: '下载', exact: true })
+      .click()
+    const taskDownload = await taskDownloadPromise
+    expect(await fs.readFile(await taskDownload.path(), 'utf8')).toBe(content)
 
     // 删除需要二次确认
     page.once('dialog', (dialog) => dialog.accept())

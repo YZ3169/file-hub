@@ -8,7 +8,7 @@ import {
   uploadChunk,
   verifyShareCode,
 } from './api'
-import { clearSession, getToken, onUnauthorized, setSession } from './auth'
+import { auth, clearSession, getToken, onUnauthorized, setSession } from './auth'
 
 function response(body, status = 200) {
   const text = typeof body === 'string' ? body : JSON.stringify(body)
@@ -91,6 +91,33 @@ describe('api request', () => {
     expect(getToken()).toBeNull()
     expect(listener).toHaveBeenCalledTimes(1)
     unsubscribe()
+  })
+
+  it.each(['old-session', null])('旧请求的 401 不清除新会话（原凭证：%s）', async (token) => {
+    if (token) setSession({ token, user: { id: 1, username: 'alice', role: 'USER' } })
+    let resolveResponse
+    fetchMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveResponse = resolve
+      }),
+    )
+    const listener = vi.fn()
+    const unsubscribe = onUnauthorized(listener)
+
+    try {
+      const pending = listFiles()
+      const newUser = { id: 2, username: 'bob', role: 'USER' }
+      setSession({ token: 'new-session', user: newUser })
+      resolveResponse(response({ code: 40001, msg: '旧会话已过期' }, 401))
+
+      await expect(pending).rejects.toMatchObject({ code: 40001, status: 401 })
+      expect(getToken()).toBe('new-session')
+      expect(auth.user).toEqual(newUser)
+      expect(localStorage.getItem('filehub.token.v1')).toBe('new-session')
+      expect(listener).not.toHaveBeenCalled()
+    } finally {
+      unsubscribe()
+    }
   })
 
   it('429 是可重试错误', async () => {

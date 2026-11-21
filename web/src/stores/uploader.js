@@ -44,6 +44,9 @@ export const state = reactive({
   config: { chunkSize: 5 * 1024 * 1024, backend: '', desktop: false },
   tasks: [],
   files: [],
+  filesLoading: false,
+  filesError: '',
+  downloads: [],
   filePage: {
     page: 1,
     size: 10,
@@ -718,9 +721,21 @@ export function clearAllTasks() {
   state.tasks = []
 }
 
+let workspaceEpoch = 0
+let filesRequest = 0
+let statsRequest = 0
+let filesController = null
+
 export async function refreshFiles() {
+  const requestId = ++filesRequest
+  filesController?.abort()
+  filesController = new AbortController()
+  state.filesLoading = true
+  state.filesError = ''
   try {
-    const res = await api.listFiles(state.filePage)
+    const res = await api.listFiles({ ...state.filePage, signal: filesController.signal })
+    // 搜索、翻页或切换账号后，迟到的响应不能覆盖当前列表。
+    if (requestId !== filesRequest) return
     state.files = res.items
     state.filePage.total = res.total
     state.filePage.page = res.page
@@ -731,11 +746,15 @@ export async function refreshFiles() {
     const maxPage = Math.max(1, Math.ceil(res.total / res.size))
     if (res.page > maxPage) {
       state.filePage.page = maxPage
-      return refreshFiles()
+      return await refreshFiles()
     }
   } catch (e) {
+    if (requestId !== filesRequest || e.name === 'AbortError') return
+    state.filesError = e.message || '文件列表加载失败，请重试'
     // 只有真正连不上服务端才算离线；401/403/429 不应把顶部显示成「服务未启动」
     if (!(e instanceof ApiError) || e.status === 0) state.online = false
+  } finally {
+    if (requestId === filesRequest) state.filesLoading = false
   }
 }
 
@@ -757,10 +776,14 @@ export async function goFilePage(page) {
 }
 
 export async function refreshStats() {
+  const requestId = ++statsRequest
   try {
-    state.stats = await api.getStats()
+    const stats = await api.getStats()
+    if (requestId !== statsRequest) return
+    state.stats = stats
     state.online = true
   } catch (e) {
+    if (requestId !== statsRequest) return
     if (!(e instanceof ApiError) || e.status === 0) state.online = false
   }
 }
@@ -780,17 +803,45 @@ export async function deleteServerFile(file) {
 }
 
 export async function downloadFile(file) {
+  if (file.status !== 1) return
+  if (state.downloads.some((item) => item.fileId === file.fileId && item.status === 'preparing')) {
+    return
+  }
+  const epoch = workspaceEpoch
+  const download = reactive({
+    id: uid(),
+    fileId: file.fileId,
+    fileName: file.fileName,
+    fileSize: file.fileSize,
+    status: 'preparing',
+    error: '',
+  })
+  state.downloads = [
+    download,
+    ...state.downloads.filter((item) => item.status === 'preparing'),
+    ...state.downloads.filter((item) => item.status !== 'preparing').slice(0, 4),
+  ]
   try {
     const ticket = await api.createDownloadTicket(file.fileId)
+    if (epoch !== workspaceEpoch) return
     const a = document.createElement('a')
     a.href = ticket.url
     a.download = file.fileName
     document.body.appendChild(a)
     a.click()
     a.remove()
+    download.status = 'submitted'
+    toast(`已发起 ${file.fileName} 的下载，请在下载列表中查看保存进度`, 'success')
   } catch (e) {
+    if (epoch !== workspaceEpoch) return
+    download.status = 'error'
+    download.error = e.message || '下载请求失败，请重试'
     toast(`下载失败：${e.message}`, 'error')
   }
+}
+
+export function clearDownloadHistory() {
+  state.downloads = state.downloads.filter((item) => item.status === 'preparing')
 }
 
 /** 登录后加载该用户的工作区：配置、本地断点记录、文件列表、统计 */
@@ -812,11 +863,19 @@ export async function startWorkspace() {
 
 /** 退出登录/会话失效：停止传输并清空内存态，但保留本用户的本地断点记录 */
 export function resetWorkspace() {
+  workspaceEpoch++
+  filesRequest++
+  statsRequest++
+  filesController?.abort()
+  filesController = null
   for (const task of state.tasks) {
     task.controller?.abort()
   }
   state.tasks = []
   state.files = []
+  state.filesLoading = false
+  state.filesError = ''
+  state.downloads = []
   state.filePage = {
     page: 1,
     size: 10,

@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import ShareDialog from './ShareDialog.vue'
 import SharesPanel from './SharesPanel.vue'
+import DownloadPanel from './DownloadPanel.vue'
 import {
   deleteServerFile,
   downloadFile,
@@ -68,17 +69,21 @@ function resetFilters() {
   statusFilter.value = ''
   updateFileQuery({ keyword: '', status: null, sort: 'time_desc' })
 }
+
+function preparingDownload(fileId) {
+  return state.downloads.some((item) => item.fileId === fileId && item.status === 'preparing')
+}
 </script>
 
 <template>
-  <section class="file-section">
+  <section id="files" class="file-section" aria-labelledby="files-heading">
     <div class="section-head">
       <div>
-        <h2>云端文件</h2>
+        <h2 id="files-heading"><BaseIcon name="archive" :size="20" /> 文件与下载</h2>
         <span>
           共 {{ state.filePage.total }} 条记录
           <template v-if="state.filePage.total"> · 第 {{ pageStart }}–{{ pageEnd }} 条</template>
-          · 秒传产生的多条记录共享同一份物理文件
+          · 找到文件，一键下载或分享
         </span>
       </div>
       <div class="head-actions">
@@ -91,9 +96,14 @@ function resetFilters() {
           <BaseIcon name="link" :size="14" />
           我的分享
         </button>
-        <button class="btn btn-ghost btn-sm" type="button" @click="refresh">
+        <button
+          class="btn btn-ghost btn-sm"
+          type="button"
+          :disabled="state.filesLoading"
+          @click="refresh"
+        >
           <BaseIcon name="refresh" :size="14" />
-          刷新
+          {{ state.filesLoading ? '刷新中…' : '刷新' }}
         </button>
       </div>
     </div>
@@ -141,30 +151,47 @@ function resetFilters() {
       </div>
     </div>
 
-    <div v-if="!state.files.length" class="empty-files">
+    <div v-if="state.filesError" class="list-error" role="alert">
+      <BaseIcon name="alert" :size="19" />
+      <div>
+        <strong>文件列表加载失败</strong><span>{{ state.filesError }}</span>
+      </div>
+      <button class="btn btn-sm" type="button" :disabled="state.filesLoading" @click="refresh">
+        重试
+      </button>
+    </div>
+
+    <div v-if="state.filesLoading" class="list-loading" aria-live="polite">
+      <span class="loading-ring" aria-hidden="true"></span> 正在加载文件…
+    </div>
+
+    <div v-else-if="!state.files.length && !state.filesError" class="empty-files">
       <div class="empty-icon"><BaseIcon name="archive" :size="26" /></div>
       <strong>{{ hasFilters ? '没有匹配的文件' : '还没有文件' }}</strong>
       <span v-if="hasFilters">换个关键字，或者清除筛选条件</span>
-      <span v-else>上传第一个文件，或者拖一份大文件试试断点续传</span>
+      <span v-else>上传文件后，即可在这里下载和分享</span>
       <button v-if="hasFilters" class="btn btn-ghost btn-sm" type="button" @click="resetFilters">
         清除筛选
       </button>
     </div>
 
-    <div v-else class="table-wrap">
+    <div v-if="state.files.length && !state.filesLoading && !state.filesError" class="table-wrap">
       <table>
+        <caption class="sr-only">
+          文件列表：文件名、大小、状态、上传时间和下载操作
+        </caption>
         <thead>
           <tr>
-            <th>文件</th>
-            <th>大小</th>
-            <th>状态</th>
-            <th>时间</th>
-            <th class="col-actions">操作</th>
+            <th scope="col">文件</th>
+            <th scope="col">大小</th>
+            <th scope="col">状态</th>
+            <th scope="col">上传时间</th>
+            <th scope="col" class="col-actions">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="file in state.files" :key="file.fileId">
-            <td>
+            <td class="file-column">
               <div class="file-cell">
                 <span class="file-badge">{{ extension(file.fileName) }}</span>
                 <div class="file-name">
@@ -173,16 +200,28 @@ function resetFilters() {
                 </div>
               </div>
             </td>
-            <td class="num">{{ formatBytes(file.fileSize) }}</td>
-            <td>
+            <td class="num" data-label="大小">{{ formatBytes(file.fileSize) }}</td>
+            <td class="status-column" data-label="状态">
               <span class="status" :class="file.status === 1 ? 'ok' : 'mid'">
                 <i></i>
                 {{ file.status === 1 ? '已完成' : '上传中' }}
               </span>
             </td>
-            <td class="time">{{ formatDate(file.createTime) }}</td>
+            <td class="time" data-label="上传时间">{{ formatDate(file.createTime) }}</td>
             <td class="col-actions">
               <div class="row-actions">
+                <button
+                  v-if="file.status === 1"
+                  class="btn btn-primary btn-sm download-button"
+                  type="button"
+                  :disabled="preparingDownload(file.fileId)"
+                  :aria-label="`下载 ${file.fileName}`"
+                  @click="downloadFile(file)"
+                >
+                  <BaseIcon name="download" :size="16" />
+                  {{ preparingDownload(file.fileId) ? '准备中…' : '下载' }}
+                </button>
+                <span v-else class="pending-label">上传完成后可下载</span>
                 <button
                   v-if="file.status === 1"
                   class="icon-link"
@@ -193,16 +232,6 @@ function resetFilters() {
                   @click="shareFile = file"
                 >
                   <BaseIcon name="link" :size="15" />
-                </button>
-                <button
-                  v-if="file.status === 1"
-                  class="icon-link"
-                  type="button"
-                  title="下载（支持 Range 断点续传）"
-                  :aria-label="`下载 ${file.fileName}`"
-                  @click="downloadFile(file)"
-                >
-                  <BaseIcon name="download" :size="15" />
                 </button>
                 <button
                   class="icon-link danger"
@@ -220,13 +249,13 @@ function resetFilters() {
       </table>
     </div>
 
-    <div v-if="state.filePage.total > 0" class="pager">
+    <div v-if="state.filePage.total > 0 && !state.filesError" class="pager">
       <span>第 {{ pageStart }}–{{ pageEnd }} 条，共 {{ state.filePage.total }} 条</span>
       <div v-if="totalPages > 1" class="pager-controls">
         <button
           class="btn btn-ghost btn-sm"
           type="button"
-          :disabled="state.filePage.page <= 1"
+          :disabled="state.filesLoading || state.filePage.page <= 1"
           aria-label="上一页"
           @click="goFilePage(state.filePage.page - 1)"
         >
@@ -236,7 +265,7 @@ function resetFilters() {
         <button
           class="btn btn-ghost btn-sm"
           type="button"
-          :disabled="state.filePage.page >= totalPages"
+          :disabled="state.filesLoading || state.filePage.page >= totalPages"
           aria-label="下一页"
           @click="goFilePage(state.filePage.page + 1)"
         >
@@ -244,6 +273,7 @@ function resetFilters() {
         </button>
       </div>
     </div>
+    <DownloadPanel />
   </section>
 
   <ShareDialog v-if="shareFile" :file="shareFile" @close="shareFile = null" />
@@ -252,6 +282,7 @@ function resetFilters() {
 
 <style scoped>
 .file-section {
+  scroll-margin-top: 100px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -269,8 +300,11 @@ function resetFilters() {
 }
 
 .section-head h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   margin: 0 0 3px;
-  font-size: 15.5px;
+  font-size: 19px;
   font-weight: 650;
 }
 
@@ -319,7 +353,7 @@ function resetFilters() {
   outline: 0;
   background: transparent;
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 14px;
   font-family: inherit;
 }
 
@@ -357,7 +391,7 @@ function resetFilters() {
   align-items: center;
   gap: 6px;
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 13px;
 }
 
 .field select {
@@ -366,7 +400,7 @@ function resetFilters() {
   border-radius: 8px;
   background: var(--panel-2);
   color: var(--text);
-  font-size: 12px;
+  font-size: 14px;
   font-family: inherit;
   cursor: pointer;
 }
@@ -403,7 +437,7 @@ th {
 }
 
 td {
-  padding: 12px 20px;
+  padding: 16px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -424,7 +458,7 @@ tbody tr:hover {
   display: flex;
   align-items: center;
   gap: 11px;
-  min-width: 220px;
+  min-width: 160px;
 }
 
 .file-badge {
@@ -449,7 +483,7 @@ tbody tr:hover {
 }
 
 .file-name strong {
-  max-width: 380px;
+  max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -459,7 +493,7 @@ tbody tr:hover {
 .file-name span {
   color: var(--muted-2);
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 12px;
   margin-top: 2px;
 }
 
@@ -515,8 +549,8 @@ tbody tr:hover {
 .icon-link {
   display: grid;
   place-items: center;
-  width: 31px;
-  height: 31px;
+  width: 36px;
+  height: 36px;
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--panel-2);
@@ -627,6 +661,183 @@ tbody tr:hover {
 
   .pager {
     padding: 12px 16px;
+  }
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.list-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 20px 16px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--bad) 30%, transparent);
+  border-radius: 12px;
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 6%, transparent);
+}
+.list-error > div {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+.list-error strong {
+  font-size: 14px;
+}
+.list-error span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.list-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 180px;
+  color: var(--muted);
+}
+.loading-ring {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--brand-light);
+  border-radius: 50%;
+  animation: loading-spin 0.8s linear infinite;
+}
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.download-button {
+  min-width: 78px;
+  min-height: 36px;
+  box-shadow: none;
+}
+.pending-label {
+  align-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+@media (max-width: 1000px) and (min-width: 761px) {
+  th,
+  td {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .file-name strong {
+    max-width: 200px;
+  }
+}
+
+@media (max-width: 600px) {
+  .section-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 16px;
+  }
+  .section-head h2 {
+    font-size: 18px;
+  }
+  .section-head span {
+    line-height: 1.8;
+  }
+  .head-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  .table-wrap {
+    overflow: visible;
+  }
+  table,
+  tbody {
+    display: block;
+    width: 100%;
+  }
+  thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  tbody {
+    padding: 0 12px 12px;
+  }
+  tbody tr {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 16px;
+    margin-top: 10px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--panel-2);
+  }
+  td {
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+  td.file-column,
+  td.col-actions {
+    grid-column: 1 / -1;
+    width: auto;
+  }
+  .file-cell {
+    min-width: 0;
+    align-items: flex-start;
+  }
+  .file-name strong {
+    max-width: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    font-size: 14px;
+  }
+  .file-name span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .num::before {
+    content: attr(data-label);
+    color: var(--muted);
+    margin-right: 8px;
+  }
+  .status-column {
+    text-align: right;
+  }
+  .row-actions {
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    gap: 8px;
+  }
+  .download-button {
+    margin-right: auto;
+    min-height: 40px;
+    padding-inline: 20px;
+  }
+  .pending-label {
+    margin-right: auto;
+  }
+  .icon-link {
+    width: 40px;
+    height: 40px;
+  }
+  .list-error {
+    margin-inline: 16px;
   }
 }
 </style>

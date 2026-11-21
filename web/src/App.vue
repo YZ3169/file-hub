@@ -114,7 +114,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <nav class="top-actions">
+      <nav class="top-actions" aria-label="应用导航">
         <a
           class="btn btn-ghost btn-sm"
           href="https://github.com/YZ3169/file-hub"
@@ -123,8 +123,8 @@ onBeforeUnmount(() => {
         >
           GitHub <span class="ext">↗</span>
         </a>
-        <a class="btn btn-ghost btn-sm" href="/classic.html" target="_blank" rel="noreferrer">
-          经典版
+        <a class="btn btn-ghost btn-sm" href="/download.html" target="_blank" rel="noreferrer">
+          <BaseIcon name="download" :size="14" /> 下载桌面版
         </a>
         <button
           class="icon-btn"
@@ -186,16 +186,13 @@ onBeforeUnmount(() => {
       <section class="hero">
         <div class="kicker">
           <i></i>
-          Spring Boot · 分片存储 · 内容寻址 · 账号隔离
+          文件传输与管理
         </div>
-        <h1>
-          大文件传输，
-          <span class="gradient-text">断了也不用从头再来</span>
-        </h1>
-        <p>
-          分片上传、秒传、断点续传，加上分片级完整性校验与自动重传。 传一个 2GB
-          的文件，网络抖一下只补那一片，而不是重传整个文件。
-        </p>
+        <h1>大文件，<span class="gradient-text">轻松存取</span></h1>
+        <p>上传、下载、分享，在一个地方完成。传输中断后重新选择原文件，即可接着上传。</p>
+        <a class="btn btn-primary files-shortcut" href="#files"
+          ><BaseIcon name="download" :size="17" /> 查看文件与下载</a
+        >
       </section>
 
       <StatsBar />
@@ -558,6 +555,10 @@ onBeforeUnmount(() => {
   line-height: 1.75;
 }
 
+.files-shortcut {
+  margin-top: 20px;
+}
+
 .resume-hint {
   display: flex;
   align-items: center;
@@ -772,6 +773,12 @@ onBeforeUnmount(() => {
 @media (max-width: 640px) {
   .topbar {
     padding: 14px 16px 10px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .top-actions {
+    margin-left: auto;
   }
 
   .page {

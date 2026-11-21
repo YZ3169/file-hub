@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="下载 FileHub Windows 桌面版。分片上传、断点续传与文件分享，内置运行环境，安装即可使用。"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>下载 FileHub · 让文件传输更从容</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #090d1a;
+        --panel: #12192c;
+        --line: #26304a;
+        --text: #edf1ff;
+        --muted: #a8b3cc;
+        --accent: #a79bff;
+        --cyan: #62dfef;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        line-height: 1.65;
+        font-size: 16px;
+      }
+      body::before {
+        content: '';
+        position: absolute;
+        z-index: -1;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 750px;
+        background: radial-gradient(ellipse at 80% 0%, #28204d 0%, transparent 60%);
+        pointer-events: none;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      button {
+        font: inherit;
+      }
+      :focus-visible {
+        outline: 3px solid var(--cyan);
+        outline-offset: 5px;
+      }
+      .wrap {
+        width: min(1100px, calc(100% - 48px));
+        margin: auto;
+      }
+      .nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 26px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+      }
+      .logo {
+        width: 40px;
+        height: 40px;
+        display: grid;
+        place-items: center;
+        background: #272140;
+        color: #b7aaff;
+        border: 1px solid #514571;
+        border-radius: 12px;
+      }
+      svg {
+        width: 22px;
+        height: 22px;
+        flex: none;
+        vertical-align: middle;
+      }
+      .nav-links {
+        display: flex;
+        gap: 26px;
+        align-items: center;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .nav-links a:hover,
+      .text-link:hover {
+        color: var(--cyan);
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 60px;
+        align-items: center;
+        padding: 76px 0 64px;
+      }
+      .eyebrow {
+        color: var(--cyan);
+        font-size: 13px;
+        letter-spacing: 2px;
+        font-weight: 650;
+        text-transform: uppercase;
+      }
+      h1 {
+        font-size: clamp(36px, 4.6vw, 54px);
+        line-height: 1.2;
+        letter-spacing: -1.8px;
+        margin: 18px 0 22px;
+      }
+      h1 span {
+        display: block;
+        color: #b4a6ff;
+      }
+      .hero-copy {
+        color: var(--muted);
+        max-width: 520px;
+        margin: 0 0 28px;
+      }
+      .hero-points {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 22px;
+        color: #c8d1e7;
+        font-size: 14px;
+      }
+      .hero-points span::before {
+        content: '✓';
+        color: var(--cyan);
+        margin-right: 7px;
+      }
+      .preview {
+        padding: 25px;
+        border: 1px solid #3a3556;
+        border-radius: 22px;
+        background: linear-gradient(145deg, #1d2340, #12192b);
+        box-shadow: 0 30px 80px #02051266;
+      }
+      .preview-head {
+        color: var(--muted);
+        font-size: 13px;
+        display: flex;
+        justify-content: space-between;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 18px;
+      }
+      .preview-head span:last-child {
+        color: var(--cyan);
+      }
+      .preview-file {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 25px 0 22px;
+      }
+      .preview-file > svg {
+        width: 43px;
+        height: 43px;
+        color: var(--accent);
+      }
+      .preview-file strong {
+        display: block;
+        font-size: 16px;
+      }
+      .preview-file small {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .chunks {
+        display: grid;
+        grid-template-columns: repeat(12, 1fr);
+        gap: 5px;
+      }
+      .chunks i {
+        height: 17px;
+        border-radius: 3px;
+        background: #6d62b9;
+      }
+      .chunks i:nth-child(4n) {
+        background: #3598a4;
+      }
+      .preview-foot {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        color: var(--cyan);
+        margin-top: 19px;
+        font-size: 14px;
+      }
+      .preview-note {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 14px 0 0;
+      }
+      .section-heading {
+        display: flex;
+        justify-content: space-between;
+        align-items: end;
+        gap: 24px;
+        margin-bottom: 20px;
+      }
+      h2 {
+        font-size: 25px;
+        letter-spacing: -0.5px;
+        margin: 0 0 4px;
+      }
+      .section-heading p {
+        color: var(--muted);
+        font-size: 14px;
+        margin: 0;
+      }
+      .release {
+        text-align: right;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .release strong {
+        display: block;
+        color: var(--text);
+        font-size: 14px;
+      }
+      .packages {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+      }
+      .package {
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      .package.recommended {
+        border-color: #7362af;
+        background: linear-gradient(130deg, #211f3c, #141b2e 80%);
+      }
+      .package-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+      }
+      .package-icon {
+        display: grid;
+        place-items: center;
+        width: 45px;
+        height: 45px;
+        border: 1px solid #3a405a;
+        border-radius: 12px;
+        color: #c0b3ff;
+      }
+      .badge {
+        font-size: 12px;
+        color: #d5caff;
+        border: 1px solid #625385;
+        background: #302746;
+        padding: 3px 10px;
+        border-radius: 5px;
+      }
+      h3 {
+        font-size: 21px;
+        margin: 21px 0 7px;
+      }
+      .package p {
+        font-size: 14px;
+        color: var(--muted);
+        margin: 0 0 18px;
+      }
+      .package ul {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 25px;
+        color: #c8d1e7;
+        font-size: 14px;
+        flex: 1;
+      }
+      .package li {
+        margin: 7px 0;
+      }
+      .package li::before {
+        content: '✓';
+        margin-right: 9px;
+        color: var(--cyan);
+      }
+      .download {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 13px 16px;
+        border-radius: 10px;
+        font-weight: 600;
+        border: 1px solid #49516c;
+        background: #222b42;
+        transition: background 0.15s;
+      }
+      .download:hover {
+        background: #303b57;
+      }
+      .recommended .download {
+        background: #7862db;
+        border-color: #9180e8;
+        color: #fff;
+      }
+      .recommended .download:hover {
+        background: #8b75ed;
+      }
+      .asset-meta {
+        margin-top: 11px;
+        color: var(--muted);
+        font-size: 12px;
+        text-align: center;
+        overflow-wrap: anywhere;
+        min-height: 20px;
+      }
+      .checksum {
+        margin-top: 14px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .checksum summary {
+        cursor: pointer;
+        padding: 4px 0;
+      }
+      .checksum code {
+        display: block;
+        margin-top: 7px;
+        overflow-wrap: anywhere;
+        font-family: Consolas, monospace;
+      }
+      .status {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px 20px;
+        margin: 17px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .status.error {
+        color: #f4c188;
+      }
+      .retry {
+        border: 0;
+        color: var(--cyan);
+        background: transparent;
+        cursor: pointer;
+        padding: 5px 0;
+        font-size: 13px;
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+      .text-link {
+        color: #c4b8ff;
+        text-decoration: underline;
+        text-underline-offset: 4px;
+      }
+      .setup {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 32px;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        margin-top: 47px;
+        padding: 33px 0;
+      }
+      .setup h3 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      .setup p {
+        font-size: 14px;
+        color: var(--muted);
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+      code {
+        font-size: 0.92em;
+        color: #c6c3eb;
+      }
+      .faq {
+        padding: 42px 0;
+      }
+      .faq h2 {
+        margin-bottom: 16px;
+        font-size: 22px;
+      }
+      .faq details {
+        border-bottom: 1px solid var(--line);
+        padding: 16px 0;
+      }
+      .faq summary {
+        cursor: pointer;
+        font-size: 15px;
+      }
+      .faq p {
+        color: var(--muted);
+        font-size: 14px;
+        max-width: 850px;
+        margin: 13px 0 0;
+      }
+      footer {
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 8px 0 35px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 760px) {
+        .wrap {
+          width: min(100% - 32px, 580px);
+        }
+        .nav {
+          padding: 20px 0;
+        }
+        .nav-links {
+          gap: 16px;
+        }
+        .nav-links .source {
+          display: none;
+        }
+        .hero {
+          grid-template-columns: 1fr;
+          gap: 32px;
+          padding: 48px 0 42px;
+        }
+        .preview {
+          display: none;
+        }
+        .section-heading {
+          align-items: start;
+        }
+        .packages {
+          grid-template-columns: 1fr;
+        }
+        .package {
+          padding: 24px;
+        }
+        .setup {
+          grid-template-columns: 1fr;
+          gap: 25px;
+        }
+        h1 {
+          letter-spacing: -1px;
+        }
+        .release {
+          max-width: 130px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+        * {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <svg xmlns="http://www.w3.org/2000/svg" style="display: none" aria-hidden="true">
+      <symbol id="layers" viewBox="0 0 24 24">
+        <path
+          d="m12 3 10 5-10 5L2 8l10-5Zm-10 9 10 5 10-5M2 16l10 5 10-5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </symbol>
+      <symbol id="download" viewBox="0 0 24 24">
+        <path
+          d="M12 3v12m-5-5 5 5 5-5M4 15v5h16v-5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </symbol>
+      <symbol id="file" viewBox="0 0 24 24">
+        <path
+          d="M14 2H5v20h14V7l-5-5Zm0 0v6h5M8 13h8m-8 4h6"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linejoin="round"
+        />
+      </symbol>
+      <symbol id="box" viewBox="0 0 24 24">
+        <path
+          d="m12 2 9 5v10l-9 5-9-5V7l9-5Zm-9 5 9 5 9-5M12 12v10M7 4.8l9 5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linejoin="round"
+        />
+      </symbol>
+    </svg>
+    <div class="wrap">
+      <header class="nav">
+        <a class="brand" href="./" aria-label="FileHub 工作台"
+          ><span class="logo"
+            ><svg aria-hidden="true"><use href="#layers" /></svg></span
+          >file-hub</a
+        >
+        <nav class="nav-links" aria-label="页面导航">
+          <a href="./">返回工作台</a>
+          <a
+            class="source"
+            href="https://github.com/YZ3169/file-hub"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub 源码</a
+          >
+        </nav>
+      </header>
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">FileHub for Windows</div>
+            <h1>把文件安稳存好，<span>让传输从容继续。</span></h1>
+            <p class="hero-copy">
+              你的文件传输工作台。大文件分片上传，断开后接着传；文件存放在自己的电脑里，随时查找、下载与管理。
+            </p>
+            <div class="hero-points">
+              <span>断点续传</span><span>完整性校验</span><span>开源可查看</span>
+            </div>
+          </div>
+          <div class="preview" aria-label="分片上传功能示意">
+            <div class="preview-head"><span>文件传输</span><span>分片校验</span></div>
+            <div class="preview-file">
+              <svg aria-hidden="true"><use href="#file" /></svg>
+              <div><strong>项目资料.zip</strong><small>分片上传 · 中断后继续</small></div>
+            </div>
+            <div class="chunks" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i
+              ><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <div class="preview-foot"><span aria-hidden="true">✓</span> 每个分片，都有校验</div>
+            <p class="preview-note">功能示意 · 实际传输状态以工作台为准</p>
+          </div>
+        </section>
+        <section aria-labelledby="packages-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="packages-title">选择你的下载方式</h2>
+              <p>Windows 10 / 11 · 64 位（x64）</p>
+            </div>
+            <div class="release">
+              <strong id="version">Windows 桌面版</strong
+              ><span id="published">版本以 GitHub 为准</span>
+            </div>
+          </div>
+          <div class="packages">
+            <article class="package recommended">
+              <div class="package-top">
+                <span class="package-icon"
+                  ><svg aria-hidden="true"><use href="#download" /></svg></span
+                ><span class="badge">日常使用推荐</span>
+              </div>
+              <h3>安装版</h3>
+              <p>跟随安装向导完成设置，从开始菜单打开。</p>
+              <ul>
+                <li>按当前用户安装，无需管理员权限</li>
+                <li>自动创建 FileHub 程序文件夹</li>
+                <li>卸载保留已有文件与账号数据</li>
+              </ul>
+              <a
+                id="msi-link"
+                class="download"
+                href="https://github.com/YZ3169/file-hub/releases/latest"
+                target="_blank"
+                rel="noopener noreferrer"
+                ><svg aria-hidden="true"><use href="#download" /></svg
+                ><span id="msi-label">前往 GitHub 下载 MSI</span></a
+              >
+              <div id="msi-meta" class="asset-meta">在发行版 Assets 中选择 .msi 文件</div>
+              <details id="msi-checksum" class="checksum" hidden>
+                <summary>查看 SHA-256 校验值</summary>
+                <code id="msi-digest"></code>
+              </details>
+            </article>
+            <article class="package">
+              <div class="package-top">
+                <span class="package-icon"
+                  ><svg aria-hidden="true"><use href="#box" /></svg></span
+                ><span class="badge">解压即可启动</span>
+              </div>
+              <h3>免安装版</h3>
+              <p>解压完整文件夹，双击 FileHub.exe 打开。</p>
+              <ul>
+                <li>无需运行安装向导</li>
+                <li>包含运行所需的 Java 环境</li>
+                <li>数据仍保存在当前用户的数据目录</li>
+              </ul>
+              <a
+                id="portable-link"
+                class="download"
+                href="https://github.com/YZ3169/file-hub/releases/latest"
+                target="_blank"
+                rel="noopener noreferrer"
+                ><svg aria-hidden="true"><use href="#download" /></svg
+                ><span id="portable-label">前往 GitHub 下载 ZIP</span></a
+              >
+              <div id="portable-meta" class="asset-meta">
+                在发行版 Assets 中选择 -portable.zip 文件
+              </div>
+              <details id="portable-checksum" class="checksum" hidden>
+                <summary>查看 SHA-256 校验值</summary>
+                <code id="portable-digest"></code>
+              </details>
+            </article>
+          </div>
+          <div class="status" id="release-status">
+            <span id="status-message" role="status" aria-live="polite"
+              >下载入口指向项目 GitHub Releases。</span
+            ><button class="retry" id="retry" type="button" hidden>重新获取</button
+            ><a
+              class="text-link"
+              id="release-link"
+              href="https://github.com/YZ3169/file-hub/releases/latest"
+              target="_blank"
+              rel="noopener noreferrer"
+              >更新说明与历史版本</a
+            >
+          </div>
+          <noscript
+            ><p class="status">
+              JavaScript 未启用。上方按钮仍可打开 GitHub 最新发行版，请在 Assets 中选择对应安装包。
+            </p></noscript
+          >
+        </section>
+        <section class="setup" aria-label="安装与首次使用">
+          <div>
+            <h3>安装更简单</h3>
+            <p>
+              内置 Java 运行环境与数据库，无需另外安装 Java、MySQL 或 Docker。安装版选择
+              <code>D:\</code> 时，会自动安装到 <code>D:\FileHub</code>。
+            </p>
+          </div>
+          <div>
+            <h3>文件留在本机</h3>
+            <p>
+              文件、账号与设置保存在
+              <code>%LOCALAPPDATA%\FileHubData</code
+              >。免安装版也使用此目录；迁移电脑前请退出程序并备份它。
+            </p>
+          </div>
+          <div>
+            <h3>打开后即可开始</h3>
+            <p>
+              首次注册的账号成为管理员。登录后选择文件上传；关闭窗口时，可选择最小化到托盘或退出程序。
+            </p>
+          </div>
+        </section>
+        <section class="faq" aria-labelledby="faq-title">
+          <h2 id="faq-title">下载前，你可能想知道</h2>
+          <details>
+            <summary>需要什么系统环境？</summary>
+            <p>
+              桌面版面向 Windows 10 / 11 x64，外壳需要 .NET Framework 4.8。独立窗口需要 Microsoft
+              Edge WebView2 Runtime；如果启动时提示缺失，可从
+              <a
+                class="text-link"
+                href="https://developer.microsoft.com/microsoft-edge/webview2/"
+                target="_blank"
+                rel="noopener noreferrer"
+                >Microsoft 官方页面</a
+              >安装。安装包内置 Java 环境，但不包含 WebView2 Runtime。
+            </p>
+          </details>
+          <details>
+            <summary>下载失败，或无法读取最新版本？</summary>
+            <p>
+              页面直接从 GitHub 获取版本与安装包。网络不通、GitHub
+              限流或发行版暂未提供安装包时，可以使用上方 GitHub 入口查看
+              Assets，或稍后重新获取。Source code 压缩包是项目源码，不是可直接运行的桌面版。
+            </p>
+          </details>
+          <details>
+            <summary>Windows 提示“未知发布者”怎么办？</summary>
+            <p>
+              当前桌面安装包未做代码签名，Windows 可能显示发布者提示。请确认文件来自本项目 GitHub
+              Releases，并核对页面提供的 SHA-256 校验值；无法确认来源时不要运行。校验值可用
+              PowerShell 的
+              <code>Get-FileHash -Algorithm SHA256 -LiteralPath '安装包路径'</code> 查看。
+            </p>
+          </details>
+          <details>
+            <summary>本机的分享链接可以发给其他人吗？</summary>
+            <p>
+              桌面版只监听本机地址
+              <code>127.0.0.1:18080</code
+              >，默认的分享链接只能在这台电脑上打开。需要跨电脑访问时，请按仓库文档部署服务器版。
+            </p>
+          </details>
+        </section>
+      </main>
+      <footer>
+        <span>file-hub · 文件由你掌握</span
+        ><a
+          class="text-link"
+          href="https://github.com/YZ3169/file-hub"
+          target="_blank"
+          rel="noopener noreferrer"
+          >查看源码与部署文档</a
+        >
+      </footer>
+    </div>
+    <script type="module">
+      const repository = 'https://github.com/YZ3169/file-hub'
+      const latestUrl = `${repository}/releases/latest`
+      const byId = (id) => document.getElementById(id)
+      const kinds = {
+        msi: {
+          suffix: '.msi',
+          label: '下载安装版',
+          fallback: '前往 GitHub 下载 MSI',
+          hint: '在发行版 Assets 中选择 .msi 文件',
+        },
+        portable: {
+          suffix: '-portable.zip',
+          label: '下载免安装版',
+          fallback: '前往 GitHub 下载 ZIP',
+          hint: '在发行版 Assets 中选择 -portable.zip 文件',
+        },
+      }
+      let loading = false
+
+      function validAsset(asset, tag, name) {
+        if (asset?.name !== name || asset.state !== 'uploaded') return false
+        try {
+          const url = new URL(asset.browser_download_url)
+          return (
+            url.origin === 'https://github.com' &&
+            !url.username &&
+            !url.password &&
+            !url.search &&
+            !url.hash &&
+            decodeURIComponent(url.pathname) === `/YZ3169/file-hub/releases/download/${tag}/${name}`
+          )
+        } catch {
+          return false
+        }
+      }
+
+      async function loadRelease() {
+        if (loading) return
+        loading = true
+        byId('retry').hidden = true
+        byId('release-status').classList.remove('error')
+        byId('status-message').textContent = '正在从 GitHub 获取最新正式版…'
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 8000)
+        try {
+          const response = await fetch(
+            'https://api.github.com/repos/YZ3169/file-hub/releases/latest',
+            {
+              headers: { Accept: 'application/vnd.github+json' },
+              signal: controller.signal,
+              credentials: 'omit',
+              referrerPolicy: 'no-referrer',
+            },
+          )
+          if (!response.ok) throw new Error('版本信息不可用')
+          const release = await response.json()
+          if (
+            release.draft ||
+            release.prerelease ||
+            !/^v\d+\.\d+\.\d+$/.test(release.tag_name) ||
+            !Array.isArray(release.assets)
+          )
+            throw new Error('版本信息不完整')
+          byId('version').textContent = `最新正式版 ${release.tag_name}`
+          const published = new Date(release.published_at)
+          byId('published').textContent = Number.isNaN(published.getTime())
+            ? 'Windows x64'
+            : `${new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'Asia/Shanghai' }).format(published)} 发布`
+          byId('release-link').href =
+            `${repository}/releases/tag/${encodeURIComponent(release.tag_name)}`
+          let available = 0
+          for (const [kind, config] of Object.entries(kinds)) {
+            const name = `FileHub-${release.tag_name.slice(1)}${config.suffix}`
+            const asset = release.assets.find((item) => validAsset(item, release.tag_name, name))
+            if (!asset) continue
+            available += 1
+            byId(`${kind}-link`).href = asset.browser_download_url
+            byId(`${kind}-label`).textContent = config.label
+            const size =
+              Number.isFinite(asset.size) && asset.size > 0
+                ? ` · ${(asset.size / 1024 / 1024).toFixed(1)} MB`
+                : ''
+            byId(`${kind}-meta`).textContent = `${asset.name}${size}`
+            if (/^sha256:[a-f0-9]{64}$/i.test(asset.digest || '')) {
+              byId(`${kind}-digest`).textContent = asset.digest.slice(7)
+              byId(`${kind}-checksum`).hidden = false
+            }
+          }
+          if (available === 2) {
+            byId('status-message').textContent = '安装包直接来自项目 GitHub Releases。'
+          } else {
+            byId('status-message').textContent =
+              '部分安装包暂未就绪，请到 GitHub 发行版查看，或稍后重新获取。'
+            byId('retry').hidden = false
+          }
+        } catch {
+          byId('version').textContent = 'Windows 桌面版'
+          byId('published').textContent = '版本以 GitHub 为准'
+          byId('release-link').href = latestUrl
+          byId('release-status').classList.add('error')
+          byId('status-message').textContent =
+            '暂时无法获取版本信息；下载按钮仍可打开 GitHub 最新发行版。'
+          byId('retry').hidden = false
+        } finally {
+          clearTimeout(timer)
+          loading = false
+        }
+      }
+
+      byId('retry').addEventListener('click', () => {
+        for (const [kind, config] of Object.entries(kinds)) {
+          byId(`${kind}-link`).href = latestUrl
+          byId(`${kind}-label`).textContent = config.fallback
+          byId(`${kind}-meta`).textContent = config.hint
+          byId(`${kind}-checksum`).hidden = true
+        }
+        loadRelease()
+      })
+      loadRelease()
+    </script>
+  </body>
+</html>

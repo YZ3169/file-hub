@@ -73,7 +73,12 @@ const meta = computed(() => {
 })
 
 function download() {
-  downloadFile({ fileId: props.task.fileId, fileName: props.task.name })
+  downloadFile({
+    fileId: props.task.fileId,
+    fileName: props.task.name,
+    fileSize: props.task.size,
+    status: 1,
+  })
 }
 </script>
 
