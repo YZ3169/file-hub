@@ -92,16 +92,22 @@ jobs:
             Windows 10/11 x64 桌面版：内置 H2 数据库和 JRE，只监听 `127.0.0.1:18080`，
             不需要安装 MySQL / Docker / Java。
 
-            - `FileHub-${{ env.APP_VERSION }}.msi`：推荐。按用户安装，不需要管理员权限，
+            **[下载安装版 MSI](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/FileHub-${{ env.APP_VERSION }}.msi)** · **[下载免安装版 ZIP](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/FileHub-${{ env.APP_VERSION }}-portable.zip)**
+
+            - `FileHub-${{ env.APP_VERSION }}.msi`：日常使用推荐。按用户安装，不需要管理员权限，
               从开始菜单启动，卸载只删程序、不删数据。
               安装时选择的目录是上级目录，安装程序会自动创建 `FileHub` 子文件夹
               （例如选择 `D:\` 会安装到 `D:\FileHub`）。
-            - `FileHub-${{ env.APP_VERSION }}-portable.zip`：免安装，解压后双击 `FileHub.exe`。
+            - `FileHub-${{ env.APP_VERSION }}-portable.zip`：免安装，完整解压后双击文件夹内的 `FileHub.exe`。
+            - `Source code` 压缩包是项目源码，不是可直接运行的桌面软件。
 
-            首次运行可能被 SmartScreen 提示「未知发布者」（安装包未做代码签名）：
-            点「更多信息 → 仍要运行」即可。
+            独立窗口需要 Microsoft Edge WebView2 Runtime；若提示缺失，请从
+            [Microsoft 官方页面](https://developer.microsoft.com/microsoft-edge/webview2/)安装。
+            安装包未做代码签名，Windows 可能提示「未知发布者」。请确认来源为本项目的
+            GitHub Releases，并核对资产的 SHA-256 校验值；无法确认来源时不要运行。
 
             数据保存在 `%LOCALAPPDATA%\FileHubData`；第一次注册的账号自动成为管理员。
+            免安装版同样使用此数据目录。升级或迁移前请退出程序并备份数据目录。
             界面在独立窗口中打开，不占用默认浏览器；关闭窗口时可以选择最小化到系统托盘
             或直接退出，托盘菜单也可以退出。
           files: |

@@ -1,5 +1,12 @@
 # file-hub
 
+**[下载 Windows 桌面版](https://github.com/YZ3169/file-hub/releases/latest)** · [更新与历史版本](https://github.com/YZ3169/file-hub/releases) · [部署与使用说明](#windows-桌面版)
+
+Windows 10/11 x64 用户：在发行版的 **Assets** 中，日常使用选 `FileHub-版本号.msi`；
+不想安装则选 `FileHub-版本号-portable.zip`，完整解压后运行 `FileHub.exe`。
+`Source code` 是源码，不是桌面安装包。已内置 Java 和数据库；独立窗口需要 Microsoft Edge WebView2 Runtime。
+运行新版工作台后，可通过顶部「下载桌面版」进入 `/download.html`，查看最新安装包、大小、发布日期及可用的 SHA-256 校验值。
+
 一个自己实现存储层的文件服务：**分片上传 / 秒传 / 断点续传 / 分片级校验与自动补传**，
 外加一个 Vue 3 + Vite 的可视化传输工作台，以及**按账号隔离的鉴权与限流**。
 
@@ -561,8 +568,8 @@ logs/filehub.log      滚动日志（排障用）
 - **升级**：新版本 MSI 直接覆盖安装，数据库文件继续复用。
 - 桌面版关闭了 Swagger/OpenAPI（本地单机不需要暴露接口文档），
   关键词搜索没有 MySQL ngram，自动回退 `LIKE`。
-- 未做代码签名，Windows SmartScreen 会提示“未知发布者”：
-  点「更多信息 → 仍要运行」即可。这是预期行为。
+- 未做代码签名，Windows 可能提示“未知发布者”。请确认安装包来自本项目的 GitHub Releases，
+  并核对可用的 SHA-256 校验值；无法确认来源时不要运行。
 - 只监听回环地址，不能给局域网/公网访问；H2 和文件都是明文的，
   安全性依赖 Windows 用户目录权限。需要多用户/远程访问请用服务器模式。
 - 系统要求：Windows 10/11 x64。界面依赖 **Microsoft Edge WebView2 Runtime**
@@ -787,9 +794,9 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 ### 验证
 
 ```bash
-mvn test                      # 93 个单元测试（分片校验、并发锁、认证/Token/票据、限流、多段 Range、完整性扫描、请求 ID/健康检查）
+mvn test                      # 122 个单元/集成测试（含大文件单段续传、分享过期边界、H2 桌面数据库）
 cd web && npm run lint && npm run format:check && npm run test:unit && npm run build
-                              # 前端：68 个单元/组件测试 + 生产构建
+                              # 前端：102 个单元/组件测试 + 生产构建
 bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB，逐项断言，含跨用户隔离）
 bash scripts/e2e-cluster.sh   # 多实例验收（两个 JVM + 共享目录 + Redis）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
