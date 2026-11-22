@@ -17,21 +17,36 @@ export async function copyText(text) {
 
   if (typeof document === 'undefined') return false
 
+  const previousFocus = document.activeElement
+  let container = previousFocus?.closest('dialog[open]')
+  if (!container) {
+    try {
+      container = document.querySelector('dialog:modal')
+    } catch {
+      // 较旧浏览器支持 dialog，但未必支持 :modal 选择器。
+      container = Array.from(document.querySelectorAll('dialog[open]')).pop()
+    }
+  }
+
   const area = document.createElement('textarea')
   area.value = text
   area.setAttribute('readonly', '')
   area.style.position = 'fixed'
   area.style.top = '-1000px'
   area.style.opacity = '0'
-  document.body.appendChild(area)
-  area.select()
-  area.setSelectionRange(0, text.length)
+  // showModal() 会使弹窗外的节点 inert：放到 body 可能返回复制成功却未改剪贴板。
+  const fallbackRoot = container || document.body
+  fallbackRoot.appendChild(area)
   try {
+    area.focus({ preventScroll: true })
+    area.select()
+    area.setSelectionRange(0, text.length)
     return document.execCommand('copy')
   } catch {
     return false
   } finally {
-    document.body.removeChild(area)
+    area.remove()
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true })
   }
 }
 

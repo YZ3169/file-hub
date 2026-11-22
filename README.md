@@ -6,6 +6,7 @@ Windows 10/11 x64 用户：在发行版的 **Assets** 中，日常使用选 `Fil
 不想安装则选 `FileHub-版本号-portable.zip`，完整解压后运行 `FileHub.exe`。
 `Source code` 是源码，不是桌面安装包。已内置 Java 和数据库；独立窗口需要 Microsoft Edge WebView2 Runtime。
 运行新版工作台后，可通过顶部「下载桌面版」进入 `/download.html`，查看最新安装包、大小、发布日期及可用的 SHA-256 校验值。
+工作台中点击文件名可查看完整名称、精确大小与 SHA-256，复制校验值或直接下载；文件列表支持每页显示 10 / 20 / 50 / 100 条。
 
 一个自己实现存储层的文件服务：**分片上传 / 秒传 / 断点续传 / 分片级校验与自动补传**，
 外加一个 Vue 3 + Vite 的可视化传输工作台，以及**按账号隔离的鉴权与限流**。
@@ -47,7 +48,7 @@ Windows 10/11 x64 用户：在发行版的 **Assets** 中，日常使用选 `Fil
 
 ```
   Vue 3 工作台（web/ → static/）            /classic.html 是原始单页演示
-     │  ① 在 Web Worker 里增量算整文件 SHA-256，结果缓存进 localStorage
+     │  ① 每次选择文件，在 Web Worker 里增量核对整文件 SHA-256
      │  ② POST /api/file/init       → fileId + 已传分片序号 + 是否秒传命中
      │  ③ POST /api/file/chunk      ×N，并发 4；每片附带 WebCrypto 算的 SHA-256
      │  ④ 失败分片指数退避重试；暂停/刷新后从 /status 或 init 重新对齐
@@ -796,7 +797,7 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 ```bash
 mvn test                      # 127 个单元/集成测试（含续传、分享过期边界、分片清理、H2 桌面数据库）
 cd web && npm run lint && npm run format:check && npm run test:unit && npm run build
-                              # 前端：116 个单元/组件测试（含账号切换、暂停/续传、分享加载）+ 生产构建
+                              # 前端：149 个单元/组件测试（含账号切换、摘要缓存核对、文件详情、分页及复制回退）+ 生产构建
 bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB，逐项断言，含跨用户隔离）
 bash scripts/e2e-cluster.sh   # 多实例验收（两个 JVM + 共享目录 + Redis）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
@@ -887,10 +888,11 @@ Phase 3 的运维端点在同一个实例上手工验证过（2026-11-18），�
 
 - **哈希在 Worker 里算，但老浏览器会回退**：整文件 SHA-256 现在跑在 Web Worker 里，
   主线程只收进度消息；不支持 Worker 的环境仍会回退到主线程，1GB 文件算哈希时会有卡顿。
-  哈希结果会缓存进 localStorage，第二次选择同一文件可以直接跳过；缓存失效时服务端返回 30003，
-  界面提示重新计算，不会静默传坏文件。
+  每次重新选择文件都需要核对完整 SHA-256，同名、同大小、同修改时间不能证明内容相同；
+  同一任务暂停后继续可复用本次已核对的摘要。持久化摘要只用于关联断点记录，不能直接用于秒传。
 - **刷新页面不会自动续传**：浏览器拿不到刷新前的 `File` 对象，需要用户重新选择同名、同大小、
-  同修改时间的文件，前端用指纹（name + size + lastModified）对上本地断点记录后再续传。
+  同修改时间的文件。前端用指纹（name + size + lastModified）查找本地断点记录，重新核对内容摘要后，
+  按服务端返回的分片状态续传，已上传的有效分片无需重传。
 - **多实例依赖共享目录和 Redis**：共享目录必须支持原子 rename、mtime 一致（NFS/SMB 的语义
   要在目标环境实测）；Redis 目前是单点，没有做 Sentinel/Cluster 高可用。Redis 不可用时上传和
   登录会明确失败（`20008` / HTTP 503），这是刻意的 fail-closed，不是降级。S3/MinIO 仍不在范围内。

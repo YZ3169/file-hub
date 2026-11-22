@@ -103,6 +103,57 @@ describe('FileTable', () => {
     expect(rows[1].text()).toContain('上传中')
   })
 
+  it('每页数量选择使用服务端分页，不在当前页内裁切文件', async () => {
+    state.files = [file()]
+    state.filePage.total = 56
+    const wrapper = mount(FileTable)
+    await wrapper.find('[aria-label="每页显示数量"]').setValue('50')
+    expect(updateFileQuery).toHaveBeenCalledWith({ size: 50 })
+  })
+
+  it('点击文件名可查看详情并从详情发起下载', async () => {
+    state.files = [file()]
+    state.filePage.total = 1
+    const wrapper = mount(FileTable, {
+      global: {
+        stubs: {
+          FileDetailsDialog: {
+            props: ['file', 'downloading'],
+            emits: ['download', 'close'],
+            template:
+              '<section data-testid="detail-stub"><span>{{ file.fileName }}</span><button @click="$emit(\'download\')">下载</button></section>',
+          },
+        },
+      },
+    })
+    await wrapper.find('[aria-label="查看 report.pdf 的详情"]').trigger('click')
+    expect(wrapper.find('[data-testid="detail-stub"]').text()).toContain('report.pdf')
+    await wrapper.find('[data-testid="detail-stub"] button').trigger('click')
+    expect(downloadFile).toHaveBeenCalledWith(state.files[0])
+  })
+
+  it('列表刷新后详情同步上传状态，文件消失时关闭且不会自行重开', async () => {
+    state.files = [file({ status: 0 })]
+    state.filePage.total = 1
+    const wrapper = mount(FileTable, {
+      global: { stubs: { FileDetailsDialog: true } },
+    })
+    await wrapper.find('[aria-label="查看 report.pdf 的详情"]').trigger('click')
+    expect(wrapper.findComponent({ name: 'FileDetailsDialog' }).props('file').status).toBe(0)
+
+    state.files = [file({ status: 1 })]
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findComponent({ name: 'FileDetailsDialog' }).props('file').status).toBe(1)
+
+    state.files = []
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findComponent({ name: 'FileDetailsDialog' }).exists()).toBe(false)
+    state.files = [file()]
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findComponent({ name: 'FileDetailsDialog' }).exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('搜索提交时去掉首尾空格并回到第一页', async () => {
     state.files = [file()]
     state.filePage.total = 1

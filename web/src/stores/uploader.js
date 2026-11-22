@@ -148,6 +148,9 @@ function newTask(file, fingerprint, saved) {
     message: '',
     errorCode: 0,
     hash: saved?.hash || null,
+    // A persisted fingerprint only identifies a candidate. It does not prove that
+    // this newly selected File still contains the same bytes.
+    _hashVerified: false,
     hashProgress: 0,
     hashMs: 0,
     hashFromCache: Boolean(saved?.hash),
@@ -531,10 +534,14 @@ async function runTask(task) {
   task.startedAt = task.startedAt || Date.now()
 
   try {
-    // 1) 哈希：有缓存就跳过。缓存只当加速，最终仍由服务端整文件校验兜底
-    if (!task.hash) {
-      task.hash = await hashFile(task)
+    // 1) 新选择的 File 必须先核对完整内容：秒传不会进入服务端的合并校验，
+    // 不能信任仅由 name + size + lastModified 对上的持久化哈希。
+    // 同一任务暂停/继续时，仍可复用本次已经核对过的内存哈希。
+    if (!task.hash || !task._hashVerified) {
+      const hash = await hashFile(task)
       if (isStopped(task)) throw stopError(task)
+      task.hash = hash
+      task._hashVerified = true
       setCachedHash(task.fingerprint, task.hash)
       task.hashFromCache = false
     }
@@ -791,6 +798,10 @@ export async function updateFileQuery(patch = {}) {
   if ('keyword' in patch) state.filePage.keyword = patch.keyword || ''
   if ('status' in patch) state.filePage.status = patch.status
   if ('sort' in patch) state.filePage.sort = patch.sort
+  if ('size' in patch) {
+    const size = Number(patch.size)
+    if (Number.isInteger(size) && size >= 1 && size <= 100) state.filePage.size = size
+  }
   state.filePage.page = 1
   await refreshFiles()
 }

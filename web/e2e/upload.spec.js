@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import fs from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { gotoWorkspace, injectSession, registerViaApi } from './helpers'
 
 test.describe('上传工作台', () => {
@@ -28,6 +29,28 @@ test.describe('上传工作台', () => {
     await page.getByLabel('搜索文件').fill(fileName)
     await page.getByRole('button', { name: '搜索', exact: true }).click()
     await expect(page.locator('tbody tr').filter({ hasText: fileName })).toBeVisible()
+
+    // 调整每页数量仍保留搜索；详情中的完整摘要应与实际上传内容一致。
+    await page.getByLabel('每页显示数量').selectOption('20')
+    await expect(page.getByLabel('每页显示数量')).toHaveValue('20')
+    await expect(page.getByLabel('搜索文件')).toHaveValue(fileName)
+    await page.getByRole('button', { name: `查看 ${fileName} 的详情` }).click()
+    const details = page.getByRole('dialog', { name: '文件详情' })
+    await expect(details).toBeVisible()
+    await expect(details.getByLabel('完整 SHA-256')).toHaveValue(
+      createHash('sha256').update(content).digest('hex'),
+    )
+    await expect(details.getByTestId('file-details-bytes')).toHaveText(
+      `${Buffer.byteLength(content)} 字节`,
+    )
+    const detailsDownloadPromise = page.waitForEvent('download')
+    await details.getByRole('button', { name: '下载文件' }).click()
+    const detailsDownload = await detailsDownloadPromise
+    expect(detailsDownload.suggestedFilename()).toBe(fileName)
+    expect(await fs.readFile(await detailsDownload.path(), 'utf8')).toBe(content)
+    await page.keyboard.press('Escape')
+    await expect(details).toHaveCount(0)
+    await expect(page.getByRole('button', { name: `查看 ${fileName} 的详情` })).toBeFocused()
 
     // 下载走短期票据；浏览器应拿到同名文件
     const downloadPromise = page.waitForEvent('download')

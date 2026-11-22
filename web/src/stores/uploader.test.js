@@ -48,6 +48,42 @@ afterEach(() => {
 })
 
 describe('文件列表请求', () => {
+  it('末页修改每页数量后回到第一页，保留已应用的查询条件', async () => {
+    Object.assign(state.filePage, { page: 8, keyword: '报告', status: 1, sort: 'name_asc' })
+    api.listFiles.mockResolvedValueOnce({ ...page('new'), size: 50, total: 75 })
+    await updateFileQuery({ size: 50 })
+    expect(api.listFiles).toHaveBeenCalledWith(
+      expect.objectContaining({
+        page: 1,
+        size: 50,
+        keyword: '报告',
+        status: 1,
+        sort: 'name_asc',
+      }),
+    )
+    expect(state.filePage.size).toBe(50)
+    expect(state.filePage.page).toBe(1)
+  })
+
+  it('改变每页数量时，先前查询的迟到响应不能恢复旧数量', async () => {
+    const previous = deferred()
+    api.listFiles
+      .mockReturnValueOnce(previous.promise)
+      .mockResolvedValueOnce({ ...page('new'), size: 20 })
+    const pending = refreshFiles()
+    await updateFileQuery({ size: 20 })
+    previous.resolve(page('old'))
+    await pending
+    expect(state.filePage.size).toBe(20)
+    expect(state.files[0].fileName).toBe('new')
+  })
+
+  it.each([0, 101, 1.5, 'bad'])('忽略非法每页数量 %s', async (size) => {
+    api.listFiles.mockResolvedValueOnce(page('default'))
+    await updateFileQuery({ size })
+    expect(api.listFiles).toHaveBeenCalledWith(expect.objectContaining({ size: 10 }))
+  })
+
   it('旧搜索迟到时不覆盖新搜索结果，并取消旧请求', async () => {
     const old = deferred()
     api.listFiles.mockReturnValueOnce(old.promise).mockResolvedValueOnce(page('new'))

@@ -1,9 +1,10 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import ShareDialog from './ShareDialog.vue'
 import SharesPanel from './SharesPanel.vue'
 import DownloadPanel from './DownloadPanel.vue'
+import FileDetailsDialog from './FileDetailsDialog.vue'
 import {
   deleteServerFile,
   downloadFile,
@@ -21,6 +22,15 @@ const statusFilter = ref(state.filePage.status === null ? '' : String(state.file
 
 const shareFile = ref(null)
 const showShares = ref(false)
+const detailsFile = ref(null)
+
+watch(
+  () => state.files,
+  (files) => {
+    if (!detailsFile.value) return
+    detailsFile.value = files.find((file) => file.fileId === detailsFile.value.fileId) || null
+  },
+)
 
 const totalPages = computed(() =>
   Math.max(1, Math.ceil(state.filePage.total / state.filePage.size)),
@@ -195,7 +205,15 @@ function preparingDownload(fileId) {
               <div class="file-cell">
                 <span class="file-badge">{{ extension(file.fileName) }}</span>
                 <div class="file-name">
-                  <strong :title="file.fileName">{{ file.fileName }}</strong>
+                  <button
+                    class="file-title"
+                    type="button"
+                    :title="file.fileName"
+                    :aria-label="`查看 ${file.fileName} 的详情`"
+                    @click="detailsFile = file"
+                  >
+                    {{ file.fileName }}
+                  </button>
                   <span :title="file.fileHash">{{ shortHash(file.fileHash) }}</span>
                 </div>
               </div>
@@ -251,6 +269,17 @@ function preparingDownload(fileId) {
 
     <div v-if="state.filePage.total > 0 && !state.filesError" class="pager">
       <span>第 {{ pageStart }}–{{ pageEnd }} 条，共 {{ state.filePage.total }} 条</span>
+      <label class="field page-size">
+        <span>每页显示</span>
+        <select
+          :value="state.filePage.size"
+          aria-label="每页显示数量"
+          :disabled="state.filesLoading"
+          @change="updateFileQuery({ size: Number($event.target.value) })"
+        >
+          <option v-for="size in [10, 20, 50, 100]" :key="size" :value="size">{{ size }} 条</option>
+        </select>
+      </label>
       <div v-if="totalPages > 1" class="pager-controls">
         <button
           class="btn btn-ghost btn-sm"
@@ -278,6 +307,13 @@ function preparingDownload(fileId) {
 
   <ShareDialog v-if="shareFile" :file="shareFile" @close="shareFile = null" />
   <SharesPanel v-if="showShares" @close="showShares = false" />
+  <FileDetailsDialog
+    v-if="detailsFile"
+    :file="detailsFile"
+    :downloading="preparingDownload(detailsFile.fileId)"
+    @close="detailsFile = null"
+    @download="downloadFile(detailsFile)"
+  />
 </template>
 
 <style scoped>
@@ -482,12 +518,28 @@ tbody tr:hover {
   min-width: 0;
 }
 
-.file-name strong {
+.file-title {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 560;
+}
+
+.file-title:hover {
+  color: var(--brand-light);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.page-size {
+  margin-left: auto;
 }
 
 .file-name span {
@@ -737,7 +789,7 @@ tbody tr:hover {
     padding-left: 12px;
     padding-right: 12px;
   }
-  .file-name strong {
+  .file-title {
     max-width: 200px;
   }
 }
@@ -801,7 +853,7 @@ tbody tr:hover {
     min-width: 0;
     align-items: flex-start;
   }
-  .file-name strong {
+  .file-title {
     max-width: none;
     white-space: normal;
     overflow-wrap: anywhere;
