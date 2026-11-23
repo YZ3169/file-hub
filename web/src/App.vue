@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import BaseIcon from './components/BaseIcon.vue'
+import AppIcon from './components/AppIcon.vue'
 import UploadZone from './components/UploadZone.vue'
 import StatsBar from './components/StatsBar.vue'
 import TaskCard from './components/TaskCard.vue'
@@ -84,29 +85,7 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="brand">
         <span class="logo">
-          <svg viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
-            <defs>
-              <linearGradient id="logoGrad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="#8b7fff" />
-                <stop offset="100%" stop-color="#22d3ee" />
-              </linearGradient>
-            </defs>
-            <path d="M16 3 28 9.5v13L16 29 4 22.5v-13L16 3Z" fill="url(#logoGrad)" opacity=".18" />
-            <path
-              d="M16 3 28 9.5v13L16 29 4 22.5v-13L16 3Z"
-              fill="none"
-              stroke="url(#logoGrad)"
-              stroke-width="1.6"
-              stroke-linejoin="round"
-            />
-            <path
-              d="M4 9.5 16 16l12-6.5M16 16v13"
-              fill="none"
-              stroke="url(#logoGrad)"
-              stroke-width="1.6"
-              stroke-linejoin="round"
-            />
-          </svg>
+          <AppIcon />
         </span>
         <div class="brand-copy">
           <strong>file-hub</strong>
@@ -247,7 +226,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="!state.tasks.length" class="empty-queue">
-          <div class="empty-icon"><BaseIcon name="cloud" :size="26" /></div>
+          <div class="empty-icon"><BaseIcon name="upload" :size="26" /></div>
           <strong>队列是空的</strong>
           <span>选一个大文件，试试中途刷新页面再继续</span>
         </div>
@@ -387,10 +366,7 @@ onBeforeUnmount(() => {
   place-items: center;
   width: 42px;
   height: 42px;
-  border-radius: 13px;
-  border: 1px solid rgba(139, 127, 255, 0.35);
-  background: rgba(109, 93, 252, 0.1);
-  box-shadow: 0 10px 26px rgba(109, 93, 252, 0.22);
+  filter: drop-shadow(0 4px 8px rgba(8, 15, 30, 0.16));
 }
 
 .brand-copy {

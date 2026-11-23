@@ -23,6 +23,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="FileHub"
+APP_ICON="$ROOT/desktop-shell/FileHub.ico"
+
+if [ ! -s "$APP_ICON" ]; then
+    echo "找不到应用图标：$APP_ICON" >&2
+    exit 1
+fi
 
 if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/jpackage" ]; then
     if [ -x "/d/safe/jdk/jdk17/bin/jpackage" ]; then
@@ -65,6 +71,7 @@ jlink \
 jpackage \
     --type app-image \
     --name "$APP_NAME" \
+    --icon "$APP_ICON" \
     --app-version "$APP_VERSION" \
     --vendor "file-hub" \
     --description "分片上传 / 秒传 / 断点续传的本地文件服务" \
@@ -120,6 +127,7 @@ MSI_FILE="$OUT/dist/$APP_NAME-$APP_VERSION.msi"
 jpackage \
     --type msi \
     --name "$APP_NAME" \
+    --icon "$APP_ICON" \
     --app-version "$APP_VERSION" \
     --vendor "file-hub" \
     --description "分片上传 / 秒传 / 断点续传的本地文件服务" \

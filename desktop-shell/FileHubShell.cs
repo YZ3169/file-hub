@@ -115,11 +115,11 @@ namespace FileHubShell
         {
             try
             {
-                string backendExe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FileHubBackend.exe");
-                Icon icon = File.Exists(backendExe) ? Icon.ExtractAssociatedIcon(backendExe) : null;
+                Icon icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
                 if (icon == null)
                 {
-                    icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                    string backendExe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FileHubBackend.exe");
+                    icon = File.Exists(backendExe) ? Icon.ExtractAssociatedIcon(backendExe) : null;
                 }
                 return icon != null ? icon : SystemIcons.Application;
             }

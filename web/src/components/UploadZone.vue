@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
+import AppIcon from './AppIcon.vue'
 import { addFiles, state } from '../stores/uploader'
 import { formatBytes } from '../lib/format'
 
@@ -50,8 +51,8 @@ function onDrop(event) {
     <input ref="input" type="file" multiple hidden @change="onChange" />
 
     <div class="drop-glow" aria-hidden="true"></div>
-    <div class="drop-icon">
-      <BaseIcon name="cloud" :size="34" :stroke-width="1.5" />
+    <div class="drop-icon" aria-hidden="true">
+      <AppIcon :size="76" />
     </div>
 
     <div class="drop-copy">
@@ -144,12 +145,28 @@ function onDrop(event) {
   grid-area: icon;
   display: grid;
   place-items: center;
-  width: 68px;
-  height: 68px;
-  border-radius: 20px;
-  color: #fff;
-  background: linear-gradient(140deg, var(--brand) 10%, var(--brand-2) 110%);
-  box-shadow: 0 16px 34px rgba(109, 93, 252, 0.35);
+  width: 76px;
+  height: 76px;
+  filter: drop-shadow(0 8px 12px rgba(8, 15, 30, 0.18));
+  transition: transform 0.2s ease;
+}
+
+.dropzone:hover .drop-icon,
+.dropzone.dragging .drop-icon {
+  transform: translateY(-2px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dropzone,
+  .drop-icon {
+    transition: none;
+  }
+
+  .dropzone:hover,
+  .dropzone:hover .drop-icon,
+  .dropzone.dragging .drop-icon {
+    transform: none;
+  }
 }
 
 .drop-copy {

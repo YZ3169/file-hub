@@ -52,12 +52,10 @@ if [ ! -x "$CSC" ]; then
     exit 1
 fi
 
-echo "==> 从后端启动器提取图标"
-ICON="$WORK/FileHub.ico"
-powershell -NoProfile -Command \
-    "Add-Type -AssemblyName System.Drawing; \$i=[System.Drawing.Icon]::ExtractAssociatedIcon('$(cygpath -w "$IMAGE/FileHub.exe")'); \$fs=[System.IO.File]::Create('$(cygpath -w "$ICON")'); \$i.Save(\$fs); \$fs.Close()"
+echo "==> 使用 FileHub 应用图标"
+ICON="$ROOT/desktop-shell/FileHub.ico"
 if [ ! -s "$ICON" ]; then
-    echo "提取图标失败：$ICON" >&2
+    echo "找不到应用图标：$ICON" >&2
     exit 1
 fi
 

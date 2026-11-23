@@ -5,6 +5,7 @@
   "type": "module",
   "description": "file-hub 上传工作台（Vue 3 + Vite）",
   "scripts": {
+    "icons:generate": "node scripts/generate-icons.mjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",

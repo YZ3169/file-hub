@@ -1,12 +1,23 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#8b7fff"/>
-      <stop offset="100%" stop-color="#22d3ee"/>
+    <linearGradient id="tile" x1="12" y1="3" x2="50" y2="62" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#28344F"/>
+      <stop offset=".52" stop-color="#172137"/>
+      <stop offset="1" stop-color="#0C1324"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="14" y1="2" x2="48" y2="62" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A9BBE5" stop-opacity=".42"/>
+      <stop offset=".5" stop-color="#8197C5" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#5E74A4" stop-opacity=".24"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="24" y1="15" x2="40" y2="49" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset=".55" stop-color="#ECF1FF"/>
+      <stop offset="1" stop-color="#B4C4E6"/>
     </linearGradient>
   </defs>
-  <rect width="32" height="32" rx="8" fill="#0b1020"/>
-  <path d="M16 4 27 10v12L16 28 5 22V10L16 4Z" fill="url(#g)" opacity=".22"/>
-  <path d="M16 4 27 10v12L16 28 5 22V10L16 4Z" fill="none" stroke="url(#g)" stroke-width="1.7" stroke-linejoin="round"/>
-  <path d="M5 10l11 6 11-6M16 16v12" fill="none" stroke="url(#g)" stroke-width="1.7" stroke-linejoin="round"/>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#tile)"/>
+  <rect x="2.5" y="2.5" width="59" height="59" rx="15.5" stroke="url(#edge)"/>
+  <path d="m21 27 11-11 11 11M32 17v21" stroke="url(#silver)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16 34v9a5 5 0 0 0 5 5h22a5 5 0 0 0 5-5v-9" stroke="url(#silver)" stroke-width="5" stroke-linecap="round"/>
 </svg>

@@ -449,13 +449,13 @@ KEY idx_share_expires (expires_at)
 
 ```bash
 export MYSQL_PWD=你的口令
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.3.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar \
   --server.port=8081 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
   --file-hub.cluster.redis-address=redis://127.0.0.1:6379
 
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.3.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar \
   --server.port=8082 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
@@ -538,7 +538,7 @@ docker compose -f docker-compose.cluster.yml up --build
 
 ### 安装与使用
 
-1. 运行 `FileHub-1.0.3.msi`（构建产物在 `build/desktop/dist/`）。
+1. 运行 `FileHub-1.0.4.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
    选择的目录是**上级目录**，安装程序会自动在其中创建 `FileHub` 子文件夹
    （例如选 `D:\` 会装到 `D:\FileHub`），不需要手动新建文件夹；
@@ -591,7 +591,7 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
-#   build/desktop/dist/FileHub-1.0.3.msi           安装包
+#   build/desktop/dist/FileHub-1.0.4.msi           安装包
 ```
 
 安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
@@ -608,8 +608,8 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 把 `pom.xml` 的版本号和标签对齐后推 tag：
 
 ```bash
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.4
+git push origin v1.0.4
 ```
 
 `.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
@@ -691,7 +691,7 @@ export MYSQL_PWD=你的口令
 mvn clean package -DskipTests
 # 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
 export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.3.jar
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar
 # → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
 # → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
 ```

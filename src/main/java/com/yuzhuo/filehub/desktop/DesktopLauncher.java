@@ -5,6 +5,7 @@ import org.springframework.boot.Banner;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import javax.imageio.ImageIO;
 import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -23,6 +24,7 @@ import java.awt.SystemTray;
 import java.awt.TrayIcon;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
@@ -266,6 +268,7 @@ public final class DesktopLauncher {
     private static void showControlWindow(Path dataDir) {
         SwingUtilities.invokeLater(() -> {
             JFrame frame = new JFrame("FileHub");
+            frame.setIconImage(createTrayImage());
             frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
             frame.addWindowListener(new java.awt.event.WindowAdapter() {
                 @Override
@@ -295,13 +298,24 @@ public final class DesktopLauncher {
     }
 
     private static Image createTrayImage() {
+        try (InputStream resource = DesktopLauncher.class.getResourceAsStream("/static/app-icon.png")) {
+            if (resource != null) {
+                BufferedImage appIcon = ImageIO.read(resource);
+                if (appIcon != null) {
+                    return appIcon;
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("读取应用图标失败，使用备用图标：" + e.getMessage());
+        }
+
         BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = image.createGraphics();
         try {
             g.setColor(new java.awt.Color(0x2F, 0x6F, 0xED));
             g.fillRoundRect(0, 0, 16, 16, 5, 5);
             g.setColor(java.awt.Color.WHITE);
-            // 简单的文件夹轮廓，不依赖外部 .ico 资源
+            // 资源缺失或损坏时保留可辨识的备用图标。
             g.fillRect(3, 6, 10, 7);
             g.fillRect(3, 4, 5, 3);
         } finally {
