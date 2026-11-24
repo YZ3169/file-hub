@@ -127,6 +127,10 @@ onBeforeUnmount(() => {
         <dt>完整文件名</dt>
         <dd class="filename" data-testid="file-details-name">{{ file.fileName || '—' }}</dd>
       </div>
+      <div v-if="file.relativePath" class="filename-field">
+        <dt>文件夹内路径</dt>
+        <dd class="filename" data-testid="file-details-path">{{ file.relativePath }}</dd>
+      </div>
       <div>
         <dt>文件大小</dt>
         <dd>{{ formatBytes(file.fileSize) }}</dd>

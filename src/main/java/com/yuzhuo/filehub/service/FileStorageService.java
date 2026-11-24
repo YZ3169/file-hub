@@ -95,13 +95,14 @@ public class FileStorageService {
      * 初始化。三种走向：
      * <ol>
      *   <li><b>秒传命中</b>：直接建一条已完成记录，共享已有物理文件；</li>
-     *   <li><b>断点续传</b>：同 hash+size 已有上传中的任务，复用它并回传已传分片；</li>
+     *   <li><b>断点续传</b>：同文件名、相对路径和 hash+size 已有上传中的任务，复用并回传已传分片；</li>
      *   <li>全新上传：建任务。</li>
      * </ol>
      *
      * @param user 当前登录用户；秒传/断点续传都只在有权限的记录里匹配
      */
     public InitUploadResponse init(InitUploadRequest req, UserPrincipal user) {
+        validateRelativePath(req);
         long configuredChunkSize = props.getChunkSize();
         if (configuredChunkSize <= 0 || configuredChunkSize > Integer.MAX_VALUE) {
             throw new BizException(50001, "服务端分片大小配置非法：" + configuredChunkSize);
@@ -138,13 +139,19 @@ public class FileStorageService {
 
         // --- 情况 2：自己的同一文件上传中任务（刷新页面 / 换标签页） ---
         // 必须带 owner_id：否则用户 B 可以把用户 A 未完成任务的 fileId 拿走继续传。
-        FileInfo ongoing = fileInfoMapper.selectOne(new LambdaQueryWrapper<FileInfo>()
+        // MySQL 默认排序规则忽略大小写/部分 Unicode 差异。SQL 先缩小范围，再用 Java
+        // 精确比较路径和文件名，防止 Folder/a.txt 与 folder/a.txt 共用一个未完成任务。
+        FileInfo ongoing = fileInfoMapper.selectList(new LambdaQueryWrapper<FileInfo>()
                 .eq(FileInfo::getOwnerId, user.id())
                 .eq(FileInfo::getFileHash, fileHash)
                 .eq(FileInfo::getFileSize, req.fileSize())
+                .eq(FileInfo::getFileName, req.fileName())
+                .eq(FileInfo::getRelativePath, req.relativePath())
                 .eq(FileInfo::getStatus, FileInfo.STATUS_UPLOADING)
-                .orderByDesc(FileInfo::getId)
-                .last("LIMIT 1"));
+                .orderByDesc(FileInfo::getId)).stream()
+                .filter(f -> req.fileName().equals(f.getFileName())
+                        && req.relativePath().equals(f.getRelativePath()))
+                .findFirst().orElse(null);
         if (ongoing != null) {
             // 用户主动回来续传，等于一次心跳：刷新 update_time，避免刚 init 完就被清理任务回收。
             // 如果任务恰好已被清理或合并（更新 0 行），就按全新任务处理。
@@ -170,6 +177,7 @@ public class FileStorageService {
         FileInfo row = new FileInfo();
         row.setFileId(fileId);
         row.setFileName(req.fileName());
+        row.setRelativePath(req.relativePath());
         row.setFileSize(req.fileSize());
         row.setFileHash(req.fileHash().toLowerCase());
         row.setChunkSize(chunkSize);
@@ -179,6 +187,27 @@ public class FileStorageService {
         row.setCreateTime(LocalDateTime.now());
         row.setUpdateTime(LocalDateTime.now());
         return row;
+    }
+
+    private static void validateRelativePath(InitUploadRequest req) {
+        String path = req.relativePath();
+        if (path.isEmpty()) {
+            return;
+        }
+        if (path.length() > 4096 || path.startsWith("/") || path.indexOf('\\') >= 0
+                || path.matches("^[a-zA-Z]:.*")
+                || path.codePoints().anyMatch(Character::isISOControl)) {
+            throw new BizException(10001, "relativePath 必须是合法的相对路径，长度不能超过 4096");
+        }
+        String[] parts = path.split("/", -1);
+        for (String part : parts) {
+            if (part.isEmpty() || part.equals(".") || part.equals("..")) {
+                throw new BizException(10001, "relativePath 不能包含空目录、. 或 ..");
+            }
+        }
+        if (!parts[parts.length - 1].equals(req.fileName())) {
+            throw new BizException(10001, "relativePath 的末尾必须与 fileName 一致");
+        }
     }
 
     /**

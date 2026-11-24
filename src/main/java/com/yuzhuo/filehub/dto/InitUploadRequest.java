@@ -26,6 +26,17 @@ public record InitUploadRequest(
         /** 全文件 SHA-256（hex 小写），秒传和完整性校验都用它 */
         @NotBlank(message = "不能为空")
         @Pattern(regexp = "^[0-9a-fA-F]{64}$", message = "必须是 64 位十六进制的 SHA-256")
-        String fileHash
+        String fileHash,
+
+        /** 文件夹上传时保留的相对路径（含文件名）；普通文件为空。仅作元数据，不参与物理存储寻址。 */
+        @Size(max = 4096, message = "长度不能超过 4096")
+        String relativePath
 ) {
+    public InitUploadRequest {
+        relativePath = relativePath == null ? "" : relativePath;
+    }
+
+    public InitUploadRequest(String fileName, Long fileSize, String fileHash) {
+        this(fileName, fileSize, fileHash, "");
+    }
 }

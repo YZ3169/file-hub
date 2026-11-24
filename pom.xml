@@ -13,7 +13,7 @@
 
     <groupId>com.yuzhuo</groupId>
     <artifactId>file-hub</artifactId>
-    <version>1.0.4</version>
+    <version>1.0.5</version>
     <name>file-hub</name>
     <description>分片上传 / 秒传 / 断点续传的分布式文件存储服务</description>
 

@@ -89,6 +89,34 @@ afterEach(async () => {
 })
 
 describe('上传哈希缓存的内容核对', () => {
+  it('同名同内容文件按相对路径分别入队并上传，重新选中原路径不重复入队', async () => {
+    const paths = ['项目/甲/report.txt', '项目/乙/report.txt']
+    const files = paths.map((webkitRelativePath) => ({
+      ...fileWithContents('ABCD'),
+      webkitRelativePath,
+    }))
+    addFiles(files)
+    addFiles([files[0]])
+    expect(state.tasks).toHaveLength(2)
+    expect(state.tasks.map((task) => task.relativePath)).toEqual(paths)
+    expect(state.tasks[0].fingerprint).not.toBe(state.tasks[1].fingerprint)
+    pauseTask(state.tasks[1])
+    expect(loadPendingTasks().find((task) => task.relativePath === paths[1])).toBeDefined()
+    resumeTask(state.tasks[1])
+    await finishHash()
+    await finishHash()
+    expect(api.initUpload.mock.calls.map(([payload]) => payload)).toEqual(
+      paths.map((relativePath) => ({
+        fileName: 'report.txt',
+        fileSize: 4,
+        fileHash: digest('ABCD'),
+        relativePath,
+      })),
+    )
+    expect(state.tasks.map((task) => task.state)).toEqual(['done', 'done'])
+    expect(loadPendingTasks()).toEqual([])
+  })
+
   it.each(['pending hash', 'cache with pending', 'cache without pending'])(
     '%s 不能让同名同大小同修改时间的新内容误秒传成旧内容',
     async (source) => {

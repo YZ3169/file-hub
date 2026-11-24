@@ -3,6 +3,7 @@ import * as api from '../lib/api'
 import { ApiError } from '../lib/api'
 import { auth, clearSession, onUnauthorized, setSession } from '../lib/auth'
 import { Sha256 } from '../lib/sha256'
+import { relativePathOf } from '../lib/uploadFiles'
 import {
   fingerprintOf,
   findPendingTask,
@@ -134,6 +135,16 @@ function sleep(ms, task) {
   })
 }
 
+function sleepBeforeRetry(backoff, task, error) {
+  const delay = Math.max(backoff, error.retryAfterMs || 0)
+  if (error.status === 429) {
+    task.message = `已达到服务端请求频率限制，等待 ${Math.ceil(delay / 1000)} 秒后自动继续…`
+  } else if (delay > backoff) {
+    task.message = `服务端暂时无法处理请求，等待 ${Math.ceil(delay / 1000)} 秒后自动重试…`
+  }
+  return sleep(delay, task)
+}
+
 function newTask(file, fingerprint, saved) {
   return {
     id: uid(),
@@ -142,6 +153,7 @@ function newTask(file, fingerprint, saved) {
     file: markRaw(file),
     fingerprint,
     name: file.name,
+    relativePath: relativePathOf(file),
     size: file.size,
     lastModified: file.lastModified,
     state: 'queued',
@@ -330,7 +342,7 @@ async function callWithRetry(fn, task, attempts = 3) {
       if (isStopError(e)) throw e
       const canRetry = !(e instanceof ApiError) || e.retriable
       if (i === attempts - 1 || !canRetry) throw e
-      await sleep(600 * 2 ** i + Math.random() * 300, task)
+      await sleepBeforeRetry(600 * 2 ** i + Math.random() * 300, task, e)
     }
   }
   throw lastError
@@ -394,7 +406,7 @@ async function uploadOneChunk(task, index) {
       task.chunkStates[index] = 'retrying'
       const delay = Math.min(8000, 400 * 2 ** attempt) + Math.random() * 250
       task.message = `分片 ${index + 1} 失败，${(delay / 1000).toFixed(1)}s 后第 ${attempt + 1} 次重试…`
-      await sleep(delay, task)
+      await sleepBeforeRetry(delay, task, e)
     }
   }
 }
@@ -489,7 +501,7 @@ async function completeOnce(task) {
       if (isStopError(e)) throw e
       if (e instanceof ApiError && [30001, 30002, 30003, 30005].includes(e.code)) throw e
       if (i === 2) throw e
-      await sleep(700 * 2 ** i + Math.random() * 200, task)
+      await sleepBeforeRetry(700 * 2 ** i + Math.random() * 200, task, e)
     }
   }
   throw lastError
@@ -559,6 +571,7 @@ async function runTask(task) {
             fileName: task.name,
             fileSize: task.size,
             fileHash: task.hash,
+            ...(task.relativePath ? { relativePath: task.relativePath } : {}),
           },
           task.controller?.signal,
         ),
@@ -686,7 +699,7 @@ export function addFiles(fileList) {
       (t) => t.fingerprint === fingerprint && !FINISHED_STATES.has(t.state),
     )
     if (duplicate) {
-      toast(`${file.name} 已在队列中`, 'warn')
+      toast(`${relativePathOf(file) || file.name} 已在队列中`, 'warn')
       continue
     }
     const saved = findPendingTask(fingerprint)
@@ -829,14 +842,14 @@ export async function refreshStats() {
 
 export async function deleteServerFile(file) {
   const ok = window.confirm(
-    `确认删除「${file.fileName}」？\n若已没有其他记录引用同一份物理文件，磁盘上的文件会一并删除。`,
+    `确认删除「${file.relativePath || file.fileName}」？\n若已没有其他记录引用同一份物理文件，磁盘上的文件会一并删除。`,
   )
   if (!ok) return
   const epoch = workspaceEpoch
   try {
     await api.deleteFile(file.fileId)
     if (epoch !== workspaceEpoch) return
-    toast(`已删除 ${file.fileName}`, 'success')
+    toast(`已删除 ${file.relativePath || file.fileName}`, 'success')
     await Promise.all([refreshFiles(), refreshStats()])
   } catch (e) {
     if (epoch !== workspaceEpoch) return

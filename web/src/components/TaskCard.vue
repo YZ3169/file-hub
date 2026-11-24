@@ -88,7 +88,7 @@ function download() {
       class="ring"
       :class="{ spinning: isActive }"
       role="progressbar"
-      :aria-label="`${task.name} · ${stateLabel}`"
+      :aria-label="`${task.relativePath || task.name} · ${stateLabel}`"
       aria-valuemin="0"
       aria-valuemax="100"
       :aria-valuenow="Math.round(progress)"
@@ -128,6 +128,10 @@ function download() {
         </div>
         <span class="task-size">{{ formatBytes(task.size) }}</span>
       </header>
+
+      <p v-if="task.relativePath" class="task-path" :title="task.relativePath">
+        {{ task.relativePath }}
+      </p>
 
       <p class="task-msg" :class="{ error: task.state === 'error' }">
         {{ task.message || '等待上传' }}
@@ -364,6 +368,13 @@ function download() {
 }
 .mini-badge.muted {
   color: var(--muted-2);
+}
+
+.task-path {
+  margin: 4px 0 0;
+  color: var(--muted-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .task-msg {

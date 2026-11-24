@@ -1,20 +1,41 @@
 <script setup>
-import { ref } from 'vue'
+import { onUnmounted, ref, watch } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import AppIcon from './AppIcon.vue'
-import { addFiles, state } from '../stores/uploader'
+import { addFiles, state, toast } from '../stores/uploader'
+import { auth } from '../lib/auth'
 import { formatBytes } from '../lib/format'
+import { collectDroppedFiles } from '../lib/uploadFiles'
 
 const input = ref(null)
+const folderInput = ref(null)
 const dragging = ref(false)
+const reading = ref(0)
 let dragDepth = 0
+let selectionEpoch = 0
+
+watch(
+  () => auth.token,
+  () => selectionEpoch++,
+  { flush: 'sync' },
+)
+onUnmounted(() => selectionEpoch++)
 
 function pick() {
   input.value?.click()
 }
 
+function pickFolder() {
+  if (!('webkitdirectory' in folderInput.value)) {
+    toast('当前浏览器不支持选择文件夹，请使用新版 Chrome 或 Edge，或尝试拖入文件夹', 'warn')
+    return
+  }
+  folderInput.value?.click()
+}
+
 function onChange(event) {
   if (event.target.files?.length) addFiles(event.target.files)
+  else if (event.target === folderInput.value) toast('文件夹为空，没有可上传的文件', 'warn')
   event.target.value = ''
 }
 
@@ -31,10 +52,27 @@ function onDragLeave() {
   }
 }
 
-function onDrop(event) {
+async function onDrop(event) {
   dragDepth = 0
   dragging.value = false
-  if (event.dataTransfer?.files?.length) addFiles(event.dataTransfer.files)
+  const transfer = event.dataTransfer
+  if (
+    !transfer?.files?.length &&
+    !Array.from(transfer?.items || []).some((item) => item.kind === 'file')
+  )
+    return
+  const epoch = selectionEpoch
+  reading.value++
+  try {
+    const files = await collectDroppedFiles(transfer)
+    if (epoch !== selectionEpoch) return
+    if (files.length) addFiles(files)
+    else toast('文件夹为空，没有可上传的文件', 'warn')
+  } catch (error) {
+    if (epoch === selectionEpoch) toast(`${error.message}；本次拖入的文件未加入队列`, 'error')
+  } finally {
+    reading.value--
+  }
 }
 </script>
 
@@ -48,7 +86,16 @@ function onDrop(event) {
     @dragleave.prevent="onDragLeave"
     @drop.prevent="onDrop"
   >
-    <input ref="input" type="file" multiple hidden @change="onChange" />
+    <input ref="input" type="file" multiple hidden @click.stop @change="onChange" />
+    <input
+      ref="folderInput"
+      type="file"
+      webkitdirectory
+      multiple
+      hidden
+      @click.stop
+      @change="onChange"
+    />
 
     <div class="drop-glow" aria-hidden="true"></div>
     <div class="drop-icon" aria-hidden="true">
@@ -56,8 +103,11 @@ function onDrop(event) {
     </div>
 
     <div class="drop-copy">
-      <h2>{{ dragging ? '松开即可加入队列' : '拖拽文件到这里，或点击选择' }}</h2>
+      <h2>{{ dragging ? '松开即可加入队列' : '拖拽文件或文件夹到这里' }}</h2>
       <p>大文件自动切片 · 断网/刷新后只补缺失分片 · 相同内容 0 字节秒传</p>
+      <p class="folder-hint" aria-live="polite">
+        {{ reading ? '正在读取文件夹内容…' : '文件夹会递归上传并保留相对路径，空目录不上传' }}
+      </p>
     </div>
 
     <div class="drop-meta">
@@ -75,10 +125,16 @@ function onDrop(event) {
       </span>
     </div>
 
-    <button class="btn btn-primary drop-btn" type="button" @click.stop="pick">
-      <BaseIcon name="upload" :size="16" />
-      选择文件
-    </button>
+    <div class="drop-actions">
+      <button class="btn btn-primary drop-btn" type="button" @click.stop="pick">
+        <BaseIcon name="upload" :size="16" />
+        选择文件
+      </button>
+      <button class="btn drop-btn" type="button" @click.stop="pickFolder">
+        <BaseIcon name="folder" :size="16" />
+        选择文件夹
+      </button>
+    </div>
   </section>
 </template>
 
@@ -188,9 +244,20 @@ function onDrop(event) {
   line-height: 1.6;
 }
 
-.drop-btn {
+.drop-actions {
   grid-area: button;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.drop-btn {
   white-space: nowrap;
+}
+
+.drop-copy .folder-hint {
+  margin-top: 4px;
+  font-size: 12px;
 }
 
 .drop-meta {
@@ -224,6 +291,7 @@ function onDrop(event) {
   }
 
   .drop-btn {
+    flex: 1;
     justify-content: center;
   }
 }

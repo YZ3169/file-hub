@@ -1,3 +1,5 @@
+import { relativePathOf } from './uploadFiles'
+
 const THEME_KEY = 'filehub.theme'
 
 // 断点续传记录与哈希缓存必须按用户隔离：换账号登录时绝不能看到、
@@ -45,10 +47,11 @@ function writeJson(key, value) {
 
 /**
  * 文件指纹。刷新页面后浏览器拿不到原 File 对象，只能让用户重新选择文件；
- * 用「文件名 + 大小 + 修改时间」把新旧两次选择对上，才能接上原来的上传任务。
+ * 用「相对路径（普通文件为文件名）+ 大小 + 修改时间」把新旧两次选择对上。
+ * 不同子目录里的同名文件必须有各自的队列和断点记录。
  */
 export function fingerprintOf(file) {
-  return `${file.name}|${file.size}|${file.lastModified}`
+  return `${relativePathOf(file) || file.name}|${file.size}|${file.lastModified}`
 }
 
 export function loadPendingTasks() {
@@ -64,6 +67,7 @@ export function savePendingTask(task) {
     list.unshift({
       fingerprint: task.fingerprint,
       fileName: task.name,
+      relativePath: task.relativePath || '',
       fileSize: task.size,
       lastModified: task.lastModified,
       hash: task.hash || null,

@@ -168,7 +168,7 @@ onBeforeUnmount(() => {
           文件传输与管理
         </div>
         <h1>大文件，<span class="gradient-text">轻松存取</span></h1>
-        <p>上传、下载、分享，在一个地方完成。传输中断后重新选择原文件，即可接着上传。</p>
+        <p>上传、下载、分享，在一个地方完成。传输中断后重新选择原文件或文件夹，即可接着上传。</p>
         <a class="btn btn-primary files-shortcut" href="#files"
           ><BaseIcon name="download" :size="17" /> 查看文件与下载</a
         >
@@ -183,10 +183,10 @@ onBeforeUnmount(() => {
         <div>
           <strong>有 {{ resumableHint.length }} 个未完成的传输任务</strong>
           <span>
-            重新选择同名、同大小、同修改时间的文件即可接着传：
+            重新选择原文件或原文件夹即可接着传，请保持目录结构不变：
             {{
               resumableHint
-                .map((p) => p.fileName)
+                .map((p) => p.relativePath || p.fileName)
                 .slice(0, 3)
                 .join('、')
             }}{{ resumableHint.length > 3 ? ' 等' : '' }}

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import {
   clearUserStorage,
   findPendingTask,
+  fingerprintOf,
   getCachedHash,
   getTheme,
   loadPendingTasks,
@@ -51,6 +52,23 @@ describe('storage 按用户隔离', () => {
 
     setStorageUser(1)
     expect(loadPendingTasks()).toHaveLength(1)
+  })
+
+  it('同名同大小同修改时间的文件按目录隔离断点，普通文件保留旧指纹', () => {
+    setStorageUser(1)
+    const file = { name: 'report.txt', size: 4, lastModified: 1234 }
+    expect(fingerprintOf(file)).toBe('report.txt|4|1234')
+    const paths = ['资料/甲/report.txt', '资料/乙/report.txt']
+    for (const relativePath of paths) {
+      const fingerprint = fingerprintOf({ ...file, webkitRelativePath: relativePath })
+      savePendingTask(pendingTask({ fingerprint, relativePath, name: file.name }))
+    }
+    expect(loadPendingTasks()).toHaveLength(2)
+    for (const relativePath of paths) {
+      expect(findPendingTask(`${relativePath}|4|1234`).relativePath).toBe(relativePath)
+    }
+    removePendingTask(`${paths[0]}|4|1234`)
+    expect(loadPendingTasks().map((task) => task.relativePath)).toEqual([paths[1]])
   })
 
   it('完成任务不落盘，已有记录会被覆盖', () => {

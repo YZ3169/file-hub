@@ -7,6 +7,11 @@ Windows 10/11 x64 用户：在发行版的 **Assets** 中，日常使用选 `Fil
 `Source code` 是源码，不是桌面安装包。已内置 Java 和数据库；独立窗口需要 Microsoft Edge WebView2 Runtime。
 运行新版工作台后，可通过顶部「下载桌面版」进入 `/download.html`，查看最新安装包、大小、发布日期及可用的 SHA-256 校验值。
 工作台中点击文件名可查看完整名称、精确大小与 SHA-256，复制校验值或直接下载；文件列表支持每页显示 10 / 20 / 50 / 100 条。
+工作台支持「选择文件夹」或直接拖入文件夹，递归上传其中的文件，并在队列、文件列表和详情中保留相对路径。
+不同目录的同名文件独立记录，仍可分片、秒传和断点续传；刷新后重新选择原文件夹即可继续。
+空文件可以上传；空目录不创建记录，下载仍按单个文件进行。
+升级已有 MySQL 部署时，先执行 `scripts/migrate-v7-relative-path.sql` 增加路径字段；
+桌面版 H2 会在启动时自动补齐，原有文件记录不受影响。
 
 一个自己实现存储层的文件服务：**分片上传 / 秒传 / 断点续传 / 分片级校验与自动补传**，
 外加一个 Vue 3 + Vite 的可视化传输工作台，以及**按账号隔离的鉴权与限流**。
@@ -449,13 +454,13 @@ KEY idx_share_expires (expires_at)
 
 ```bash
 export MYSQL_PWD=你的口令
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar \
   --server.port=8081 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
   --file-hub.cluster.redis-address=redis://127.0.0.1:6379
 
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar \
   --server.port=8082 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
@@ -538,7 +543,7 @@ docker compose -f docker-compose.cluster.yml up --build
 
 ### 安装与使用
 
-1. 运行 `FileHub-1.0.4.msi`（构建产物在 `build/desktop/dist/`）。
+1. 运行 `FileHub-1.0.5.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
    选择的目录是**上级目录**，安装程序会自动在其中创建 `FileHub` 子文件夹
    （例如选 `D:\` 会装到 `D:\FileHub`），不需要手动新建文件夹；
@@ -591,7 +596,7 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
-#   build/desktop/dist/FileHub-1.0.4.msi           安装包
+#   build/desktop/dist/FileHub-1.0.5.msi           安装包
 ```
 
 安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
@@ -608,8 +613,8 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 把 `pom.xml` 的版本号和标签对齐后推 tag：
 
 ```bash
-git tag v1.0.4
-git push origin v1.0.4
+git tag v1.0.5
+git push origin v1.0.5
 ```
 
 `.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
@@ -683,6 +688,8 @@ mysql -uroot -p < scripts/migrate-v4-auth.sql
 mysql -uroot -p < scripts/migrate-v5-fulltext.sql
 #    已经跑过 v5 的库，补提取码分享表（只建新表，同样幂等）：
 mysql -uroot -p < scripts/migrate-v6-share.sql
+#    文件夹上传需要相对路径列（同样幂等；桌面版 H2 启动时自动补齐）：
+mysql -uroot -p < scripts/migrate-v7-relative-path.sql
 
 # 2. 数据库口令走环境变量，不落盘（application.yml 里写的是 ${MYSQL_PWD}）
 export MYSQL_PWD=你的口令
@@ -691,7 +698,7 @@ export MYSQL_PWD=你的口令
 mvn clean package -DskipTests
 # 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
 export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.4.jar
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar
 # → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
 # → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
 ```
@@ -891,7 +898,8 @@ Phase 3 的运维端点在同一个实例上手工验证过（2026-11-18），�
   每次重新选择文件都需要核对完整 SHA-256，同名、同大小、同修改时间不能证明内容相同；
   同一任务暂停后继续可复用本次已核对的摘要。持久化摘要只用于关联断点记录，不能直接用于秒传。
 - **刷新页面不会自动续传**：浏览器拿不到刷新前的 `File` 对象，需要用户重新选择同名、同大小、
-  同修改时间的文件。前端用指纹（name + size + lastModified）查找本地断点记录，重新核对内容摘要后，
+  同修改时间的文件；文件夹上传需重新选择原文件夹并保持相对路径不变。前端用指纹
+  （relativePath 或 name + size + lastModified）查找本地断点记录，重新核对内容摘要后，
   按服务端返回的分片状态续传，已上传的有效分片无需重传。
 - **多实例依赖共享目录和 Redis**：共享目录必须支持原子 rename、mtime 一致（NFS/SMB 的语义
   要在目标环境实测）；Redis 目前是单点，没有做 Sentinel/Cluster 高可用。Redis 不可用时上传和

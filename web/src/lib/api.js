@@ -1,11 +1,15 @@
 import { clearSession, getToken } from './auth'
 
 export class ApiError extends Error {
-  constructor(code, message, status = 0) {
+  constructor(code, message, status = 0, retryAfterMs = 0) {
     super(message)
     this.name = 'ApiError'
     this.code = code
     this.status = status
+    // setTimeout 超过有符号 32 位整数会溢出成近乎立即重试。
+    this.retryAfterMs = Number.isFinite(retryAfterMs)
+      ? Math.min(Math.max(0, retryAfterMs), 2_147_483_647)
+      : 0
   }
 
   /** 哪些错误值得重试：网络/5xx/超时/分片校验失败/存储瞬时失败 */
@@ -18,6 +22,14 @@ export class ApiError extends Error {
 const DEFAULT_TIMEOUT = 30_000
 const UPLOAD_TIMEOUT = 120_000
 const MERGE_TIMEOUT = 600_000
+
+function parseRetryAfter(value) {
+  const text = value?.trim()
+  if (!text) return 0
+  if (/^\d+$/.test(text)) return Number(text) * 1000
+  // HTTP 日期包含月份名称；不要把负数、小数等无效秒数当作日期。
+  return /[a-z]/i.test(text) ? Date.parse(text) - Date.now() : 0
+}
 
 /**
  * 把「用户主动取消」和「超时」两个 signal 合到一起。
@@ -83,13 +95,19 @@ async function request(path, options = {}) {
   let res
   try {
     res = await fetch(path, { ...rest, headers, signal: combined.signal })
+    const retryAfterMs = parseRetryAfter(res.headers?.get('Retry-After'))
     const text = await res.text()
     let body = null
     if (text) {
       try {
         body = JSON.parse(text)
       } catch {
-        throw new ApiError(50000, `服务端返回了非 JSON 响应（HTTP ${res.status}）`, res.status)
+        throw new ApiError(
+          50000,
+          `服务端返回了非 JSON 响应（HTTP ${res.status}）`,
+          res.status,
+          retryAfterMs,
+        )
       }
     }
 
@@ -104,6 +122,7 @@ async function request(path, options = {}) {
         body?.code ?? res.status,
         body?.msg ?? `请求失败（HTTP ${res.status}）`,
         res.status,
+        retryAfterMs,
       )
     }
     if (!body || body.code === undefined) {

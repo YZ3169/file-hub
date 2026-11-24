@@ -10,11 +10,12 @@ import {
 } from './api'
 import { auth, clearSession, getToken, onUnauthorized, setSession } from './auth'
 
-function response(body, status = 200) {
+function response(body, status = 200, headers = {}) {
   const text = typeof body === 'string' ? body : JSON.stringify(body)
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: new Headers(headers),
     text: () => Promise.resolve(text),
   }
 }
@@ -127,6 +128,44 @@ describe('api request', () => {
 
     expect(error.status).toBe(429)
     expect(error.retriable).toBe(true)
+  })
+
+  it.each([
+    ['17', 17_000],
+    ['0', 0],
+    ['-1', 0],
+    ['1.5', 0],
+    ['not-a-date', 0],
+    ['Infinity', 0],
+    ['2147484', 2_147_483_647],
+  ])('解析 Retry-After=%s，避免无效值和定时器溢出', async (value, expected) => {
+    fetchMock.mockResolvedValue(
+      response({ code: 40002, msg: '请求过于频繁' }, 429, { 'Retry-After': value }),
+    )
+    const error = await listFiles().catch((e) => e)
+    expect(error.retryAfterMs).toBe(expected)
+  })
+
+  it('支持 HTTP 日期格式的 Retry-After，过期日期不产生负延迟', async () => {
+    const now = Date.parse('2026-11-24T00:00:00Z')
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    fetchMock.mockResolvedValue(
+      response({ code: 40002, msg: '请求过于频繁' }, 429, {
+        'Retry-After': new Date(now + 30_000).toUTCString(),
+      }),
+    )
+    await expect(listFiles()).rejects.toMatchObject({ retryAfterMs: 30_000 })
+    fetchMock.mockResolvedValue(
+      response({ code: 40002, msg: '请求过于频繁' }, 429, {
+        'Retry-After': new Date(now - 30_000).toUTCString(),
+      }),
+    )
+    await expect(listFiles()).rejects.toMatchObject({ retryAfterMs: 0 })
+  })
+
+  it('网关返回非 JSON 的 429 时仍保留 Retry-After', async () => {
+    fetchMock.mockResolvedValue(response('Too many requests', 429, { 'Retry-After': '60' }))
+    await expect(listFiles()).rejects.toMatchObject({ status: 429, retryAfterMs: 60_000 })
   })
 
   it('非 JSON 响应给出明确错误', async () => {

@@ -29,7 +29,7 @@ test('初始化上传挂起时退出并换账号，新账号可以独立上传',
   const newName = `new-user-${Date.now()}.txt`
   try {
     await page
-      .locator('input[type="file"]')
+      .locator('input[type="file"]:not([webkitdirectory])')
       .setInputFiles({ name: oldName, mimeType: 'text/plain', buffer: Buffer.from('account A') })
     await started
     await page.getByTestId('logout-button').click()
@@ -39,7 +39,7 @@ test('初始化上传挂起时退出并换账号，新账号可以独立上传',
     await page.getByTestId('auth-submit').click()
     await expect(page.getByTestId('user-menu')).toContainText(b.username)
     await page
-      .locator('input[type="file"]')
+      .locator('input[type="file"]:not([webkitdirectory])')
       .setInputFiles({ name: newName, mimeType: 'text/plain', buffer: Buffer.from('account B') })
     await expect(page.locator('tbody tr').filter({ hasText: newName })).toBeVisible()
     release()

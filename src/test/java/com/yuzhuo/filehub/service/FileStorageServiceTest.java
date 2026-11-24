@@ -6,6 +6,7 @@ import com.yuzhuo.filehub.common.FileLockRegistry;
 import com.yuzhuo.filehub.config.StorageProperties;
 import com.yuzhuo.filehub.dto.CheckResponse;
 import com.yuzhuo.filehub.dto.FileVO;
+import com.yuzhuo.filehub.dto.InitUploadRequest;
 import com.yuzhuo.filehub.entity.FileChunk;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.mapper.FileChunkMapper;
@@ -18,6 +19,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -44,6 +48,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -287,6 +292,70 @@ class FileStorageServiceTest {
         verify(storage, never()).deleteChunks(ID);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"/folder/hello.bin", "../hello.bin", "folder/../hello.bin",
+            "folder/./hello.bin", "folder//hello.bin", "folder/hello.bin/", "folder/other.bin",
+            "C:/folder/hello.bin", "C:\\folder\\hello.bin", "folder/\u0000hello.bin",
+            "folder/\nhello.bin"})
+    @DisplayName("文件夹路径拒绝绝对路径、目录穿越、控制字符和文件名不匹配")
+    void rejectsInvalidRelativePaths(String relativePath) {
+        BizException ex = assertThrows(BizException.class, () -> service.init(
+                new InitUploadRequest("hello.bin", 5L, "a".repeat(64), relativePath), USER));
+
+        assertEquals(10001, ex.getCode());
+        verifyNoInteractions(fileInfoMapper, fileChunkMapper, storage);
+    }
+
+    @Test
+    @DisplayName("文件夹相对路径最多 4096 字符，拒绝过长路径")
+    void rejectsOverlongRelativePath() {
+        BizException ex = assertThrows(BizException.class, () -> service.init(
+                new InitUploadRequest("hello.bin", 5L, "a".repeat(64),
+                        "dir/".repeat(1024) + "hello.bin"), USER));
+
+        assertEquals(10001, ex.getCode());
+        verifyNoInteractions(fileInfoMapper, fileChunkMapper, storage);
+    }
+
+    @Test
+    @DisplayName("即使数据库忽略大小写，续传也必须精确匹配相对路径和文件名")
+    void resumeUsesExactPathAndFileNameEvenWithCaseInsensitiveDatabase() {
+        FileInfo wrongCasePath = uploadingInfo();
+        wrongCasePath.setRelativePath("Folder/hello.bin");
+        FileInfo wrongCaseName = uploadingInfo();
+        wrongCaseName.setFileName("HELLO.bin");
+        wrongCaseName.setRelativePath("folder/hello.bin");
+        FileInfo exact = uploadingInfo();
+        exact.setFileId(OTHER_ID);
+        exact.setRelativePath("folder/hello.bin");
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of(wrongCasePath, wrongCaseName, exact));
+        when(fileInfoMapper.touchUploading(OTHER_ID)).thenReturn(1);
+
+        var resumed = service.init(
+                new InitUploadRequest("hello.bin", 5L, "a".repeat(64), "folder/hello.bin"), USER);
+
+        assertEquals(OTHER_ID, resumed.fileId());
+        verify(fileInfoMapper, never()).touchUploading(ID);
+        verify(fileInfoMapper, never()).insert(any(FileInfo.class));
+    }
+
+    @Test
+    @DisplayName("大小写不同的目录没有精确匹配时新建独立上传记录")
+    void differentCasePathCreatesSeparateUpload() {
+        FileInfo wrongPath = uploadingInfo();
+        wrongPath.setRelativePath("Folder/hello.bin");
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of(wrongPath));
+
+        service.init(new InitUploadRequest("hello.bin", 5L, "a".repeat(64),
+                "folder/hello.bin"), USER);
+
+        ArgumentCaptor<FileInfo> inserted = ArgumentCaptor.forClass(FileInfo.class);
+        verify(fileInfoMapper).insert(inserted.capture());
+        assertEquals("folder/hello.bin", inserted.getValue().getRelativePath());
+        assertEquals("hello.bin", inserted.getValue().getFileName());
+        verify(fileInfoMapper, never()).touchUploading(anyString());
+    }
+
     private static FileInfo doneInfo() {
         FileInfo info = uploadingInfo();
         info.setStatus(FileInfo.STATUS_DONE);
@@ -299,6 +368,7 @@ class FileStorageServiceTest {
         info.setId(1L);
         info.setFileId(ID);
         info.setFileName("hello.bin");
+        info.setRelativePath("");
         info.setFileSize(5L);
         info.setFileHash("a".repeat(64));
         info.setChunkSize(5);

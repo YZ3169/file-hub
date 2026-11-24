@@ -22,6 +22,9 @@ public class FileInfo {
 
     private String fileName;
 
+    /** 用户选择的文件夹内相对路径（含文件名）；普通文件为空，与 storagePath 无关。 */
+    private String relativePath;
+
     private Long fileSize;
 
     /** 全文件 SHA-256（hex 小写） */

@@ -64,6 +64,7 @@ CREATE TABLE `file_info`
     `id`           BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     `file_id`      VARCHAR(64)  NOT NULL COMMENT '对外暴露的文件标识（UUID，不暴露自增 ID）',
     `file_name`    VARCHAR(255) NOT NULL COMMENT '原始文件名（含扩展名）',
+    `relative_path` VARCHAR(4096) NOT NULL DEFAULT '' COMMENT '文件夹上传的相对路径（含文件名），普通文件为空',
     `file_size`    BIGINT       NOT NULL COMMENT '文件总字节数',
     `file_hash`    CHAR(64)     NOT NULL COMMENT '全文件 SHA-256（hex，小写），秒传与完整性校验都靠它',
     `chunk_size`   INT          NOT NULL COMMENT '该次上传约定的分片大小',

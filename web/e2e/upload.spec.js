@@ -11,7 +11,7 @@ test.describe('上传工作台', () => {
 
     const fileName = `pw-upload-${Date.now()}.txt`
     const content = `file-hub playwright upload ${Date.now()}\n`
-    await page.locator('input[type="file"]').setInputFiles({
+    await page.locator('input[type="file"]:not([webkitdirectory])').setInputFiles({
       name: fileName,
       mimeType: 'text/plain',
       buffer: Buffer.from(content),

@@ -43,6 +43,8 @@ import java.util.Comparator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -151,6 +153,69 @@ class DesktopDatabaseIntegrationTest {
         assertNull(removed, "过期上传任务应被删除");
 
         assertNotNull(done.getStoragePath());
+
+        assertFolderUploadFlow(user, loggedIn.token());
+    }
+
+    private void assertFolderUploadFlow(UserPrincipal user, String token) throws Exception {
+        byte[] content = "folder upload 同内容不同目录".getBytes(StandardCharsets.UTF_8);
+        String hash = HashUtil.sha256Hex(content);
+        String longPath = "资料/" + "子目录/".repeat(80) + "same.txt";
+        var firstRequest = new InitUploadRequest("same.txt", (long) content.length, hash, longPath);
+        var first = service.init(firstRequest, user);
+        var other = service.init(new InitUploadRequest("same.txt", (long) content.length, hash,
+                "资料/other/same.txt"), user);
+
+        assertFalse(first.instant());
+        assertFalse(other.instant());
+        assertNotEquals(first.fileId(), other.fileId(), "同内容不同目录必须保留独立逻辑记录");
+        assertEquals(first.fileId(), service.init(firstRequest, user).fileId(), "相同路径重新选择可续传");
+        assertEquals(longPath, service.requireInfo(first.fileId(), user).getRelativePath());
+
+        service.saveChunk(first.fileId(), 0, new ByteArrayInputStream(content), hash, user);
+        var completed = service.complete(first.fileId(), user);
+        assertEquals(longPath, completed.relativePath());
+        assertEquals("same.txt", completed.fileName());
+
+        var instant = service.init(new InitUploadRequest("same.txt", (long) content.length, hash,
+                "资料/third/same.txt"), user);
+        assertTrue(instant.instant());
+        assertNotEquals(first.fileId(), instant.fileId());
+        var instantInfo = service.requireInfo(instant.fileId(), user);
+        assertEquals("资料/third/same.txt", instantInfo.getRelativePath());
+        assertEquals(service.requireInfo(first.fileId(), user).getStoragePath(), instantInfo.getStoragePath());
+        var listed = service.list(1, 100, "same.txt", null, "time_desc", user, null).items();
+        assertTrue(listed.stream().anyMatch(f -> f.fileId().equals(first.fileId())
+                && longPath.equals(f.relativePath())));
+
+        // 下载仍保留叶子文件名，目录元数据不会改变磁盘路径或下载名称。
+        mockMvc.perform(get("/api/file/" + first.fileId() + "/download")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(result -> assertTrue(result.getResponse().getHeader("Content-Disposition")
+                        .contains("filename*=UTF-8''same.txt")));
+
+        // HTTP 反序列化允许不传 relativePath，旧客户端仍可上传普通文件。
+        mockMvc.perform(post("/api/file/init")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"fileName\":\"ordinary.txt\",\"fileSize\":" + content.length
+                                + ",\"fileHash\":\"" + hash + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+
+        mockMvc.perform(post("/api/file/init")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"fileName\":\"same.txt\",\"fileSize\":" + content.length
+                                + ",\"fileHash\":\"" + hash + "\",\"relativePath\":\"../same.txt\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(10001));
+
+        var empty = service.init(new InitUploadRequest("empty.txt", 0L,
+                HashUtil.sha256Hex(new byte[0]), "资料/empty.txt"), user);
+        assertEquals("资料/empty.txt", service.complete(empty.fileId(), user).relativePath());
+        service.delete(other.fileId(), user);
     }
 
     @Test

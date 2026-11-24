@@ -208,12 +208,15 @@ function preparingDownload(fileId) {
                   <button
                     class="file-title"
                     type="button"
-                    :title="file.fileName"
-                    :aria-label="`查看 ${file.fileName} 的详情`"
+                    :title="file.relativePath || file.fileName"
+                    :aria-label="`查看 ${file.relativePath || file.fileName} 的详情`"
                     @click="detailsFile = file"
                   >
                     {{ file.fileName }}
                   </button>
+                  <span v-if="file.relativePath" class="file-path" :title="file.relativePath">
+                    {{ file.relativePath }}
+                  </span>
                   <span :title="file.fileHash">{{ shortHash(file.fileHash) }}</span>
                 </div>
               </div>
@@ -233,7 +236,7 @@ function preparingDownload(fileId) {
                   class="btn btn-primary btn-sm download-button"
                   type="button"
                   :disabled="preparingDownload(file.fileId)"
-                  :aria-label="`下载 ${file.fileName}`"
+                  :aria-label="`下载 ${file.relativePath || file.fileName}`"
                   @click="downloadFile(file)"
                 >
                   <BaseIcon name="download" :size="16" />
@@ -245,7 +248,7 @@ function preparingDownload(fileId) {
                   class="icon-link"
                   type="button"
                   title="分享（链接 + 提取码）"
-                  :aria-label="`分享 ${file.fileName}`"
+                  :aria-label="`分享 ${file.relativePath || file.fileName}`"
                   data-testid="share-file-button"
                   @click="shareFile = file"
                 >
@@ -255,7 +258,7 @@ function preparingDownload(fileId) {
                   class="icon-link danger"
                   type="button"
                   title="删除"
-                  :aria-label="`删除 ${file.fileName}`"
+                  :aria-label="`删除 ${file.relativePath || file.fileName}`"
                   @click="deleteServerFile(file)"
                 >
                   <BaseIcon name="trash" :size="15" />
@@ -549,6 +552,14 @@ tbody tr:hover {
   margin-top: 2px;
 }
 
+.file-name .file-path {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: inherit;
+}
+
 .num,
 .time {
   white-space: nowrap;
@@ -789,7 +800,8 @@ tbody tr:hover {
     padding-left: 12px;
     padding-right: 12px;
   }
-  .file-title {
+  .file-title,
+  .file-name .file-path {
     max-width: 200px;
   }
 }
@@ -862,6 +874,11 @@ tbody tr:hover {
   .file-name span {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .file-name .file-path {
+    max-width: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .num::before {
     content: attr(data-label);

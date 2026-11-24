@@ -11,13 +11,14 @@ import java.time.LocalDateTime;
 public record FileVO(
         String fileId,
         String fileName,
+        String relativePath,
         long fileSize,
         String fileHash,
         int status,
         LocalDateTime createTime
 ) {
     public static FileVO from(FileInfo f) {
-        return new FileVO(f.getFileId(), f.getFileName(), f.getFileSize(),
+        return new FileVO(f.getFileId(), f.getFileName(), f.getRelativePath(), f.getFileSize(),
                 f.getFileHash(), f.getStatus(), f.getCreateTime());
     }
 }
