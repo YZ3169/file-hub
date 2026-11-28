@@ -13,7 +13,7 @@ test.describe('v8 增强工作台端到端', () => {
     await gotoWorkspace(page)
 
     const fileName = `pw-v8-${Date.now()}.txt`
-    const content = 'line-alpha\nline-beta\n'
+    const content = `line-alpha\nline-beta\n${Date.now()}\n`
     await page.locator('input[type="file"]:not([webkitdirectory])').setInputFiles({
       name: fileName,
       mimeType: 'text/plain',
@@ -96,7 +96,7 @@ test.describe('v8 增强工作台端到端', () => {
     await page.getByTestId('account-button').click()
     const accountDialog = page.getByTestId('account-dialog')
     await expect(accountDialog).toBeVisible()
-    await expect(accountDialog).toContainText('/dav/')
+    await expect(accountDialog.locator('.dav-row input')).toHaveValue(/\/dav\/$/)
     await accountDialog.getByLabel('关闭账号设置').click()
   })
 })

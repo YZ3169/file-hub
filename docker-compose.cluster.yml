@@ -93,7 +93,7 @@ services:
       - "8082:8081"
 
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     profiles: ["s3"]
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
