@@ -7,7 +7,9 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -22,8 +24,21 @@ namespace FileHubShell
         private static Mutex instanceMutex;
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            bool startMinimized = false;
+            if (args != null)
+            {
+                foreach (string arg in args)
+                {
+                    if (string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase))
+                    {
+                        startMinimized = true;
+                        break;
+                    }
+                }
+            }
+
             bool createdNew;
             instanceMutex = new Mutex(true, "Local\\FileHubShell_SingleInstance", out createdNew);
             if (!createdNew)
@@ -43,7 +58,7 @@ namespace FileHubShell
             {
                 MainForm.Log("unhandled exception: " + e.ExceptionObject);
             };
-            Application.Run(new MainForm());
+            Application.Run(new MainForm(startMinimized));
             GC.KeepAlive(instanceMutex);
         }
 
@@ -77,9 +92,11 @@ namespace FileHubShell
         private bool exiting;
         private bool webReady;
         private string dataDir;
+        private readonly bool startMinimized;
 
-        public MainForm()
+        public MainForm(bool startMinimized)
         {
+            this.startMinimized = startMinimized;
             Text = Program.WindowTitle;
             StartPosition = FormStartPosition.CenterScreen;
 
@@ -89,6 +106,11 @@ namespace FileHubShell
             MinimumSize = new Size(900, 600);
             BackColor = Color.FromArgb(23, 23, 31);
             Icon = LoadAppIcon();
+            if (startMinimized)
+            {
+                Opacity = 0;
+                ShowInTaskbar = false;
+            }
 
             loadingLabel = new Label();
             loadingLabel.Text = ShellUi.T("正在启动 FileHub...", "Starting FileHub...");
@@ -142,16 +164,106 @@ namespace FileHubShell
             menu.Font = ShellUi.Font(9F);
             menu.Items.Add(ShellUi.T("打开 FileHub", "Open FileHub"), null,
                     delegate { RestoreFromTray(); });
+            menu.Items.Add(ShellUi.T("复制访问地址", "Copy URL"), null,
+                    delegate { CopyAppUrl(); });
             menu.Items.Add(ShellUi.T("打开数据目录", "Open data folder"), null,
                     delegate { OpenDataDir(); });
+
+            ToolStripMenuItem autoStartItem = new ToolStripMenuItem(
+                    ShellUi.T("开机自启动", "Start on login"));
+            autoStartItem.Checked = IsAutoStartEnabled();
+            autoStartItem.Click += delegate
+            {
+                bool next = !autoStartItem.Checked;
+                if (SetAutoStart(next))
+                {
+                    autoStartItem.Checked = IsAutoStartEnabled();
+                }
+            };
+            menu.Items.Add(autoStartItem);
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(ShellUi.T("退出", "Exit"), null, delegate { ExitApplication(); });
             trayIcon.ContextMenuStrip = menu;
             trayIcon.DoubleClick += delegate { RestoreFromTray(); };
         }
 
+        private const string AutoStartRegPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AutoStartValueName = "FileHub";
+
+        private void CopyAppUrl()
+        {
+            try
+            {
+                Clipboard.SetText(Program.AppUrl);
+                if (trayIcon != null)
+                {
+                    trayIcon.ShowBalloonTip(
+                            2000,
+                            Program.WindowTitle,
+                            ShellUi.T("已复制访问地址：", "Copied URL: ") + Program.AppUrl,
+                            ToolTipIcon.Info);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("copy url failed: " + ex.Message);
+            }
+        }
+
+        private static bool IsAutoStartEnabled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(AutoStartRegPath, false))
+                {
+                    object val = key != null ? key.GetValue(AutoStartValueName) : null;
+                    return val != null && !string.IsNullOrEmpty(val.ToString());
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool SetAutoStart(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(AutoStartRegPath, true))
+                {
+                    if (key == null)
+                    {
+                        return false;
+                    }
+                    if (enable)
+                    {
+                        key.SetValue(AutoStartValueName,
+                                "\"" + Application.ExecutablePath + "\" --minimized");
+                    }
+                    else
+                    {
+                        key.DeleteValue(AutoStartValueName, false);
+                    }
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("toggle autostart failed: " + ex.Message);
+                return false;
+            }
+        }
+
         private async void OnShown(object sender, EventArgs e)
         {
+            if (startMinimized)
+            {
+                Hide();
+                ShowInTaskbar = false;
+                Opacity = 1;
+            }
             try
             {
                 Log("shell starting, url=" + Program.AppUrl);
@@ -212,10 +324,73 @@ namespace FileHubShell
             core.Settings.IsStatusBarEnabled = false;
             core.Settings.AreDefaultContextMenusEnabled = true;
             core.Settings.IsZoomControlEnabled = true;
+            core.Settings.IsWebMessageEnabled = true;
 
             core.NavigationStarting += OnNavigationStarting;
             core.NewWindowRequested += OnNewWindowRequested;
+            core.WebMessageReceived += OnWebMessageReceived;
             core.Navigate(Program.AppUrl);
+        }
+
+        private void OnWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            string msg = e.WebMessageAsJson;
+            if (msg == null || !msg.Contains("\"pickFolder\""))
+            {
+                return;
+            }
+            BeginInvoke(new MethodInvoker(delegate
+            {
+                using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+                {
+                    dlg.Description = ShellUi.T(
+                            "选择要自动备份同步到 FileHub 的本地目录",
+                            "Select a local folder to sync with FileHub");
+                    dlg.ShowNewFolderButton = true;
+                    if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
+                    {
+                        if (webView != null && webView.CoreWebView2 != null)
+                        {
+                            string payload = "{\"type\":\"pickedFolder\",\"path\":"
+                                    + EscapeJsonString(dlg.SelectedPath) + "}";
+                            webView.CoreWebView2.PostWebMessageAsJson(payload);
+                        }
+                    }
+                }
+            }));
+        }
+
+        private static string EscapeJsonString(string value)
+        {
+            if (value == null)
+            {
+                return "null";
+            }
+            StringBuilder sb = new StringBuilder(value.Length + 8);
+            sb.Append('"');
+            foreach (char ch in value)
+            {
+                switch (ch)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (ch < 0x20)
+                        {
+                            sb.AppendFormat("\\u{0:X4}", (int)ch);
+                        }
+                        else
+                        {
+                            sb.Append(ch);
+                        }
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
         }
 
         private void OnNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
@@ -420,6 +595,8 @@ namespace FileHubShell
 
         private void RestoreFromTray()
         {
+            Opacity = 1;
+            ShowInTaskbar = true;
             Show();
             if (WindowState == FormWindowState.Minimized)
             {
@@ -522,6 +699,7 @@ namespace FileHubShell
             {
                 return;
             }
+            RestoreFromTray();
             string logPath = Path.Combine(dataDir != null ? dataDir : GetDataDir(), "logs", "filehub.log");
             Log("startup error: " + detail);
             MessageBox.Show(this,

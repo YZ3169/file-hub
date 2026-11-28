@@ -36,4 +36,10 @@ public class RateLimitProperties {
      * 否则客户端可以伪造该头绕过按 IP 的登录限流。
      */
     private boolean trustForwardedHeaders = false;
+
+    /** WebDAV 请求上限（单用户每分钟） */
+    private int webdavPerMinute = 300;
+
+    /** WebDAV Basic/Bearer 鉴权失败上限（按 IP 每分钟，防暴力破解） */
+    private int webdavAuthFailPerMinute = 10;
 }

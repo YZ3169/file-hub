@@ -12,11 +12,21 @@ vi.mock('../lib/api', () => {
     ApiError,
     getPublicConfig: vi.fn(),
     getPublicShareMeta: vi.fn(),
+    saveShareToMySpace: vi.fn(),
     verifyShareCode: vi.fn(),
+    createDownloadTicket: vi.fn(),
+    fetchTextPreview: vi.fn(),
   }
 })
 
-import { ApiError, getPublicConfig, getPublicShareMeta, verifyShareCode } from '../lib/api'
+import {
+  ApiError,
+  getPublicConfig,
+  getPublicShareMeta,
+  saveShareToMySpace,
+  verifyShareCode,
+} from '../lib/api'
+import { auth } from '../lib/auth'
 import ShareView from './ShareView.vue'
 
 const TOKEN = 'A'.repeat(43)
@@ -51,6 +61,7 @@ async function verifyFile(overrides = {}) {
 describe('ShareView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    auth.token = null
     getPublicConfig.mockResolvedValue({ desktop: false, chunkSize: 1024 })
     getPublicShareMeta.mockResolvedValue({ state: 'ACTIVE', expiresAt: null, locked: false })
   })
@@ -213,5 +224,45 @@ describe('ShareView', () => {
     expect(wrapper.find('.download-feedback').text()).toContain('已请求下载')
     expect(wrapper.find('.download-feedback').text()).not.toContain('下载完成')
     expect(wrapper.find('[data-testid="share-download"]').text()).toBe('再次下载')
+  })
+
+  it('免提取码公开分享无需输入提取码即可直接提取，支持预览和登录后转存网盘', async () => {
+    auth.token = 'logged-in'
+    getPublicShareMeta.mockResolvedValue({
+      state: 'ACTIVE',
+      requireCode: false,
+      maxDownloads: 5,
+      downloadCount: 1,
+      locked: false,
+    })
+    verifyShareCode.mockResolvedValue({
+      fileId: 'f-1',
+      fileName: 'notes.txt',
+      fileSize: 512,
+      downloadUrl: '/api/file/f-1/download?ticket=tk-99',
+      ticketExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    saveShareToMySpace.mockResolvedValue({ fileId: 'f-copy', relativePath: 'notes.txt' })
+
+    const wrapper = mount(ShareView, {
+      props: { token: TOKEN },
+      global: { stubs: { FilePreviewDialog: { template: '<div data-testid="preview-stub" />' } } },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="share-code-input"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="share-open-hint"]').exists()).toBe(true)
+
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+    expect(verifyShareCode).toHaveBeenCalledWith(TOKEN, '')
+
+    await wrapper.find('[data-testid="share-preview"]').trigger('click')
+    expect(wrapper.find('[data-testid="preview-stub"]').exists()).toBe(true)
+
+    await wrapper.find('[data-testid="share-save"]').trigger('click')
+    await flushPromises()
+    expect(saveShareToMySpace).toHaveBeenCalledWith(TOKEN, { code: null, ticket: 'tk-99' })
+    expect(wrapper.find('[data-testid="share-saved"]').text()).toContain('notes.txt')
   })
 })

@@ -170,6 +170,13 @@ export const me = () => request('/api/auth/me')
 
 export const logout = () => request('/api/auth/logout', { method: 'POST' })
 
+export const changePassword = (currentPassword, newPassword) =>
+  request('/api/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword, newPassword }),
+  })
+
 // ---- 文件 ----
 
 export const getConfig = () => request('/api/file/config')
@@ -218,6 +225,7 @@ export const listFiles = ({
   size = 10,
   keyword = '',
   status = null,
+  category = '',
   sort = 'time_desc',
   scope = null,
   signal,
@@ -225,6 +233,7 @@ export const listFiles = ({
   const qs = new URLSearchParams({ page: String(page), size: String(size), sort })
   if (keyword) qs.set('keyword', keyword)
   if (status !== null && status !== undefined && status !== '') qs.set('status', String(status))
+  if (category) qs.set('category', category)
   if (scope) qs.set('scope', scope)
   return request(`/api/file/list?${qs.toString()}`, { signal })
 }
@@ -235,6 +244,100 @@ export const getStats = (scope = null) =>
 export const deleteFile = (fileId) =>
   request(`/api/file/${encodeURIComponent(fileId)}`, { method: 'DELETE', timeout: 60_000 })
 
+export const trashFile = (fileId) =>
+  request(`/api/file/${encodeURIComponent(fileId)}/trash`, { method: 'POST', timeout: 60_000 })
+
+export const restoreFile = (fileId) =>
+  request(`/api/file/${encodeURIComponent(fileId)}/restore`, { method: 'POST', timeout: 60_000 })
+
+export const listTrash = ({ page = 1, size = 20 } = {}) =>
+  request(`/api/file/trash?page=${page}&size=${size}`)
+
+export const emptyTrash = () => request('/api/file/trash', { method: 'DELETE', timeout: 60_000 })
+
+// ---- 目录树与批量操作 ----
+
+export const getFolderTree = ({
+  dir = '',
+  keyword = '',
+  category = '',
+  sort = 'time_desc',
+  scope = null,
+  signal,
+} = {}) => {
+  const qs = new URLSearchParams({ dir, sort })
+  if (keyword) qs.set('keyword', keyword)
+  if (category) qs.set('category', category)
+  if (scope) qs.set('scope', scope)
+  return request(`/api/file/tree?${qs.toString()}`, { signal })
+}
+
+export const createFolder = (path) =>
+  request('/api/file/folder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+
+export const moveFile = (fileId, targetDir, newName = null) =>
+  request(`/api/file/${encodeURIComponent(fileId)}/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ targetDir, ...(newName ? { newName } : {}) }),
+  })
+
+export const moveFolder = (sourcePath, targetPath) =>
+  request('/api/file/folder/move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourcePath, targetPath }),
+  })
+
+export const trashFolder = (folderPath) =>
+  request('/api/file/folder/trash', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folderPath }),
+  })
+
+export const batchMove = (fileIds, targetDir) =>
+  request('/api/file/batch/move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileIds, targetDir }),
+  })
+
+export const batchTrash = (fileIds) =>
+  request('/api/file/batch/trash', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileIds }),
+  })
+
+export const batchRestore = (fileIds) =>
+  request('/api/file/batch/restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileIds }),
+  })
+
+export const batchDelete = (fileIds) =>
+  request('/api/file/batch/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileIds }),
+  })
+
+export const createZipTicket = ({ fileIds = null, folderPath = null } = {}) =>
+  request('/api/file/zip-ticket', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...(fileIds ? { fileIds } : {}),
+      ...(folderPath !== null ? { folderPath } : {}),
+    }),
+  })
+
 /**
  * 浏览器下载票据。Bearer Token 无法附加到 <a href>，先换一张 5 分钟的
  * 短期票据，再把返回的 url 交给浏览器。
@@ -242,13 +345,42 @@ export const deleteFile = (fileId) =>
 export const createDownloadTicket = (fileId) =>
   request(`/api/file/${encodeURIComponent(fileId)}/download-ticket`)
 
+/** 抓取文本预览切片（最多 2MB，避免大日志文件把浏览器内存撑爆） */
+export async function fetchTextPreview(url, maxBytes = 2 * 1024 * 1024) {
+  const res = await fetch(url, {
+    headers: { Range: `bytes=0-${maxBytes - 1}` },
+  })
+  if (!res.ok && res.status !== 206) {
+    throw new Error(`加载预览内容失败（HTTP ${res.status}）`)
+  }
+  const text = await res.text()
+  const contentRange = res.headers?.get('Content-Range') || ''
+  const totalMatch = /\/(\d+)$/.exec(contentRange)
+  const totalSize = totalMatch ? Number(totalMatch[1]) : text.length
+  return { text, truncated: res.status === 206 && totalSize > maxBytes, totalSize }
+}
+
 // ---- 提取码分享（管理端，需登录）----
 
-export const createShare = (fileId, expiresInDays = 7) =>
+export const createShare = (fileId, expiresInDays = 7, options = {}) =>
   request('/api/share', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fileId, expiresInDays }),
+    body: JSON.stringify({
+      fileId,
+      expiresInDays,
+      ...(options.requireCode !== undefined ? { requireCode: options.requireCode } : {}),
+      ...(options.maxDownloads !== undefined && options.maxDownloads !== null
+        ? { maxDownloads: options.maxDownloads }
+        : {}),
+    }),
+  })
+
+export const saveShareToMySpace = (token, { code = null, ticket = null } = {}) =>
+  request(`/api/share/${encodeURIComponent(token)}/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...(code ? { code } : {}), ...(ticket ? { ticket } : {}) }),
   })
 
 export const listShares = ({ page = 1, size = 20 } = {}) =>
@@ -294,3 +426,53 @@ export const repairIntegrity = (fileIds) =>
     body: JSON.stringify({ fileIds }),
     timeout: 600_000,
   })
+
+// ---- 审计日志 & 管理员用户配额 ----
+
+export const listAuditLogs = ({ page = 1, size = 20, action = '', scope = '' } = {}) => {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) })
+  if (action) qs.set('action', action)
+  if (scope) qs.set('scope', scope)
+  return request(`/api/audit/logs?${qs.toString()}`)
+}
+
+export const listAdminUsers = ({ page = 1, size = 20 } = {}) =>
+  request(`/api/admin/users?page=${page}&size=${size}`)
+
+export const updateUserQuota = (userId, quotaBytes) =>
+  request(`/api/admin/users/${encodeURIComponent(userId)}/quota`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quotaBytes }),
+  })
+
+export const updateUserStatus = (userId, enabled) =>
+  request(`/api/admin/users/${encodeURIComponent(userId)}/status`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+
+// ---- 桌面端本地目录同步 ----
+
+export const listDesktopSync = () => request('/api/desktop/sync')
+
+export const addDesktopSync = (localDir, targetDir) =>
+  request('/api/desktop/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localDir, targetDir }),
+  })
+
+export const toggleDesktopSync = (id, enabled) =>
+  request(`/api/desktop/sync/${encodeURIComponent(id)}/toggle`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+
+export const runDesktopSync = (id) =>
+  request(`/api/desktop/sync/${encodeURIComponent(id)}/run`, { method: 'POST', timeout: 600_000 })
+
+export const deleteDesktopSync = (id) =>
+  request(`/api/desktop/sync/${encodeURIComponent(id)}`, { method: 'DELETE' })

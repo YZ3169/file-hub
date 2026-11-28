@@ -39,9 +39,9 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
 
     /**
      * 数一下还有几行逻辑文件引用同一个物理文件——秒传会让多行共享一个 storage_path，
-     * 只有引用数为 1 时才能真删磁盘文件。
+     * 只有引用数为 1 时才能真删磁盘文件。回收站（status = 2）仍保留物理引用以便恢复。
      */
-    @Select("SELECT COUNT(*) FROM file_info WHERE storage_path = #{path} AND status = 1")
+    @Select("SELECT COUNT(*) FROM file_info WHERE storage_path = #{path} AND status IN (1, 2)")
     int countByStoragePath(String path);
 
     /**
@@ -81,10 +81,36 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
     @Select("SELECT file_id FROM file_info WHERE status = 0")
     List<String> findUploadingFileIds();
 
-    /** 所有被引用的物理文件路径，用于判断 files/ 下哪些成品是孤儿 */
+    /** 所有被引用的物理文件路径，用于判断 files/ 下哪些成品是孤儿（含回收站） */
     @Select("SELECT DISTINCT storage_path FROM file_info "
-            + "WHERE status = 1 AND storage_path IS NOT NULL")
+            + "WHERE status IN (1, 2) AND storage_path IS NOT NULL")
     List<String> findAllStoragePaths();
+
+    /** 回收站：到期自动彻底清理 */
+    @Select("SELECT * FROM file_info WHERE status = 2 AND deleted_at < #{cutoff} ORDER BY id LIMIT 200")
+    List<FileInfo> findExpiredTrash(@Param("cutoff") LocalDateTime cutoff);
+
+    @Update("DELETE FROM file_info WHERE id = #{id} AND status = 2 AND deleted_at < #{cutoff}")
+    int deleteExpiredTrashById(@Param("id") Long id, @Param("cutoff") LocalDateTime cutoff);
+
+    @Update("UPDATE file_info SET status = 2, deleted_at = #{now}, update_time = #{now} "
+            + "WHERE id = #{id} AND status = 1")
+    int moveToTrash(@Param("id") Long id, @Param("now") LocalDateTime now);
+
+    @Update("UPDATE file_info SET status = 1, deleted_at = NULL, update_time = #{now} "
+            + "WHERE id = #{id} AND status = 2")
+    int restoreFromTrash(@Param("id") Long id, @Param("now") LocalDateTime now);
+
+    /** 配额统计：包含上传中、已完成及回收站占用，防止并发上传或删后传绕过配额 */
+    @Select("SELECT COALESCE(SUM(file_size), 0) FROM file_info "
+            + "WHERE owner_id = #{ownerId} AND status IN (0, 1, 2)")
+    long sumQuotaUsedByOwner(@Param("ownerId") Long ownerId);
+
+    /** 列出某个用户的全部已完成文件，供目录视图及 WebDAV 使用 */
+    @Select("<script>SELECT * FROM file_info WHERE status = 1 AND (owner_id = #{ownerId}"
+            + "<if test='includeLegacy'> OR owner_id IS NULL</if>) ORDER BY id DESC</script>")
+    List<FileInfo> listDoneByOwner(@Param("ownerId") Long ownerId,
+                                   @Param("includeLegacy") boolean includeLegacy);
 
     @Select("SELECT COUNT(*) FROM file_info WHERE status = 1")
     long countDone();

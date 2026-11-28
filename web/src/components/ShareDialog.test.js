@@ -118,4 +118,19 @@ describe('ShareDialog', () => {
 
     expect(wrapper.find('[role="alert"]').text()).toContain('文件已失效')
   })
+
+  it('支持关闭提取码与设置最大下载次数上限', async () => {
+    createShare.mockResolvedValue(created({ requireCode: false, code: null, maxDownloads: 3 }))
+    const wrapper = mountDialog()
+
+    await wrapper.find('[data-testid="share-require-code"]').setValue(false)
+    await wrapper.find('[data-testid="share-max-downloads"]').setValue('3')
+    await wrapper.find('[data-testid="share-create"]').trigger('click')
+    await flushPromises()
+
+    expect(createShare).toHaveBeenCalledWith('f-1', 7, { requireCode: false, maxDownloads: 3 })
+    expect(wrapper.find('[data-testid="share-no-code"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="share-code"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('最多下载 3 次')
+  })
 })

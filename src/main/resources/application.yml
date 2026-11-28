@@ -41,10 +41,32 @@ file-hub:
   # 定时回收废弃任务 / 残留临时文件的间隔
   cleanup-interval-ms: 600000
   cleanup-initial-delay-ms: 60000
+  # 单次流式上传（WebDAV PUT / 桌面目录同步）大小上限，默认 2GB
+  max-stream-upload-bytes: ${FILE_HUB_MAX_STREAM_BYTES:2147483648}
 
   # 关键词搜索实现。MySQL 8 用 ngram 全文索引；桌面版 H2 没有 FULLTEXT，关掉后回退 LIKE。
   search:
     fulltext-enabled: true
+
+  # 回收站保留天数（超过后定时彻底清除）
+  trash-retention-days: 30
+
+  # 用户默认存储配额（字节），-1 表示不限制
+  quota:
+    default-bytes: ${FILE_HUB_DEFAULT_QUOTA_BYTES:-1}
+
+  # 成品存储后端：local（默认，本地磁盘）| s3（S3 / MinIO / 阿里云 OSS 等）
+  storage:
+    type: ${FILE_HUB_STORAGE_TYPE:local}
+    s3:
+      endpoint: ${FILE_HUB_S3_ENDPOINT:}
+      region: ${FILE_HUB_S3_REGION:us-east-1}
+      bucket: ${FILE_HUB_S3_BUCKET:file-hub}
+      access-key: ${FILE_HUB_S3_ACCESS_KEY:}
+      secret-key: ${FILE_HUB_S3_SECRET_KEY:}
+      key-prefix: ${FILE_HUB_S3_PREFIX:files/}
+      path-style-access: ${FILE_HUB_S3_PATH_STYLE:true}
+      auto-create-bucket: ${FILE_HUB_S3_AUTO_CREATE_BUCKET:true}
 
   # 登录 / 会话 / 管理员初始化
   auth:
@@ -61,11 +83,13 @@ file-hub:
     # 桌面版单人使用：第一个注册的账号直接给 ADMIN，不用另配管理员密码。
     # 服务器模式保持 false，管理员仍由上面的环境变量初始化。
     first-user-admin: false
+    # Swagger/OpenAPI 文档默认仅管理员可看；演示环境如需公开可设 FILE_HUB_DOCS_PUBLIC=true
+    docs-public: ${FILE_HUB_DOCS_PUBLIC:false}
 
   # 多实例部署。默认 false：单进程内锁 + Caffeine 限流，不需要 Redis。
   # 打开后锁和限流都切到 Redis，所有实例必须指向同一个共享存储目录（root）和同一个 Redis。
   cluster:
-    enabled: false
+    enabled: ${FILE_HUB_CLUSTER_ENABLED:false}
     redis-address: ${FILE_HUB_REDIS_ADDRESS:redis://127.0.0.1:6379}
     redis-database: 0
     key-prefix: "filehub:"
@@ -103,6 +127,8 @@ file-hub:
     share-global-per-minute: 120
     # 默认不信任 X-Forwarded-For；只有放在可信反向代理后面时才打开。
     trust-forwarded-headers: false
+    webdav-per-minute: 300
+    webdav-auth-fail-per-minute: 10
 
 # 运维端点：health 公开；metrics/prometheus 在 SecurityConfig 里要求 ADMIN
 management:
@@ -125,7 +151,7 @@ management:
 info:
   app:
     name: file-hub
-    version: 1.0.3
+    version: 1.1.0
 
 springdoc:
   api-docs:

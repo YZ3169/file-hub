@@ -29,8 +29,11 @@ public class FileShare {
 
     private Long ownerId;
 
-    /** 4 位提取码的 BCrypt 摘要；绝不返回给前端 */
+    /** 4 位提取码的 BCrypt 摘要；绝不返回给前端，免码分享为空串 */
     private String codeHash;
+
+    /** 1=需要提取码 0=免提取码公开链接 */
+    private Integer requireCode;
 
     /** NULL = 永久有效 */
     private LocalDateTime expiresAt;
@@ -39,6 +42,9 @@ public class FileShare {
     private Integer status;
 
     private Long downloadCount;
+
+    /** 最大允许验证/下载次数，NULL=不限制 */
+    private Long maxDownloads;
 
     private Integer failedAttempts;
 

@@ -34,21 +34,59 @@ const cards = computed(() => [
     tone: 'green',
   },
 ])
+
+const quotaInfo = computed(() => {
+  const limit = Number(state.stats.quotaBytes)
+  if (!Number.isFinite(limit) || limit < 0) return null
+  const used = Math.max(0, Number(state.stats.quotaUsedBytes ?? state.stats.logicalBytes ?? 0))
+  const percent = limit === 0 ? 100 : Math.min(100, Math.round((used / limit) * 100))
+  const tone = percent >= 95 ? 'bad' : percent >= 80 ? 'warn' : 'ok'
+  return { used, limit, percent, tone }
+})
 </script>
 
 <template>
-  <div class="stats">
-    <article v-for="card in cards" :key="card.label" class="stat-card" :class="`tone-${card.tone}`">
-      <div class="stat-icon">
-        <BaseIcon :name="card.icon" :size="18" />
+  <section class="stats-wrap">
+    <div class="stats">
+      <article
+        v-for="card in cards"
+        :key="card.label"
+        class="stat-card"
+        :class="`tone-${card.tone}`"
+      >
+        <div class="stat-icon">
+          <BaseIcon :name="card.icon" :size="18" />
+        </div>
+        <div class="stat-body">
+          <span class="stat-label">{{ card.label }}</span>
+          <strong class="stat-value">{{ card.value }}</strong>
+          <span class="stat-hint">{{ card.hint }}</span>
+        </div>
+      </article>
+    </div>
+    <div v-if="quotaInfo" class="quota-bar" data-testid="quota-bar">
+      <div class="quota-head">
+        <span>
+          <BaseIcon name="hard-drive" :size="14" />
+          存储配额：已用 {{ formatBytes(quotaInfo.used) }} / {{ formatBytes(quotaInfo.limit) }}
+        </span>
+        <strong :class="`quota-${quotaInfo.tone}`">{{ quotaInfo.percent }}%</strong>
       </div>
-      <div class="stat-body">
-        <span class="stat-label">{{ card.label }}</span>
-        <strong class="stat-value">{{ card.value }}</strong>
-        <span class="stat-hint">{{ card.hint }}</span>
+      <div
+        class="quota-track"
+        role="progressbar"
+        :aria-valuenow="quotaInfo.percent"
+        aria-valuemin="0"
+        aria-valuemax="100"
+      >
+        <div
+          class="quota-fill"
+          :class="`quota-${quotaInfo.tone}`"
+          :style="{ width: `${quotaInfo.percent}%` }"
+        ></div>
       </div>
-    </article>
-  </div>
+    </div>
+  </section>
 </template>
 
 <style scoped>
@@ -136,5 +174,72 @@ const cards = computed(() => [
   .stats {
     grid-template-columns: 1fr;
   }
+}
+
+.stats-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.quota-bar {
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(var(--blur));
+}
+
+.quota-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.quota-head span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.quota-head strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-track {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.quota-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.quota-ok {
+  color: var(--ok);
+}
+.quota-fill.quota-ok {
+  background: linear-gradient(90deg, var(--brand), var(--ok));
+}
+.quota-warn {
+  color: var(--warn);
+}
+.quota-fill.quota-warn {
+  background: var(--warn);
+}
+.quota-bad {
+  color: var(--bad);
+}
+.quota-fill.quota-bad {
+  background: var(--bad);
 }
 </style>

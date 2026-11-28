@@ -25,11 +25,30 @@ x-app: &app
     FILE_HUB_REDIS_ADDRESS: redis://redis:6379
     FILE_HUB_ADMIN_USER: ${FILE_HUB_ADMIN_USER:-admin}
     FILE_HUB_ADMIN_PASSWORD: ${FILE_HUB_ADMIN_PASSWORD:-}
+    FILE_HUB_DOCS_PUBLIC: ${FILE_HUB_DOCS_PUBLIC:-false}
+    FILE_HUB_DEFAULT_QUOTA_BYTES: ${FILE_HUB_DEFAULT_QUOTA_BYTES:--1}
+    FILE_HUB_MAX_STREAM_BYTES: ${FILE_HUB_MAX_STREAM_BYTES:-2147483648}
+    FILE_HUB_SHARE_PEPPER: ${FILE_HUB_SHARE_PEPPER:-}
+    FILE_HUB_STORAGE_TYPE: ${FILE_HUB_STORAGE_TYPE:-local}
+    FILE_HUB_S3_ENDPOINT: ${FILE_HUB_S3_ENDPOINT:-}
+    FILE_HUB_S3_REGION: ${FILE_HUB_S3_REGION:-us-east-1}
+    FILE_HUB_S3_BUCKET: ${FILE_HUB_S3_BUCKET:-file-hub}
+    FILE_HUB_S3_ACCESS_KEY: ${FILE_HUB_S3_ACCESS_KEY:-}
+    FILE_HUB_S3_SECRET_KEY: ${FILE_HUB_S3_SECRET_KEY:-}
+    FILE_HUB_S3_PREFIX: ${FILE_HUB_S3_PREFIX:-files/}
+    FILE_HUB_S3_PATH_STYLE: ${FILE_HUB_S3_PATH_STYLE:-true}
+    FILE_HUB_S3_AUTO_CREATE_BUCKET: ${FILE_HUB_S3_AUTO_CREATE_BUCKET:-true}
     FILE_HUB_LOG_LEVEL: info
     SERVER_PORT: 8081
     TZ: Asia/Shanghai
   volumes:
     - file-data:/data
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/actuator/health || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 40s
 
 services:
   mysql:
@@ -73,8 +92,23 @@ services:
     ports:
       - "8082:8081"
 
+  minio:
+    image: minio/minio:latest
+    profiles: ["s3"]
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${FILE_HUB_S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${FILE_HUB_S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
 volumes:
   mysql-data:
   redis-data:
   # 两个实例必须挂同一个卷；换成 NFS/SMB 时也要保证原子 rename
   file-data:
+  minio-data:

@@ -15,10 +15,16 @@ public record FileVO(
         long fileSize,
         String fileHash,
         int status,
-        LocalDateTime createTime
+        LocalDateTime createTime,
+        LocalDateTime deletedAt
 ) {
+    public FileVO(String fileId, String fileName, String relativePath, long fileSize,
+                  String fileHash, int status, LocalDateTime createTime) {
+        this(fileId, fileName, relativePath, fileSize, fileHash, status, createTime, null);
+    }
+
     public static FileVO from(FileInfo f) {
         return new FileVO(f.getFileId(), f.getFileName(), f.getRelativePath(), f.getFileSize(),
-                f.getFileHash(), f.getStatus(), f.getCreateTime());
+                f.getFileHash(), f.getStatus(), f.getCreateTime(), f.getDeletedAt());
     }
 }

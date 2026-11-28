@@ -184,7 +184,7 @@ class ShareServiceTest {
         when(fileStorageService.findDoneForShare("f1")).thenReturn(file("f1", 1L, FileInfo.STATUS_DONE));
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
         when(shareMapper.incrementDownload(eq(share.getId()), any())).thenReturn(1);
-        when(ticketService.issue(eq("f1"), any())).thenReturn(
+        when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
                 new DownloadTicketResponse("t", LocalDateTime.now().plusMinutes(5),
                         "/api/file/f1/download?ticket=t"));
 
@@ -194,7 +194,7 @@ class ShareServiceTest {
         assertEquals("测试.bin", resp.fileName());
         assertEquals("/api/file/f1/download?ticket=t", resp.downloadUrl());
         verify(ticketService).issue(eq("f1"),
-                argThat(p -> p.id() == 1L && !p.isAdmin()));
+                argThat(p -> p.id() == 1L && !p.isAdmin()), eq(10L));
     }
 
     @Test
@@ -216,7 +216,7 @@ class ShareServiceTest {
         when(shareMapper.findByToken(created.token())).thenReturn(saved);
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
         when(shareMapper.incrementDownload(eq(10L), any())).thenReturn(1);
-        when(ticketService.issue(eq("f1"), any())).thenReturn(
+        when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
                 new DownloadTicketResponse("t", LocalDateTime.now().plusMinutes(5),
                         "/api/file/f1/download?ticket=t"));
 
@@ -237,7 +237,7 @@ class ShareServiceTest {
         BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ZZZZ"));
         assertEquals(42003, e.getCode());
         assertTrue(e.getMessage().contains("9"));
-        verify(ticketService, never()).issue(anyString(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any());
     }
 
     @Test
@@ -312,7 +312,7 @@ class ShareServiceTest {
 
         BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
         assertEquals(42002, e.getCode());
-        verify(ticketService, never()).issue(anyString(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any());
     }
 
     @Test
@@ -330,7 +330,7 @@ class ShareServiceTest {
         when(shareMapper.incrementDownload(eq(share.getId()), any())).thenAnswer(inv ->
                 expiresAt.isAfter(inv.getArgument(1, LocalDateTime.class)) ? 1 : 0);
         lenient().when(shareMapper.selectById(share.getId())).thenReturn(share);
-        lenient().when(ticketService.issue(eq("f1"), any())).thenReturn(
+        lenient().when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
                 new DownloadTicketResponse("t", expiresAt.plusMinutes(5), "/download?ticket=t"));
 
         try (MockedStatic<LocalDateTime> clock = mockStatic(LocalDateTime.class, CALLS_REAL_METHODS)) {
@@ -339,7 +339,7 @@ class ShareServiceTest {
             BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
             assertEquals(42002, e.getCode());
         }
-        verify(ticketService, never()).issue(anyString(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any());
     }
 
     @Test
@@ -409,15 +409,22 @@ class ShareServiceTest {
         ArgumentCaptor<String> hash = ArgumentCaptor.forClass(String.class);
         verify(shareMapper).resetCode(eq(TOKEN), eq(1L), hash.capture(), any());
         assertTrue(encoder.matches(resp.code(), hash.getValue()));
+        verify(ticketService).revokeByShareId(10L);
     }
 
     @Test
-    @DisplayName("取消：更新 0 行按不存在处理")
+    @DisplayName("取消：更新 0 行按不存在处理；成功取消时立即吊销已签发票据")
     void cancelMissingShare() {
         when(shareMapper.cancel(eq(TOKEN), eq(1L), any())).thenReturn(0);
 
         BizException e = assertThrows(BizException.class, () -> service.cancel(TOKEN, user));
         assertEquals(42001, e.getCode());
+
+        FileShare share = shareWithCode("ABCD");
+        when(shareMapper.cancel(eq(TOKEN), eq(1L), any())).thenReturn(1);
+        when(shareMapper.findByToken(TOKEN)).thenReturn(share);
+        service.cancel(TOKEN, user);
+        verify(ticketService).revokeByShareId(10L);
     }
 
     // ---------------- helpers ----------------

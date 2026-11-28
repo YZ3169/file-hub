@@ -8,6 +8,12 @@ web/playwright-report
 .idea
 *.iml
 data
+build
+web/dist
+desktop-shell
+scripts
+*.msi
+*.zip
 Dockerfile
 .dockerignore
 README.md

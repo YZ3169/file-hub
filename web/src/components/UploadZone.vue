@@ -1,5 +1,5 @@
 <script setup>
-import { onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import BaseIcon from './BaseIcon.vue'
 import AppIcon from './AppIcon.vue'
 import { addFiles, state, toast } from '../stores/uploader'
@@ -14,12 +14,43 @@ const reading = ref(0)
 let dragDepth = 0
 let selectionEpoch = 0
 
+function onPaste(event) {
+  if (!auth.token) return
+  const target = event.target
+  if (
+    target &&
+    (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)
+  ) {
+    return
+  }
+  const rawFiles = Array.from(event.clipboardData?.files || [])
+  if (!rawFiles.length) return
+  event.preventDefault()
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
+  const normalized = rawFiles.map((f, idx) => {
+    if (f.name === 'image.png' && f.type === 'image/png') {
+      const suffix = rawFiles.length > 1 ? `-${idx + 1}` : ''
+      return new File([f], `screenshot-${stamp}${suffix}.png`, {
+        type: f.type,
+        lastModified: f.lastModified,
+      })
+    }
+    return f
+  })
+  addFiles(normalized)
+  toast(`已从剪贴板加入 ${normalized.length} 个文件`, 'info')
+}
+
 watch(
   () => auth.token,
   () => selectionEpoch++,
   { flush: 'sync' },
 )
-onUnmounted(() => selectionEpoch++)
+onMounted(() => window.addEventListener('paste', onPaste))
+onUnmounted(() => {
+  selectionEpoch++
+  window.removeEventListener('paste', onPaste)
+})
 
 function pick() {
   input.value?.click()
@@ -106,7 +137,11 @@ async function onDrop(event) {
       <h2>{{ dragging ? '松开即可加入队列' : '拖拽文件或文件夹到这里' }}</h2>
       <p>大文件自动切片 · 断网/刷新后只补缺失分片 · 相同内容 0 字节秒传</p>
       <p class="folder-hint" aria-live="polite">
-        {{ reading ? '正在读取文件夹内容…' : '文件夹会递归上传并保留相对路径，空目录不上传' }}
+        {{
+          reading
+            ? '正在读取文件夹内容…'
+            : '支持 Ctrl+V 粘贴文件或截图 · 文件夹会递归上传并保留相对路径'
+        }}
       </p>
     </div>
 

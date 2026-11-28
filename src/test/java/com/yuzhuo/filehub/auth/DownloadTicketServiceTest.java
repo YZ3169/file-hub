@@ -99,6 +99,42 @@ class DownloadTicketServiceTest {
         assertNull(service.resolve(FILE_ID, raw));
     }
 
+    @Test
+    @DisplayName("签发分享票据并按 shareId 立即吊销")
+    void issueWithShareIdAndRevoke() {
+        DownloadTicketResponse response = service.issue(
+                FILE_ID, new UserPrincipal(7L, "alice", "USER"), 42L);
+        ArgumentCaptor<DownloadTicket> captor = ArgumentCaptor.forClass(DownloadTicket.class);
+        verify(ticketMapper).insert(captor.capture());
+        assertEquals(42L, captor.getValue().getShareId());
+        assertTrue(response.url().contains("ticket="));
+
+        when(ticketMapper.deleteByShareId(42L)).thenReturn(2);
+        assertEquals(2, service.revokeByShareId(42L));
+        assertEquals(0, service.revokeByShareId(null));
+    }
+
+    @Test
+    @DisplayName("跨分享票据隔离：普通下载票据或不同 shareId 不能用于 resolveForShare")
+    void resolveForShareRequiresMatchingShareId() {
+        String raw = "share-tk".repeat(4);
+        DownloadTicket regularTicket = new DownloadTicket();
+        regularTicket.setFileId(FILE_ID);
+        regularTicket.setUserId(7L);
+        regularTicket.setShareId(null);
+
+        when(ticketMapper.findValid(eq(OpaqueToken.hash(raw)), eq(FILE_ID), any(LocalDateTime.class)))
+                .thenReturn(regularTicket);
+        assertNull(service.resolveForShare(FILE_ID, 10L, raw));
+
+        regularTicket.setShareId(99L);
+        assertNull(service.resolveForShare(FILE_ID, 10L, raw));
+
+        regularTicket.setShareId(10L);
+        when(userMapper.selectById(7L)).thenReturn(account(7L, 1));
+        assertEquals(7L, service.resolveForShare(FILE_ID, 10L, raw).id());
+    }
+
     private UserAccount account(long id, int enabled) {
         UserAccount account = new UserAccount();
         account.setId(id);

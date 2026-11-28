@@ -1,7 +1,15 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import BaseIcon from './BaseIcon.vue'
-import { ApiError, getPublicConfig, getPublicShareMeta, verifyShareCode } from '../lib/api'
+import FilePreviewDialog from './FilePreviewDialog.vue'
+import {
+  ApiError,
+  getPublicConfig,
+  getPublicShareMeta,
+  saveShareToMySpace,
+  verifyShareCode,
+} from '../lib/api'
+import { auth } from '../lib/auth'
 import { formatBytes, formatDate } from '../lib/format'
 
 const props = defineProps({
@@ -16,6 +24,10 @@ const code = ref('')
 const busy = ref(false)
 const verifyError = ref('')
 const result = ref(null)
+const previewOpen = ref(false)
+const saving = ref(false)
+const savedMessage = ref('')
+const saveError = ref('')
 const now = ref(Date.now())
 const ticketDeadline = ref(0)
 const downloadRequested = ref(false)
@@ -26,6 +38,7 @@ let clockTimer = null
 let disposed = false
 
 const ticketExpired = computed(() => Boolean(result.value) && now.value >= ticketDeadline.value)
+const needCode = computed(() => meta.value?.requireCode !== false)
 
 const isLocalHost = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname)
 const localOnlyHint = computed(() => desktop.value || isLocalHost)
@@ -35,6 +48,7 @@ const errorTitle = computed(() => {
     42001: '链接无效',
     42002: '分享已过期',
     42004: '提取已锁定',
+    42009: '次数已达上限',
   }
   return titleByCode[loadError.value?.code] || '无法打开分享'
 })
@@ -78,17 +92,20 @@ function onCodeInput(event) {
 
 async function submit() {
   now.value = Date.now()
-  if (busy.value || code.value.length !== 4 || locked.value) return
+  if (busy.value || locked.value) return
+  if (needCode.value && code.value.length !== 4) return
   busy.value = true
   verifyError.value = ''
   try {
-    const verified = await verifyShareCode(props.token, code.value)
+    const verified = await verifyShareCode(props.token, needCode.value ? code.value : '')
     if (disposed) return
     now.value = Date.now()
     const deadline = new Date(verified.ticketExpiresAt || '').getTime()
     ticketDeadline.value = Number.isFinite(deadline) ? deadline : now.value + 5 * 60_000
     result.value = verified
     downloadRequested.value = false
+    savedMessage.value = ''
+    saveError.value = ''
     await nextTick()
     resultHeading.value?.focus()
   } catch (e) {
@@ -104,6 +121,9 @@ async function submit() {
 
 async function reset() {
   result.value = null
+  previewOpen.value = false
+  savedMessage.value = ''
+  saveError.value = ''
   code.value = ''
   verifyError.value = ''
   downloadRequested.value = false
@@ -122,6 +142,33 @@ function download() {
   a.click()
   a.remove()
   downloadRequested.value = true
+}
+
+function extractTicket(url) {
+  if (!url) return null
+  const idx = url.indexOf('?')
+  if (idx < 0) return null
+  return new URLSearchParams(url.slice(idx + 1)).get('ticket')
+}
+
+async function saveToDrive() {
+  if (saving.value || !result.value || !auth.token) return
+  saving.value = true
+  saveError.value = ''
+  savedMessage.value = ''
+  try {
+    const ticket = extractTicket(result.value.downloadUrl)
+    const saved = await saveShareToMySpace(props.token, {
+      code: needCode.value ? code.value : null,
+      ticket,
+    })
+    if (disposed) return
+    savedMessage.value = `已保存到你的网盘：${saved.relativePath || saved.fileName}`
+  } catch (e) {
+    if (!disposed) saveError.value = e.message || '保存失败'
+  } finally {
+    if (!disposed) saving.value = false
+  }
 }
 
 onMounted(async () => {
@@ -178,8 +225,10 @@ onBeforeUnmount(() => {
           <p class="lead">
             {{
               result
-                ? '核对文件信息，然后保存到你的设备。'
-                : '输入分享者提供的 4 位提取码，即可查看并下载文件。'
+                ? '核对文件信息，然后预览、下载或保存到你的网盘。'
+                : needCode
+                  ? '输入分享者提供的 4 位提取码，即可查看并下载文件。'
+                  : '该分享免提取码，点击下方按钮即可查看或下载。'
             }}
           </p>
         </div>
@@ -197,33 +246,37 @@ onBeforeUnmount(() => {
         </div>
 
         <form v-if="!result" class="code-form" @submit.prevent="submit">
-          <label class="code-label" for="share-code-input">提取码</label>
-          <input
-            id="share-code-input"
-            ref="codeInput"
-            class="code-input"
-            type="text"
-            inputmode="text"
-            autocomplete="one-time-code"
-            autocapitalize="characters"
-            spellcheck="false"
-            maxlength="4"
-            placeholder="4 位字母或数字"
-            :value="code"
-            :disabled="busy || locked"
-            :aria-invalid="Boolean(verifyError)"
-            :aria-describedby="verifyError ? 'share-code-error' : 'share-code-hint'"
-            data-testid="share-code-input"
-            @input="onCodeInput"
-          />
-          <p id="share-code-hint" class="hint">字母不区分大小写，无需登录。</p>
+          <template v-if="needCode">
+            <label class="code-label" for="share-code-input">提取码</label>
+            <input
+              id="share-code-input"
+              ref="codeInput"
+              class="code-input"
+              type="text"
+              inputmode="text"
+              autocomplete="one-time-code"
+              autocapitalize="characters"
+              spellcheck="false"
+              maxlength="4"
+              placeholder="4 位字母或数字"
+              :value="code"
+              :disabled="busy || locked"
+              :aria-invalid="Boolean(verifyError)"
+              :aria-describedby="verifyError ? 'share-code-error' : 'share-code-hint'"
+              data-testid="share-code-input"
+              @input="onCodeInput"
+            />
+            <p id="share-code-hint" class="hint">字母不区分大小写，无需登录。</p>
+          </template>
+          <p v-else class="hint" data-testid="share-open-hint">公开分享链接，无需提取码。</p>
+
           <p v-if="verifyError" id="share-code-error" class="error" role="alert">
             {{ verifyError }}
           </p>
           <button
             class="btn btn-primary"
             type="submit"
-            :disabled="busy || code.length !== 4 || locked"
+            :disabled="busy || (needCode && code.length !== 4) || locked"
             data-testid="share-submit"
           >
             <BaseIcon name="download" :size="15" />
@@ -239,16 +292,47 @@ onBeforeUnmount(() => {
               <span>{{ formatBytes(result.fileSize) }}</span>
             </div>
           </div>
-          <button
-            class="btn btn-primary download-button"
-            type="button"
-            :disabled="ticketExpired"
-            data-testid="share-download"
-            @click="download"
-          >
-            <BaseIcon name="download" :size="15" />
-            {{ ticketExpired ? '下载凭证已过期' : downloadRequested ? '再次下载' : '下载' }}
-          </button>
+          <div class="result-actions">
+            <button
+              class="btn btn-primary download-button"
+              type="button"
+              :disabled="ticketExpired"
+              data-testid="share-download"
+              @click="download"
+            >
+              <BaseIcon name="download" :size="15" />
+              {{ ticketExpired ? '下载凭证已过期' : downloadRequested ? '再次下载' : '下载' }}
+            </button>
+            <button
+              class="btn btn-ghost"
+              type="button"
+              :disabled="ticketExpired"
+              data-testid="share-preview"
+              @click="previewOpen = true"
+            >
+              <BaseIcon name="eye" :size="15" />
+              预览
+            </button>
+            <button
+              v-if="auth.token"
+              class="btn btn-ghost"
+              type="button"
+              :disabled="saving"
+              data-testid="share-save"
+              @click="saveToDrive"
+            >
+              <BaseIcon name="folder-plus" :size="15" />
+              {{ saving ? '保存中…' : '存到网盘' }}
+            </button>
+          </div>
+          <p v-if="!auth.token" class="hint">
+            已有账号？<a class="link-btn" href="#/">登录后可一键转存到自己的网盘</a>
+          </p>
+          <p v-if="savedMessage" class="download-feedback" role="status" data-testid="share-saved">
+            <BaseIcon name="check" :size="16" />
+            {{ savedMessage }}
+          </p>
+          <p v-if="saveError" class="error" role="alert">{{ saveError }}</p>
           <p v-if="downloadRequested" class="download-feedback" role="status">
             <BaseIcon name="check" :size="16" />
             已请求下载，请在浏览器或桌面窗口的下载列表中查看进度。
@@ -265,9 +349,14 @@ onBeforeUnmount(() => {
             <button class="link-btn" type="button" @click="reset">重新校验</button>
           </p>
         </div>
-        <p v-if="meta.expiresAt" class="hint share-expiry">
+        <p v-if="meta.expiresAt || meta.maxDownloads" class="hint share-expiry">
           <BaseIcon name="clock" :size="14" />
-          分享有效至 {{ formatDate(meta.expiresAt) }}
+          <template v-if="meta.expiresAt">分享有效至 {{ formatDate(meta.expiresAt) }}</template>
+          <template v-else>长期有效</template>
+          <template v-if="meta.maxDownloads">
+            · 剩余可提取 {{ Math.max(0, meta.maxDownloads - (meta.downloadCount || 0)) }} /
+            {{ meta.maxDownloads }} 次
+          </template>
         </p>
       </template>
 
@@ -280,6 +369,14 @@ onBeforeUnmount(() => {
         <a class="link-btn" href="#/">返回 file-hub 首页</a>
       </footer>
     </section>
+
+    <FilePreviewDialog
+      v-if="previewOpen && result"
+      :file="result"
+      :direct-url="result.downloadUrl"
+      @close="previewOpen = false"
+      @download="download"
+    />
   </div>
 </template>
 
@@ -598,5 +695,15 @@ onBeforeUnmount(() => {
   .file-result {
     padding: 16px;
   }
+}
+
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.result-actions .download-button {
+  flex: 1 1 auto;
 }
 </style>

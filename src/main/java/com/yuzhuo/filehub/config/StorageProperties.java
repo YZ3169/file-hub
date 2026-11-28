@@ -31,6 +31,24 @@ public class StorageProperties {
     /** 关键词搜索相关配置 */
     private Search search = new Search();
 
+    /** 回收站文件保留天数（超过后自动彻底清理），默认 30 天 */
+    private int trashRetentionDays = 30;
+
+    /** 用户存储配额配置 */
+    private Quota quota = new Quota();
+
+    /** 单次流式上传（WebDAV PUT / 桌面目录同步）大小上限，默认 2GB */
+    private long maxStreamUploadBytes = 2L * 1024 * 1024 * 1024;
+
+    /** 成品对象存储后端配置：local（默认，本地磁盘）| s3 */
+    private Storage storage = new Storage();
+
+    @Data
+    public static class Quota {
+        /** 新用户默认配额（字节），-1 表示不限制 */
+        private long defaultBytes = -1L;
+    }
+
     @Data
     public static class Search {
         /**
@@ -38,5 +56,32 @@ public class StorageProperties {
          * 关掉后统一回退 LIKE。
          */
         private boolean fulltextEnabled = true;
+    }
+
+    @Data
+    public static class Storage {
+        /** local | s3 */
+        private String type = "local";
+        private S3 s3 = new S3();
+    }
+
+    @Data
+    public static class S3 {
+        /** S3/MinIO/OSS endpoint，如 http://127.0.0.1:9000；留空走 AWS 默认域名 */
+        private String endpoint = "";
+        private String region = "us-east-1";
+        private String bucket = "file-hub";
+        private String accessKey = "";
+        private String secretKey = "";
+        /** 对象键前缀，如 files/ */
+        private String keyPrefix = "files/";
+        /** MinIO/私有对象存储一般需要 path-style */
+        private boolean pathStyleAccess = true;
+        /** 超过该字节数自动走 S3 分片上传（Multipart Upload），默认 16MB */
+        private long multipartThresholdBytes = 16L * 1024 * 1024;
+        /** S3 分片上传每片大小（S3 要求非最后一片至少 5MB），默认 8MB */
+        private long multipartPartBytes = 8L * 1024 * 1024;
+        /** 启动时若 bucket 不存在则自动创建（方便本地 MinIO 开箱即用） */
+        private boolean autoCreateBucket = true;
     }
 }

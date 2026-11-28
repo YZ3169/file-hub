@@ -48,7 +48,8 @@ public interface FileShareMapper extends BaseMapper<FileShare> {
      */
     @Update("UPDATE file_share SET download_count = download_count + 1, update_time = #{now} "
             + "WHERE id = #{id} AND status = 1 "
-            + "AND (expires_at IS NULL OR expires_at > #{now})")
+            + "AND (expires_at IS NULL OR expires_at > #{now}) "
+            + "AND (max_downloads IS NULL OR download_count < max_downloads)")
     int incrementDownload(@Param("id") Long id, @Param("now") LocalDateTime now);
 
     /** 已登录用户某个文件的有效分享数（用于创建配额） */

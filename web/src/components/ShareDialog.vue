@@ -19,6 +19,8 @@ const EXPIRY_OPTIONS = [
 ]
 
 const expiry = ref(7)
+const requireCode = ref(true)
+const maxDownloads = ref('')
 const share = ref(null)
 const busy = ref(false)
 const error = ref('')
@@ -28,10 +30,23 @@ const link = computed(() => (share.value ? buildShareUrl(share.value.token) : ''
 
 async function submit() {
   if (busy.value) return
+  const rawLimit = String(maxDownloads.value).trim()
+  const limit = rawLimit === '' ? null : Number(rawLimit)
+  if (limit !== null && (!Number.isInteger(limit) || limit < 1)) {
+    error.value = '最大下载次数限制须为正整数，留空表示不限'
+    return
+  }
   busy.value = true
   error.value = ''
   try {
-    share.value = await createShare(props.file.fileId, expiry.value)
+    if (requireCode.value && limit === null) {
+      share.value = await createShare(props.file.fileId, expiry.value)
+    } else {
+      share.value = await createShare(props.file.fileId, expiry.value, {
+        requireCode: requireCode.value,
+        maxDownloads: limit,
+      })
+    }
   } catch (e) {
     error.value = e.message
   } finally {
@@ -60,7 +75,10 @@ async function copy(text, label) {
 }
 
 function copyAll() {
-  copy(`${props.file.fileName}\n链接：${link.value}\n提取码：${share.value.code}`, '分享信息')
+  const codeLine = share.value?.code
+    ? `\n提取码：${share.value.code}`
+    : '\n提取方式：免提取码直接提取'
+  copy(`${props.file.fileName}\n链接：${link.value}${codeLine}`, '分享信息')
 }
 </script>
 
@@ -108,8 +126,30 @@ function copyAll() {
           </div>
         </div>
 
+        <div class="share-opts">
+          <label class="opt-check">
+            <input v-model="requireCode" type="checkbox" data-testid="share-require-code" />
+            <span>需要 4 位提取码（取消勾选则公开免密访问）</span>
+          </label>
+          <label class="opt-limit">
+            <span>最大下载次数</span>
+            <input
+              v-model="maxDownloads"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="留空不限制"
+              data-testid="share-max-downloads"
+            />
+          </label>
+        </div>
+
         <p class="hint">
-          生成后把「链接 + 提取码」发给对方，对方无需注册登录即可下载；提取码只显示这一次。
+          {{
+            requireCode
+              ? '生成后把「链接 + 提取码」发给对方，对方无需注册登录即可下载；提取码只显示这一次。'
+              : '免密分享任何人拿到链接即可查看并下载（如设置次数限制，满额后自动失效）。'
+          }}
         </p>
 
         <p v-if="error" class="error" role="alert">{{ error }}</p>
@@ -144,15 +184,19 @@ function copyAll() {
             </button>
           </label>
 
-          <div class="result-row">
+          <div v-if="share.requireCode !== false && share.code" class="result-row">
             <span>提取码</span>
             <strong class="code" data-testid="share-code">{{ share.code }}</strong>
             <button class="btn btn-ghost btn-sm" type="button" @click="copy(share.code, '提取码')">
               复制
             </button>
           </div>
+          <div v-else class="result-row">
+            <span>访问方式</span>
+            <strong class="public-badge" data-testid="share-no-code">免提取码公开链接</strong>
+          </div>
 
-          <p class="hint">
+          <p v-if="share.requireCode !== false && share.code" class="hint">
             <BaseIcon name="lock" :size="13" />
             提取码只显示这一次，请立即保存；忘了只能「换一个提取码」。
           </p>
@@ -160,13 +204,20 @@ function copyAll() {
             有效期：{{
               share.expiresAt ? share.expiresAt.replace('T', ' ').slice(0, 16) : '永久有效'
             }}
+            <template v-if="share.maxDownloads"> · 最多下载 {{ share.maxDownloads }} 次 </template>
           </p>
         </div>
 
         <p v-if="error" class="error" role="alert">{{ error }}</p>
 
         <footer class="dialog-foot">
-          <button class="btn btn-ghost btn-sm" type="button" :disabled="busy" @click="regenerate">
+          <button
+            v-if="share.requireCode !== false && share.code"
+            class="btn btn-ghost btn-sm"
+            type="button"
+            :disabled="busy"
+            @click="regenerate"
+          >
             <BaseIcon name="refresh" :size="14" />
             换一个提取码
           </button>
@@ -375,5 +426,48 @@ function copyAll() {
 
 .spacer {
   flex: 1;
+}
+
+.share-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.opt-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.opt-limit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.opt-limit input {
+  width: 130px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.public-badge {
+  color: var(--ok);
+  font-size: 13px;
 }
 </style>

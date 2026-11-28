@@ -19,6 +19,13 @@ public interface UserSessionMapper extends BaseMapper<UserSession> {
     @Delete("DELETE FROM user_session WHERE token_hash = #{tokenHash}")
     int deleteByTokenHash(@Param("tokenHash") String tokenHash);
 
+    @Delete("DELETE FROM user_session WHERE user_id = #{userId}")
+    int deleteByUserId(@Param("userId") Long userId);
+
+    @Delete("DELETE FROM user_session WHERE user_id = #{userId} AND token_hash <> #{keepTokenHash}")
+    int deleteByUserIdExceptTokenHash(@Param("userId") Long userId,
+                                       @Param("keepTokenHash") String keepTokenHash);
+
     @Delete("DELETE FROM user_session WHERE expires_at <= #{now}")
     int deleteExpired(@Param("now") LocalDateTime now);
 }

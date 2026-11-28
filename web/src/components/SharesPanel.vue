@@ -13,6 +13,7 @@ const STATE_LABEL = {
   EXPIRED: '已过期',
   CANCELLED: '已取消',
   FILE_MISSING: '文件已删除',
+  EXHAUSTED: '次数已满',
 }
 
 const items = ref([])
@@ -176,7 +177,10 @@ onBeforeUnmount(() => {
               <td>
                 <div class="name-cell">
                   <strong :title="item.fileName">{{ item.fileName }}</strong>
-                  <span>{{ item.token.slice(0, 10) }}…</span>
+                  <span>
+                    {{ item.token.slice(0, 10) }}…
+                    <template v-if="item.requireCode === false"> · 免提取码</template>
+                  </span>
                 </div>
               </td>
               <td>
@@ -187,7 +191,13 @@ onBeforeUnmount(() => {
                 </span>
               </td>
               <td class="time">{{ pretty(item.expiresAt) }}</td>
-              <td class="num">{{ item.downloadCount }}</td>
+              <td class="num">
+                {{
+                  item.maxDownloads
+                    ? `${item.downloadCount} / ${item.maxDownloads}`
+                    : item.downloadCount
+                }}
+              </td>
               <td class="col-actions">
                 <div class="row-actions">
                   <template v-if="item.state === 'ACTIVE'">
@@ -201,6 +211,7 @@ onBeforeUnmount(() => {
                       <BaseIcon name="link" :size="15" />
                     </button>
                     <button
+                      v-if="item.requireCode !== false"
                       class="icon-link"
                       type="button"
                       title="换一个提取码"

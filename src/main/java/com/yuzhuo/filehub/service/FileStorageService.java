@@ -18,10 +18,11 @@ import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.mapper.FileChunkMapper;
 import com.yuzhuo.filehub.mapper.FileInfoMapper;
 import com.yuzhuo.filehub.storage.LocalDiskStorage;
+import com.yuzhuo.filehub.storage.StorageBackend;
 import com.yuzhuo.filehub.util.HashUtil;
 import io.micrometer.core.instrument.MeterRegistry;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -56,7 +57,6 @@ import java.util.stream.IntStream;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class FileStorageService {
 
     /**
@@ -67,10 +67,44 @@ public class FileStorageService {
 
     private final FileInfoMapper fileInfoMapper;
     private final FileChunkMapper fileChunkMapper;
-    private final LocalDiskStorage storage;
+    private final LocalDiskStorage chunkStorage;
+    private final StorageBackend objectStorage;
     private final StorageProperties props;
     private final LockRegistry locks;
     private final MeterRegistry meters;
+    private QuotaService quotaService;
+
+    @Autowired(required = false)
+    public void setQuotaService(QuotaService quotaService) {
+        this.quotaService = quotaService;
+    }
+
+    @Autowired
+    public FileStorageService(FileInfoMapper fileInfoMapper,
+                              FileChunkMapper fileChunkMapper,
+                              LocalDiskStorage chunkStorage,
+                              StorageBackend objectStorage,
+                              StorageProperties props,
+                              LockRegistry locks,
+                              MeterRegistry meters) {
+        this.fileInfoMapper = fileInfoMapper;
+        this.fileChunkMapper = fileChunkMapper;
+        this.chunkStorage = chunkStorage;
+        this.objectStorage = objectStorage;
+        this.props = props;
+        this.locks = locks;
+        this.meters = meters;
+    }
+
+    /** 兼容单本地存储的构造器，方便现有单元测试直接使用 */
+    public FileStorageService(FileInfoMapper fileInfoMapper,
+                              FileChunkMapper fileChunkMapper,
+                              LocalDiskStorage storage,
+                              StorageProperties props,
+                              LockRegistry locks,
+                              MeterRegistry meters) {
+        this(fileInfoMapper, fileChunkMapper, storage, storage, props, locks, meters);
+    }
 
     // ==================================================================
     // 1. 秒传预检
@@ -122,6 +156,7 @@ public class FileStorageService {
                     if (done == null) {
                         return null;
                     }
+                    checkQuota(user, req.fileSize());
                     String newFileId = UUID.randomUUID().toString();
                     FileInfo row = newRow(newFileId, req, chunkSize, chunkTotal, user);
                     row.setStatus(FileInfo.STATUS_DONE);
@@ -165,6 +200,7 @@ public class FileStorageService {
         }
 
         // --- 情况 3：全新任务 ---
+        checkQuota(user, req.fileSize());
         String fileId = UUID.randomUUID().toString();
         FileInfo row = newRow(fileId, req, chunkSize, chunkTotal, user);
         fileInfoMapper.insert(row);
@@ -272,7 +308,7 @@ public class FileStorageService {
         long expectedSize = expectedChunkSize(info, index);
         LocalDiskStorage.ChunkWriteResult result;
         try {
-            result = storage.saveChunk(fileId, index, in, expectedChunkHash, expectedSize);
+            result = chunkStorage.saveChunk(fileId, index, in, expectedChunkHash, expectedSize);
         } catch (IOException e) {
             throw new BizException(20003, "分片落盘失败：" + e.getMessage());
         }
@@ -289,7 +325,7 @@ public class FileStorageService {
         // 这一步必须在 upsert 之后做，否则刚写的分片元数据会变成无主数据。
         int touched = fileInfoMapper.touchUploading(fileId);
         if (touched == 0) {
-            storage.deleteChunk(fileId, index);
+            chunkStorage.deleteChunk(fileId, index);
             fileChunkMapper.deleteChunk(fileId, index);
             FileInfo after = findInfo(fileId);
             if (after != null && after.getStatus() == FileInfo.STATUS_DONE) {
@@ -358,7 +394,7 @@ public class FileStorageService {
 
         // 以磁盘为准判断齐没齐：数据库说传过、但文件丢了（比如被清理过），
         // 这里能如实发现并要求重传，而不是拼出一个缺片的坏文件
-        List<Integer> onDisk = storage.listChunksOnDisk(fileId);
+        List<Integer> onDisk = chunkStorage.listChunksOnDisk(fileId);
         Set<Integer> present = new HashSet<>(onDisk);
         List<Integer> missing = IntStream.range(0, info.getChunkTotal())
                 .filter(i -> !present.contains(i))
@@ -384,7 +420,7 @@ public class FileStorageService {
         // 下次再合并遇到坏片时就能精确到片自愈。
         Map<Integer, String> hashesToBackfill = new HashMap<>();
         try {
-            merged = storage.createMergeTmpFile(fileId);
+            merged = chunkStorage.createMergeTmpFile(fileId);
             var digest = HashUtil.sha256();
             try (OutputStream fileOut = Files.newOutputStream(merged);
                  BufferedOutputStream buffered = new BufferedOutputStream(fileOut, 1 << 16);
@@ -394,7 +430,7 @@ public class FileStorageService {
                     // 磁盘只读一遍，却能同时回答"这一片对不对"和"整个文件对不对"
                     MessageDigest chunkDigest = HashUtil.sha256();
                     long chunkBytes;
-                    try (InputStream chunkIn = Files.newInputStream(storage.chunkFile(fileId, i));
+                    try (InputStream chunkIn = Files.newInputStream(chunkStorage.chunkFile(fileId, i));
                          DigestInputStream digestIn = new DigestInputStream(chunkIn, chunkDigest)) {
                         chunkBytes = digestIn.transferTo(digestOut);
                     }
@@ -425,7 +461,7 @@ public class FileStorageService {
             deleteQuietly(merged);
             List<Integer> bad = corrupt.stream().sorted().toList();
             for (int i : bad) {
-                storage.deleteChunk(fileId, i);
+                chunkStorage.deleteChunk(fileId, i);
                 fileChunkMapper.deleteChunk(fileId, i);
             }
             throw new BizException(30005, "逐片校验发现 " + bad.size()
@@ -467,9 +503,9 @@ public class FileStorageService {
                         path = existing.getStoragePath();
                         log.info("合并后去重：{} 复用已有物理文件 {}", fileId, path);
                     } else {
-                        path = storage.buildRelativePath(fileId);
+                        path = chunkStorage.buildRelativePath(fileId);
                         try {
-                            storage.put(path, mergedFile);
+                            objectStorage.put(path, mergedFile);
                         } catch (IOException e) {
                             deleteQuietly(mergedFile);
                             throw new BizException(20005, "写入存储失败：" + e.getMessage());
@@ -487,7 +523,7 @@ public class FileStorageService {
         // 如果进程在两者之间被杀，留下的是「有目录无元数据」，孤儿目录回收还能扫到；
         // 反过来先删盘会留下一堆永远不会被扫到的 file_chunk 行。
         fileChunkMapper.deleteByFileId(fileId);
-        storage.deleteChunks(fileId);
+        chunkStorage.deleteChunks(fileId);
 
         FileInfo after = requireInfo(fileId, user);
         log.info("文件 {} 合并完成：{} 字节，{} 片，hash={}", fileId, actualSize, info.getChunkTotal(), actualHash);
@@ -507,17 +543,44 @@ public class FileStorageService {
      */
     public PageResponse<FileVO> list(int page, int size, String keyword, Integer status, String sort,
                                      UserPrincipal user, String scope) {
+        return list(page, size, keyword, status, null, sort, user, scope);
+    }
+
+    public PageResponse<FileVO> list(int page, int size, String keyword, Integer status,
+                                     String category, String sort, UserPrincipal user, String scope) {
         int safePage = Math.max(1, page);
         int safeSize = Math.min(100, Math.max(1, size));
 
-        if (status != null && status != FileInfo.STATUS_UPLOADING && status != FileInfo.STATUS_DONE) {
-            throw new BizException(10008, "status 只能是 0（上传中）或 1（已完成）");
+        if (status != null && status != FileInfo.STATUS_UPLOADING
+                && status != FileInfo.STATUS_DONE && status != FileInfo.STATUS_TRASH) {
+            throw new BizException(10008, "status 只能是 0（上传中）、1（已完成）或 2（回收站）");
         }
+        Set<String> categoryExts = com.yuzhuo.filehub.util.FileMediaTypeResolver.extensionsForCategory(category);
+        String catKey = category == null ? "" : category.trim().toLowerCase(java.util.Locale.ROOT);
 
         LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
         applyOwnerScope(qw, user, scope);
         if (status != null) {
             qw.eq(FileInfo::getStatus, status);
+        } else {
+            qw.ne(FileInfo::getStatus, FileInfo.STATUS_TRASH);
+        }
+        if (!categoryExts.isEmpty()) {
+            qw.and(w -> {
+                boolean first = true;
+                for (String ext : categoryExts) {
+                    if (!first) {
+                        w.or();
+                    }
+                    w.apply("LOWER(file_name) LIKE {0}", "%." + ext);
+                    first = false;
+                }
+                if ("document".equals(catKey)) {
+                    w.or().apply("LOWER(file_name) IN ('readme', 'license')");
+                } else if ("code".equals(catKey)) {
+                    w.or().apply("LOWER(file_name) IN ('dockerfile', 'makefile')");
+                }
+            });
         }
         if (keyword != null && !keyword.isBlank()) {
             String kw = keyword.trim();
@@ -643,13 +706,13 @@ public class FileStorageService {
     }
 
     /** 数据库说完成、磁盘上也确实有一份大小一致的文件，三者同时成立才算完好 */
-    private boolean isStorageIntact(FileInfo info) {
+    public boolean isStorageIntact(FileInfo info) {
         String path = info.getStoragePath();
         if (path == null || path.isBlank()) {
             return false;
         }
         try {
-            return storage.exists(path) && storage.size(path) == info.getFileSize();
+            return objectStorage.exists(path) && objectStorage.size(path) == info.getFileSize();
         } catch (RuntimeException e) {
             log.warn("检查物理文件失败：{}", path, e);
             return false;
@@ -663,7 +726,7 @@ public class FileStorageService {
 
     /** 已落盘的分片序号（以磁盘为准） */
     public List<Integer> uploadedIndexes(String fileId) {
-        return storage.listChunksOnDisk(fileId);
+        return chunkStorage.listChunksOnDisk(fileId);
     }
 
     /**
@@ -681,7 +744,7 @@ public class FileStorageService {
                 info.getStatus() == FileInfo.STATUS_DONE,
                 info.getChunkSize(),
                 info.getChunkTotal(),
-                storage.listChunksOnDisk(fileId));
+                chunkStorage.listChunksOnDisk(fileId));
     }
 
     public StatsResponse stats(UserPrincipal user, String scope) {
@@ -702,7 +765,10 @@ public class FileStorageService {
             logical = fileInfoMapper.sumLogicalBytesByOwner(user.id(), includeLegacy);
             physical = fileInfoMapper.sumPhysicalBytesByOwner(user.id(), includeLegacy);
         }
-        return new StatsResponse(done, uploading, logical, physical, Math.max(0, logical - physical));
+        long quotaBytes = quotaService == null ? -1L : quotaService.quotaBytesFor(user.id());
+        long quotaUsedBytes = quotaService == null ? logical : quotaService.usedBytesFor(user.id());
+        return new StatsResponse(done, uploading, logical, physical, Math.max(0, logical - physical),
+                quotaBytes, quotaUsedBytes);
     }
 
     /**
@@ -742,7 +808,7 @@ public class FileStorageService {
                     }
                     // 先删元数据再删盘：中间崩溃时留下的是可被孤儿目录扫描发现的目录
                     fileChunkMapper.deleteByFileId(stale.getFileId());
-                    storage.deleteChunks(stale.getFileId());
+                    chunkStorage.deleteChunks(stale.getFileId());
                     return n;
                 });
                 if (deleted == 0) {
@@ -758,14 +824,44 @@ public class FileStorageService {
         }
         int orphanDirs = cleanupOrphanChunkDirs(Duration.ofMinutes(minutes));
         int orphanFiles = cleanupOrphanFinishedFiles(Duration.ofHours(props.getOrphanFileGraceHours()));
-        int tempFiles = storage.cleanupTemporary(Duration.ofMinutes(minutes));
+        int expiredTrash = cleanupExpiredTrash(Duration.ofDays(Math.max(1, props.getTrashRetentionDays())));
+        int tempFiles = chunkStorage.cleanupTemporary(Duration.ofMinutes(minutes));
         meters.counter("filehub.cleanup.orphan_chunk_dirs").increment(orphanDirs);
         meters.counter("filehub.cleanup.orphan_files").increment(orphanFiles);
         meters.counter("filehub.cleanup.temp_files").increment(tempFiles);
-        if (removed > 0 || orphanDirs > 0 || orphanFiles > 0 || tempFiles > 0) {
-            log.info("临时文件清理完成：过期任务 {} 个，孤儿分片目录 {} 个，孤儿成品 {} 个，残留文件 {} 个",
-                    removed, orphanDirs, orphanFiles, tempFiles);
+        if (removed > 0 || orphanDirs > 0 || orphanFiles > 0 || expiredTrash > 0 || tempFiles > 0) {
+            log.info("临时文件清理完成：过期任务 {} 个，过期回收站 {} 个，孤儿分片目录 {} 个，孤儿成品 {} 个，残留文件 {} 个",
+                    removed, expiredTrash, orphanDirs, orphanFiles, tempFiles);
         }
+    }
+
+    private int cleanupExpiredTrash(Duration retention) {
+        LocalDateTime cutoff = LocalDateTime.now().minus(retention);
+        int removed = 0;
+        for (FileInfo trashed : fileInfoMapper.findExpiredTrash(cutoff)) {
+            try {
+                int deleted = locks.write(trashed.getFileId(), () -> {
+                    int n = fileInfoMapper.deleteExpiredTrashById(trashed.getId(), cutoff);
+                    if (n == 0) {
+                        return 0;
+                    }
+                    if (trashed.getStoragePath() != null) {
+                        locks.writeVoid(contentKey(trashed.getFileHash(), trashed.getFileSize()), () -> {
+                            if (fileInfoMapper.countByStoragePath(trashed.getStoragePath()) == 0) {
+                                objectStorage.delete(trashed.getStoragePath());
+                            }
+                        });
+                    }
+                    return n;
+                });
+                if (deleted > 0) {
+                    removed++;
+                }
+            } catch (Exception e) {
+                log.warn("清理过期回收站记录失败：{}", trashed.getFileId(), e);
+            }
+        }
+        return removed;
     }
 
     /**
@@ -778,8 +874,8 @@ public class FileStorageService {
     private int cleanupOrphanChunkDirs(Duration age) {
         Set<String> uploading = new HashSet<>(fileInfoMapper.findUploadingFileIds());
         int removed = 0;
-        for (String fileId : storage.listChunkDirs()) {
-            if (uploading.contains(fileId) || !storage.chunkDirOlderThan(fileId, age)) {
+        for (String fileId : chunkStorage.listChunkDirs()) {
+            if (uploading.contains(fileId) || !chunkStorage.chunkDirOlderThan(fileId, age)) {
                 continue;
             }
             boolean deleted = locks.write(fileId, () -> {
@@ -789,7 +885,7 @@ public class FileStorageService {
                 }
                 // 完成态任务理论上没有分片元数据了；崩溃残留的一并清掉
                 fileChunkMapper.deleteByFileId(fileId);
-                storage.deleteChunks(fileId);
+                chunkStorage.deleteChunks(fileId);
                 log.info("回收孤儿分片目录：{}", fileId);
                 return true;
             });
@@ -820,15 +916,15 @@ public class FileStorageService {
     private int cleanupOrphanFinishedFiles(Duration grace) {
         Set<String> referenced = new HashSet<>(fileInfoMapper.findAllStoragePaths());
         int removed = 0;
-        for (String path : storage.listFilePaths()) {
-            if (referenced.contains(path) || !storage.fileOlderThan(path, grace)) {
+        for (String path : objectStorage.listFilePaths()) {
+            if (referenced.contains(path) || !objectStorage.fileOlderThan(path, grace)) {
                 continue;
             }
             boolean deleted = locks.write(GC_LOCK, () -> {
                 if (fileInfoMapper.countByStoragePath(path) > 0) {
                     return false;
                 }
-                if (!storage.delete(path)) {
+                if (!objectStorage.delete(path)) {
                     return false;
                 }
                 log.info("回收孤儿成品文件：{}", path);
@@ -844,7 +940,7 @@ public class FileStorageService {
     public InputStream openForRead(FileInfo info) {
         requireReadable(info);
         try {
-            return storage.open(info.getStoragePath());
+            return objectStorage.open(info.getStoragePath());
         } catch (IOException e) {
             throw new BizException(20006, "读取文件失败：" + e.getMessage());
         }
@@ -857,18 +953,232 @@ public class FileStorageService {
     public InputStream openRangeForRead(FileInfo info, long offset, long length) {
         requireReadable(info);
         try {
-            return storage.openRange(info.getStoragePath(), offset, length);
+            return objectStorage.openRange(info.getStoragePath(), offset, length);
         } catch (IOException e) {
             throw new BizException(20006, "读取文件失败：" + e.getMessage());
         }
     }
 
+    public FileInfo requireReadableInfo(String fileId, UserPrincipal user) {
+        FileInfo info = requireInfo(fileId, user);
+        requireReadable(info);
+        return info;
+    }
+
     private void requireReadable(FileInfo info) {
         if (info.getStatus() != FileInfo.STATUS_DONE) {
-            throw new BizException(10006, "文件尚未上传完成，无法下载");
+            throw new BizException(10006, "文件尚未上传完成或已在回收站，无法访问");
         }
         if (!isStorageIntact(info)) {
             throw new BizException(20006, "存储中的文件缺失或大小不符，无法下载");
+        }
+    }
+
+    /** 移入回收站（仅已完成文件；保留物理文件引用以便恢复） */
+    public void moveToTrash(String fileId, UserPrincipal user) {
+        LocalDiskStorage.requireSafeId(fileId);
+        locks.writeVoid(fileId, () -> {
+            FileInfo info = requireInfo(fileId, user);
+            if (info.getStatus() != FileInfo.STATUS_DONE) {
+                throw new BizException(10006, "只有已完成的文件可以移入回收站");
+            }
+            fileInfoMapper.moveToTrash(info.getId(), LocalDateTime.now());
+        });
+    }
+
+    /** 从回收站恢复到原路径 */
+    public FileVO restoreFromTrash(String fileId, UserPrincipal user) {
+        LocalDiskStorage.requireSafeId(fileId);
+        return locks.write(fileId, () -> {
+            FileInfo info = requireInfo(fileId, user);
+            if (info.getStatus() != FileInfo.STATUS_TRASH) {
+                throw new BizException(10006, "该文件不在回收站中");
+            }
+            fileInfoMapper.restoreFromTrash(info.getId(), LocalDateTime.now());
+            return FileVO.from(requireInfo(fileId, user));
+        });
+    }
+
+    public PageResponse<FileVO> listTrash(int page, int size, UserPrincipal user) {
+        int safePage = Math.max(1, page);
+        int safeSize = Math.min(100, Math.max(1, size));
+        LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
+        applyOwnerScope(qw, user, null);
+        qw.eq(FileInfo::getStatus, FileInfo.STATUS_TRASH);
+        qw.orderByDesc(FileInfo::getDeletedAt).orderByDesc(FileInfo::getId);
+        Page<FileInfo> result = fileInfoMapper.selectPage(new Page<>(safePage, safeSize), qw);
+        return new PageResponse<>(
+                result.getRecords().stream().map(FileVO::from).toList(),
+                result.getTotal(), safePage, safeSize);
+    }
+
+    public int emptyTrash(UserPrincipal user) {
+        LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
+        applyOwnerScope(qw, user, null);
+        qw.eq(FileInfo::getStatus, FileInfo.STATUS_TRASH);
+        List<FileInfo> trashed = fileInfoMapper.selectList(qw);
+        int count = 0;
+        for (FileInfo info : trashed) {
+            try {
+                delete(info.getFileId(), user);
+                count++;
+            } catch (RuntimeException e) {
+                log.warn("清空回收站项失败 fileId={}", info.getFileId(), e);
+            }
+        }
+        return count;
+    }
+
+    /** 分享转存：利用内容寻址在接收者空间生成新逻辑记录，零数据拷贝 */
+    public FileVO createSharedCopy(FileInfo source, UserPrincipal receiver) {
+        return locks.write(contentKey(source.getFileHash(), source.getFileSize()), () ->
+                locks.read(GC_LOCK, () -> {
+                    if (!isStorageIntact(source)) {
+                        throw new BizException(42005, "文件已失效，无法转存");
+                    }
+                    checkQuota(receiver, source.getFileSize());
+                    String newFileId = UUID.randomUUID().toString();
+                    LocalDateTime now = LocalDateTime.now();
+                    FileInfo row = new FileInfo();
+                    row.setFileId(newFileId);
+                    row.setFileName(source.getFileName());
+                    row.setRelativePath("");
+                    row.setFileSize(source.getFileSize());
+                    row.setFileHash(source.getFileHash());
+                    row.setChunkSize(source.getChunkSize());
+                    row.setChunkTotal(source.getChunkTotal());
+                    row.setStoragePath(source.getStoragePath());
+                    row.setStatus(FileInfo.STATUS_DONE);
+                    row.setOwnerId(receiver.id());
+                    row.setCreateTime(now);
+                    row.setUpdateTime(now);
+                    fileInfoMapper.insert(row);
+                    return FileVO.from(row);
+                }));
+    }
+
+    /**
+     * 直接流式写入成品（供 WebDAV PUT 与桌面同步使用）：
+     * 边落临时文件边算 SHA-256，校验配额后按内容寻址去重落入存储后端；
+     * 若同路径已有文件，新文件落盘后替换旧逻辑记录。
+     */
+    public FileVO storeStream(String fileName, String relativePath, InputStream in, UserPrincipal user) {
+        String tempId = UUID.randomUUID().toString();
+        Path merged = null;
+        try {
+            // 先查同路径旧文件与可用额度，流式写入过程中实时截断超限请求，避免打满临时磁盘
+            List<FileInfo> existingSamePath = findByExactPath(user.id(), fileName, relativePath);
+            long existingReplacedBytes = existingSamePath.stream().mapToLong(FileInfo::getFileSize).sum();
+
+            long maxStream = props.getMaxStreamUploadBytes() > 0
+                    ? props.getMaxStreamUploadBytes()
+                    : Long.MAX_VALUE;
+            long remaining = quotaService != null ? quotaService.remainingBytesFor(user) : -1L;
+            long quotaCap = Long.MAX_VALUE;
+            if (remaining >= 0) {
+                quotaCap = remaining > Long.MAX_VALUE - existingReplacedBytes
+                        ? Long.MAX_VALUE
+                        : remaining + existingReplacedBytes;
+            }
+            long maxAllowed = Math.min(maxStream, quotaCap);
+            boolean quotaTightest = remaining >= 0 && quotaCap <= maxStream;
+
+            merged = chunkStorage.createMergeTmpFile(tempId);
+            MessageDigest digest = HashUtil.sha256();
+            long size = 0;
+            try (DigestInputStream digestIn = new DigestInputStream(in, digest);
+                 OutputStream out = new BufferedOutputStream(Files.newOutputStream(merged), 1 << 16)) {
+                byte[] buf = new byte[1 << 16];
+                int read;
+                while ((read = digestIn.read(buf)) != -1) {
+                    size += read;
+                    if (size > maxAllowed) {
+                        if (quotaTightest) {
+                            throw new BizException(41001, "存储空间不足：流式上传超过可用配额上限");
+                        }
+                        throw new BizException(10001, "单次流式上传超过大小上限");
+                    }
+                    out.write(buf, 0, read);
+                }
+            } catch (BizException e) {
+                deleteQuietly(merged);
+                throw e;
+            }
+            String hash = HexFormat.of().formatHex(digest.digest());
+
+            if (size > existingReplacedBytes) {
+                checkQuota(user, size - existingReplacedBytes);
+            }
+
+            final Path mergedFile = merged;
+            final long finalSize = size;
+            int chunkSize = (int) Math.max(1, props.getChunkSize());
+            int chunkTotal = calcChunkTotal(finalSize, chunkSize);
+            String newFileId = UUID.randomUUID().toString();
+            LocalDateTime now = LocalDateTime.now();
+
+            FileInfo inserted = locks.write(contentKey(hash, finalSize), () ->
+                    locks.read(GC_LOCK, () -> {
+                        FileInfo done = findUsableDone(hash, finalSize);
+                        String path;
+                        if (done != null) {
+                            deleteQuietly(mergedFile);
+                            path = done.getStoragePath();
+                        } else {
+                            path = chunkStorage.buildRelativePath(newFileId);
+                            try {
+                                objectStorage.put(path, mergedFile);
+                            } catch (IOException e) {
+                                deleteQuietly(mergedFile);
+                                throw new BizException(20005, "写入存储失败：" + e.getMessage());
+                            }
+                        }
+                        FileInfo row = new FileInfo();
+                        row.setFileId(newFileId);
+                        row.setFileName(fileName);
+                        row.setRelativePath(relativePath == null ? "" : relativePath);
+                        row.setFileSize(finalSize);
+                        row.setFileHash(hash);
+                        row.setChunkSize(chunkSize);
+                        row.setChunkTotal(chunkTotal);
+                        row.setStoragePath(path);
+                        row.setStatus(FileInfo.STATUS_DONE);
+                        row.setOwnerId(user.id());
+                        row.setCreateTime(now);
+                        row.setUpdateTime(now);
+                        fileInfoMapper.insert(row);
+                        return row;
+                    }));
+
+            for (FileInfo old : existingSamePath) {
+                try {
+                    delete(old.getFileId(), user);
+                } catch (RuntimeException e) {
+                    log.warn("覆盖旧文件失败 oldId={}", old.getFileId(), e);
+                }
+            }
+            return FileVO.from(inserted);
+        } catch (IOException e) {
+            deleteQuietly(merged);
+            throw new BizException(20005, "写入文件流失败：" + e.getMessage());
+        }
+    }
+
+    private List<FileInfo> findByExactPath(Long ownerId, String fileName, String relativePath) {
+        String rel = relativePath == null ? "" : relativePath;
+        return fileInfoMapper.selectList(new LambdaQueryWrapper<FileInfo>()
+                .eq(FileInfo::getOwnerId, ownerId)
+                .eq(FileInfo::getFileName, fileName)
+                .eq(FileInfo::getRelativePath, rel)
+                .eq(FileInfo::getStatus, FileInfo.STATUS_DONE))
+                .stream()
+                .filter(f -> fileName.equals(f.getFileName()) && rel.equals(f.getRelativePath()))
+                .toList();
+    }
+
+    private void checkQuota(UserPrincipal user, long additionalBytes) {
+        if (quotaService != null) {
+            quotaService.checkCanAllocate(user, additionalBytes);
         }
     }
 
@@ -882,13 +1192,13 @@ public class FileStorageService {
             FileInfo info = requireInfo(fileId, user);
             fileInfoMapper.deleteById(info.getId());
 
-            if (info.getStatus() == FileInfo.STATUS_DONE) {
+            if (info.getStatus() == FileInfo.STATUS_DONE || info.getStatus() == FileInfo.STATUS_TRASH) {
                 // 与秒传插入共用内容锁：删除行和数引用之间，不能再插进一条新引用，
                 // 否则会出现「数到 0 就删盘，但新行已经指向这个物理文件」。
                 locks.writeVoid(contentKey(info.getFileHash(), info.getFileSize()), () -> {
                     int stillReferenced = fileInfoMapper.countByStoragePath(info.getStoragePath());
                     if (stillReferenced == 0) {
-                        storage.delete(info.getStoragePath());
+                        objectStorage.delete(info.getStoragePath());
                         log.info("最后一个引用已删除，物理文件一并清理：{}", info.getStoragePath());
                     } else {
                         log.info("物理文件仍被 {} 条记录引用，予以保留：{}", stillReferenced, info.getStoragePath());
@@ -897,7 +1207,7 @@ public class FileStorageService {
             } else {
                 // 先清元数据再删目录；若数据库失败，保留目录供孤儿清理任务重试。
                 fileChunkMapper.deleteByFileId(fileId);
-                storage.deleteChunks(fileId);
+                chunkStorage.deleteChunks(fileId);
             }
         });
     }

@@ -26,6 +26,8 @@ public class DownloadTicket {
 
     private Long userId;
 
+    private Long shareId;
+
     private LocalDateTime expiresAt;
 
     private LocalDateTime createdAt;

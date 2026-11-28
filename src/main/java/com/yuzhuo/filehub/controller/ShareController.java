@@ -3,9 +3,11 @@ package com.yuzhuo.filehub.controller;
 import com.yuzhuo.filehub.auth.UserPrincipal;
 import com.yuzhuo.filehub.common.Result;
 import com.yuzhuo.filehub.dto.CreateShareRequest;
+import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.ResetShareCodeResponse;
 import com.yuzhuo.filehub.dto.ShareCreatedResponse;
+import com.yuzhuo.filehub.dto.ShareSaveRequest;
 import com.yuzhuo.filehub.dto.ShareVO;
 import com.yuzhuo.filehub.service.ShareService;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -57,5 +59,12 @@ public class ShareController {
     public Result<ResetShareCodeResponse> resetCode(@PathVariable String token,
                                                     @AuthenticationPrincipal UserPrincipal user) {
         return Result.ok(shareService.resetCode(token, user));
+    }
+
+    @PostMapping("/{token}/save")
+    public Result<FileVO> saveToMySpace(@PathVariable String token,
+                                        @Valid @RequestBody(required = false) ShareSaveRequest request,
+                                        @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(shareService.saveToMySpace(token, request, user));
     }
 }

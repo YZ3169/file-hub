@@ -4,6 +4,8 @@ import BaseIcon from './BaseIcon.vue'
 import { auth } from '../lib/auth'
 import { logout } from '../stores/uploader'
 
+const emit = defineEmits(['open-account'])
+
 const initial = computed(() => (auth.user?.username || '?').slice(0, 1).toUpperCase())
 const isAdmin = computed(() => auth.user?.role === 'ADMIN')
 const roleLabel = computed(() => (isAdmin.value ? '管理员' : '普通用户'))
@@ -16,6 +18,16 @@ const roleLabel = computed(() => (isAdmin.value ? '管理员' : '普通用户'))
       <strong :title="auth.user?.username">{{ auth.user?.username }}</strong>
       <span class="role" :class="{ admin: isAdmin }">{{ roleLabel }}</span>
     </div>
+    <button
+      class="icon-btn account-btn"
+      type="button"
+      title="账号设置 / 修改密码"
+      aria-label="账号设置"
+      data-testid="account-button"
+      @click="emit('open-account')"
+    >
+      <BaseIcon name="key" :size="15" />
+    </button>
     <button
       class="icon-btn"
       type="button"
@@ -94,6 +106,10 @@ const roleLabel = computed(() => (isAdmin.value ? '管理员' : '普通用户'))
 .icon-btn:hover {
   background: var(--hover);
   color: var(--bad);
+}
+
+.account-btn:hover {
+  color: var(--brand-2);
 }
 
 @media (max-width: 640px) {

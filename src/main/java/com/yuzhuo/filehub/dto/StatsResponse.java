@@ -10,6 +10,12 @@ public record StatsResponse(
         long uploadingFiles,
         long logicalBytes,
         long physicalBytes,
-        long savedBytes
+        long savedBytes,
+        long quotaBytes,
+        long quotaUsedBytes
 ) {
+    public StatsResponse(long doneFiles, long uploadingFiles, long logicalBytes,
+                         long physicalBytes, long savedBytes) {
+        this(doneFiles, uploadingFiles, logicalBytes, physicalBytes, savedBytes, -1L, logicalBytes);
+    }
 }

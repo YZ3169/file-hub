@@ -10,8 +10,21 @@ import ToastHost from './components/ToastHost.vue'
 import LoginView from './components/LoginView.vue'
 import UserMenu from './components/UserMenu.vue'
 import AdminIntegrityPanel from './components/AdminIntegrityPanel.vue'
+import AccountDialog from './components/AccountDialog.vue'
+import AuditPanel from './components/AuditPanel.vue'
+import AdminUsersPanel from './components/AdminUsersPanel.vue'
+import DesktopSyncPanel from './components/DesktopSyncPanel.vue'
 import ShareView from './components/ShareView.vue'
-import { applyTheme, bootstrap, clearFinished, state, toggleTheme } from './stores/uploader'
+import {
+  applyTheme,
+  bootstrap,
+  clearFinished,
+  retryAllFailed,
+  setConcurrency,
+  setSpeedLimit,
+  state,
+  toggleTheme,
+} from './stores/uploader'
 import { auth } from './lib/auth'
 import { formatBytes } from './lib/format'
 
@@ -49,6 +62,10 @@ const flow = [
 
 const isAdmin = computed(() => auth.user?.role === 'ADMIN')
 const showIntegrity = ref(false)
+const showAccount = ref(false)
+const showAudit = ref(false)
+const showUsers = ref(false)
+const showSync = ref(false)
 
 const resumableHint = computed(() =>
   state.pendingResumable.filter((p) => !state.tasks.some((t) => t.fingerprint === p.fingerprint)),
@@ -57,6 +74,7 @@ const resumableHint = computed(() =>
 const activeCount = computed(
   () => state.tasks.filter((t) => !['done', 'instant', 'canceled'].includes(t.state)).length,
 )
+const failedCount = computed(() => state.tasks.filter((t) => t.state === 'error').length)
 const finishedCount = computed(
   () => state.tasks.filter((t) => ['done', 'instant', 'canceled'].includes(t.state)).length,
 )
@@ -116,6 +134,36 @@ onBeforeUnmount(() => {
           <BaseIcon :name="state.theme === 'dark' ? 'sun' : 'moon'" :size="17" />
         </button>
         <button
+          v-if="auth.token && state.config.desktop"
+          class="btn btn-ghost btn-sm"
+          type="button"
+          data-testid="sync-button"
+          @click="showSync = true"
+        >
+          <BaseIcon name="rotate-ccw" :size="14" />
+          目录同步
+        </button>
+        <button
+          v-if="auth.token"
+          class="btn btn-ghost btn-sm"
+          type="button"
+          data-testid="audit-button"
+          @click="showAudit = true"
+        >
+          <BaseIcon name="activity" :size="14" />
+          日志
+        </button>
+        <button
+          v-if="isAdmin"
+          class="btn btn-ghost btn-sm"
+          type="button"
+          data-testid="admin-users-button"
+          @click="showUsers = true"
+        >
+          <BaseIcon name="users" :size="14" />
+          用户配额
+        </button>
+        <button
           v-if="isAdmin"
           class="btn btn-ghost btn-sm"
           type="button"
@@ -125,7 +173,7 @@ onBeforeUnmount(() => {
           <BaseIcon name="shield" :size="14" />
           完整性
         </button>
-        <UserMenu v-if="auth.token" />
+        <UserMenu v-if="auth.token" @open-account="showAccount = true" />
       </nav>
     </header>
 
@@ -214,15 +262,57 @@ onBeforeUnmount(() => {
               <template v-if="finishedCount"> · {{ finishedCount }} 个已结束</template>
             </span>
           </div>
-          <button
-            v-if="finishedCount"
-            class="btn btn-ghost btn-sm"
-            type="button"
-            @click="clearFinished"
-          >
-            <BaseIcon name="x" :size="14" />
-            清除已结束
-          </button>
+          <div class="queue-controls">
+            <label class="queue-select" title="分片上传并发数">
+              <span>并发</span>
+              <select
+                :value="state.concurrency"
+                aria-label="分片上传并发数"
+                data-testid="concurrency-select"
+                @change="setConcurrency($event.target.value)"
+              >
+                <option :value="1">1</option>
+                <option :value="2">2</option>
+                <option :value="4">4</option>
+                <option :value="6">6</option>
+                <option :value="8">8</option>
+              </select>
+            </label>
+            <label class="queue-select" title="上传速度上限">
+              <span>限速</span>
+              <select
+                :value="state.speedLimitKBps"
+                aria-label="上传限速"
+                data-testid="speed-limit-select"
+                @change="setSpeedLimit($event.target.value)"
+              >
+                <option :value="0">不限速</option>
+                <option :value="512">512 KB/s</option>
+                <option :value="2048">2 MB/s</option>
+                <option :value="5120">5 MB/s</option>
+                <option :value="10240">10 MB/s</option>
+              </select>
+            </label>
+            <button
+              v-if="failedCount"
+              class="btn btn-ghost btn-sm"
+              type="button"
+              data-testid="retry-failed-button"
+              @click="retryAllFailed"
+            >
+              <BaseIcon name="refresh" :size="14" />
+              重试失败 ({{ failedCount }})
+            </button>
+            <button
+              v-if="finishedCount"
+              class="btn btn-ghost btn-sm"
+              type="button"
+              @click="clearFinished"
+            >
+              <BaseIcon name="x" :size="14" />
+              清除已结束
+            </button>
+          </div>
         </div>
 
         <div v-if="!state.tasks.length" class="empty-queue">
@@ -259,6 +349,10 @@ onBeforeUnmount(() => {
     </main>
 
     <AdminIntegrityPanel v-if="showIntegrity" @close="showIntegrity = false" />
+    <AccountDialog v-if="showAccount" @close="showAccount = false" />
+    <AuditPanel v-if="showAudit" @close="showAudit = false" />
+    <AdminUsersPanel v-if="showUsers" @close="showUsers = false" />
+    <DesktopSyncPanel v-if="showSync" @close="showSync = false" />
 
     <ToastHost />
   </div>
@@ -773,5 +867,32 @@ onBeforeUnmount(() => {
     flex-direction: column;
     align-items: flex-start;
   }
+}
+
+.queue-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.queue-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queue-select select {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
 }
 </style>

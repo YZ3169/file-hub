@@ -64,6 +64,23 @@ public class TokenService {
         }
     }
 
+    public void revokeAllForUser(Long userId) {
+        if (userId != null) {
+            sessionMapper.deleteByUserId(userId);
+        }
+    }
+
+    public void revokeOthersForUser(Long userId, String keepRawToken) {
+        if (userId == null) {
+            return;
+        }
+        if (keepRawToken == null || keepRawToken.isBlank()) {
+            sessionMapper.deleteByUserId(userId);
+        } else {
+            sessionMapper.deleteByUserIdExceptTokenHash(userId, OpaqueToken.hash(keepRawToken));
+        }
+    }
+
     /** 从 Authorization 头取出 Bearer Token；不是 Bearer 方案时返回 null */
     public static String extractBearer(String authorization) {
         if (authorization == null) {

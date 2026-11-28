@@ -9,10 +9,12 @@ import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.config.ShareProperties;
 import com.yuzhuo.filehub.dto.CreateShareRequest;
 import com.yuzhuo.filehub.dto.DownloadTicketResponse;
+import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.ResetShareCodeResponse;
 import com.yuzhuo.filehub.dto.ShareCreatedResponse;
 import com.yuzhuo.filehub.dto.ShareMetaResponse;
+import com.yuzhuo.filehub.dto.ShareSaveRequest;
 import com.yuzhuo.filehub.dto.ShareVO;
 import com.yuzhuo.filehub.dto.ShareVerifyResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
@@ -23,6 +25,7 @@ import com.yuzhuo.filehub.mapper.FileShareMapper;
 import com.yuzhuo.filehub.mapper.UserAccountMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
@@ -63,6 +66,7 @@ public class ShareService {
     public static final String STATE_CANCELLED = "CANCELLED";
     public static final String STATE_FILE_MISSING = "FILE_MISSING";
     public static final String STATE_LOCKED = "LOCKED";
+    public static final String STATE_EXHAUSTED = "EXHAUSTED";
 
     /** 去掉 0/O/1/I 等易混字符，共 32 个 */
     private static final String CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -88,6 +92,13 @@ public class ShareService {
 
     private final ShareProperties properties;
 
+    private AuditService auditService;
+
+    @Autowired(required = false)
+    public void setAuditService(AuditService auditService) {
+        this.auditService = auditService;
+    }
+
     // ==================================================================
     // 登录后：创建 / 列表 / 取消 / 重置
     // ==================================================================
@@ -96,6 +107,9 @@ public class ShareService {
         int days = req.expiresInDays() == null ? DEFAULT_EXPIRY_DAYS : req.expiresInDays();
         if (!ALLOWED_EXPIRY_DAYS.contains(days)) {
             throw new BizException(10001, "有效期只能是 0（永久）/ 1 / 7 / 30 天");
+        }
+        if (req.maxDownloads() != null && req.maxDownloads() < 1) {
+            throw new BizException(10001, "最大允许提取次数至少为 1 次");
         }
 
         FileInfo info = fileStorageService.requireInfo(req.fileId(), user);
@@ -121,23 +135,31 @@ public class ShareService {
 
         LocalDateTime expiresAt = days == 0 ? null : now.plusDays(days);
         String token = OpaqueToken.generate();
-        String code = randomCode();
+        boolean needCode = req.requireCode() == null || req.requireCode();
+        String code = needCode ? randomCode() : "";
 
         FileShare share = new FileShare();
         share.setShareToken(token);
         share.setFileId(info.getFileId());
         share.setOwnerId(user.id());
-        share.setCodeHash(passwordEncoder.encode(protectedCode(code)));
+        share.setCodeHash(needCode ? passwordEncoder.encode(protectedCode(code)) : "");
+        share.setRequireCode(needCode ? 1 : 0);
         share.setExpiresAt(expiresAt);
         share.setStatus(FileShare.STATUS_ACTIVE);
         share.setDownloadCount(0L);
+        share.setMaxDownloads(req.maxDownloads());
         share.setFailedAttempts(0);
         share.setCreateTime(now);
         share.setUpdateTime(now);
         shareMapper.insert(share);
 
-        log.info("创建分享：file={} owner={} expiresAt={}", info.getFileId(), user.id(), expiresAt);
-        return new ShareCreatedResponse(token, code, "/#/s/" + token, expiresAt, now);
+        log.info("创建分享：file={} owner={} expiresAt={} requireCode={} maxDownloads={}",
+                info.getFileId(), user.id(), expiresAt, needCode, req.maxDownloads());
+        if (auditService != null) {
+            auditService.record(user, "SHARE_CREATE", "SHARE", token, info.getFileName(), null);
+        }
+        return new ShareCreatedResponse(token, code, "/#/s/" + token, expiresAt, now,
+                needCode, req.maxDownloads());
     }
 
     public PageResponse<ShareVO> listMine(int page, int size, UserPrincipal user) {
@@ -163,10 +185,12 @@ public class ShareService {
                     file == null ? null : file.getFileSize(),
                     row.getExpiresAt(),
                     stateOf(row, file, now),
-                    row.getDownloadCount() == null ? 0 : row.getDownloadCount(),
+                    downloads(row),
                     isLocked(row, now),
                     row.getLockedUntil(),
-                    row.getCreateTime()));
+                    row.getCreateTime(),
+                    needCode(row),
+                    row.getMaxDownloads()));
         }
         return new PageResponse<>(items, result.getTotal(), safePage, safeSize);
     }
@@ -178,6 +202,10 @@ public class ShareService {
             // 不是自己的、已经取消、或 token 不存在，统一文案，避免探测
             throw new BizException(42001, "分享不存在或已取消");
         }
+        FileShare share = shareMapper.findByToken(token);
+        if (share != null && share.getId() != null) {
+            ticketService.revokeByShareId(share.getId());
+        }
         log.info("取消分享：{}（owner={}）", token, user.id());
     }
 
@@ -188,6 +216,9 @@ public class ShareService {
                 || share.getOwnerId() == null || !share.getOwnerId().equals(user.id())) {
             throw new BizException(42001, "分享不存在或已取消");
         }
+        if (!needCode(share)) {
+            throw new BizException(10001, "免提取码分享无需重置提取码");
+        }
 
         String code = randomCode();
         LocalDateTime now = LocalDateTime.now();
@@ -196,12 +227,13 @@ public class ShareService {
         if (updated == 0) {
             throw new BizException(42001, "分享不存在或已取消");
         }
+        ticketService.revokeByShareId(share.getId());
         log.info("重置分享提取码：{}（owner={}）", token, user.id());
         return new ResetShareCodeResponse(token, code, share.getExpiresAt());
     }
 
     // ==================================================================
-    // 匿名：查状态 / 校验提取码
+    // 匿名：查状态 / 校验提取码 / 登录后转存
     // ==================================================================
 
     public ShareMetaResponse meta(String token) {
@@ -214,16 +246,22 @@ public class ShareService {
         if (isExpired(share, now)) {
             throw new BizException(42002, "分享已过期");
         }
+        if (isExhausted(share)) {
+            throw new BizException(42009, "该分享提取次数已达上限");
+        }
         boolean locked = isLocked(share, now);
         return new ShareMetaResponse(
                 locked ? STATE_LOCKED : STATE_ACTIVE,
                 share.getExpiresAt(),
                 locked,
-                share.getLockedUntil());
+                share.getLockedUntil(),
+                needCode(share),
+                share.getMaxDownloads(),
+                downloads(share));
     }
 
     /**
-     * 校验提取码。成功后签发一张绑定「文件 + 创建者」的短期下载票据，
+     * 校验提取码（或免提取码直接提取）。成功后签发一张绑定「文件 + 创建者」的短期下载票据，
      * 返回现有下载地址，Range/断点续传行为与登录下载完全一致。
      */
     public ShareVerifyResponse verify(String token, String rawCode) {
@@ -236,6 +274,94 @@ public class ShareService {
         if (isExpired(share, now)) {
             throw new BizException(42002, "分享已过期");
         }
+        if (isExhausted(share)) {
+            throw new BizException(42009, "该分享提取次数已达上限");
+        }
+
+        if (needCode(share)) {
+            verifyCodeWithLock(share, rawCode, now);
+        }
+
+        // 文件/所有者状态放在验码之后判断，避免只拿链接不用码就能探测文件是否失效
+        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
+        if (file == null) {
+            throw new BizException(42005, "文件已失效，无法下载");
+        }
+        UserAccount owner = userMapper.selectById(share.getOwnerId());
+        if (owner == null || !owner.isActive()) {
+            // 票据兑换时也会拒绝禁用用户，这里提前给出明确结果
+            throw new BizException(42005, "文件已失效，无法下载");
+        }
+
+        // 计数带过期与次数上限兜底：验码期间分享刚好过期/达到上限时不能签发票据
+        if (shareMapper.incrementDownload(share.getId(), LocalDateTime.now()) == 0) {
+            FileShare after = shareMapper.selectById(share.getId());
+            if (after == null || !isActive(after)) {
+                throw new BizException(42001, "分享不存在或已取消");
+            }
+            if (isExpired(after, LocalDateTime.now())) {
+                throw new BizException(42002, "分享已过期");
+            }
+            if (isExhausted(after)) {
+                throw new BizException(42009, "该分享提取次数已达上限");
+            }
+            throw new BizException(42001, "分享不存在或已取消");
+        }
+        DownloadTicketResponse ticket =
+                ticketService.issue(share.getFileId(), UserPrincipal.from(owner), share.getId());
+        log.info("分享提取成功：share={} file={}", token, share.getFileId());
+        return new ShareVerifyResponse(
+                file.getFileId(),
+                file.getFileName(),
+                file.getFileSize(),
+                ticket.url(),
+                ticket.expiresAt(),
+                share.getExpiresAt());
+    }
+
+    /** 一键转存分享文件到当前登录用户网盘（基于内容寻址零拷贝复用） */
+    public FileVO saveToMySpace(String token, ShareSaveRequest req, UserPrincipal receiver) {
+        validateToken(token);
+        FileShare share = shareMapper.findByToken(token);
+        LocalDateTime now = LocalDateTime.now();
+        if (share == null || !isActive(share)) {
+            throw new BizException(42001, "分享不存在或已取消");
+        }
+        if (isExpired(share, now)) {
+            throw new BizException(42002, "分享已过期");
+        }
+
+        boolean verifiedByTicket = false;
+        if (req != null && req.ticket() != null && !req.ticket().isBlank()) {
+            UserPrincipal resolved = ticketService.resolveForShare(
+                    share.getFileId(), share.getId(), req.ticket());
+            if (resolved != null && resolved.id().equals(share.getOwnerId())) {
+                verifiedByTicket = true;
+            }
+        }
+        if (!verifiedByTicket) {
+            if (isExhausted(share)) {
+                throw new BizException(42009, "该分享提取次数已达上限");
+            }
+            if (needCode(share)) {
+                verifyCodeWithLock(share, req == null ? null : req.code(), now);
+            }
+        }
+
+        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
+        if (file == null) {
+            throw new BizException(42005, "文件已失效，无法转存");
+        }
+        FileVO copy = fileStorageService.createSharedCopy(file, receiver);
+        if (auditService != null) {
+            auditService.record(receiver, "SHARE_SAVE", "FILE", copy.fileId(),
+                    file.getFileName() + " <- share:" + token, null);
+        }
+        log.info("分享转存成功：share={} receiver={} newFile={}", token, receiver.id(), copy.fileId());
+        return copy;
+    }
+
+    private void verifyCodeWithLock(FileShare share, String rawCode, LocalDateTime now) {
         if (isLocked(share, now)) {
             throw lockException(share, now);
         }
@@ -252,8 +378,6 @@ public class ShareService {
         int maxAttempts = Math.max(1, properties.getCodeMaxAttempts());
         LocalDateTime lockUntil = now.plusMinutes(Math.max(1, properties.getCodeLockMinutes()));
 
-        // 先原子地占一次尝试额度，再比对提取码。顺序反过来会让并发请求全部先跑完
-        // BCrypt，实际被测试的码数远超阈值。
         if (shareMapper.reserveAttempt(share.getId(), maxAttempts, lockUntil, now) == 0) {
             FileShare after = shareMapper.selectById(share.getId());
             if (after == null || !isActive(after)) {
@@ -278,41 +402,7 @@ public class ShareService {
             throw new BizException(42003, "提取码错误，还可尝试 " + remaining + " 次");
         }
 
-        // 码是对的：这一次不该被算成失败尝试（文件即使失效也不能把用户锁死）
         shareMapper.clearFailures(share.getId(), now);
-
-        // 文件/所有者状态放在验码之后判断，避免只拿链接不用码就能探测文件是否失效
-        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
-        if (file == null) {
-            throw new BizException(42005, "文件已失效，无法下载");
-        }
-        UserAccount owner = userMapper.selectById(share.getOwnerId());
-        if (owner == null || !owner.isActive()) {
-            // 票据兑换时也会拒绝禁用用户，这里提前给出明确结果
-            throw new BizException(42005, "文件已失效，无法下载");
-        }
-
-        // 计数带过期兜底：验码期间分享刚好过期时不能签发票据
-        // BCrypt 与文件检查可能耗时，不能复用请求开始时的时间。
-        if (shareMapper.incrementDownload(share.getId(), LocalDateTime.now()) == 0) {
-            FileShare after = shareMapper.selectById(share.getId());
-            if (after == null || !isActive(after)) {
-                throw new BizException(42001, "分享不存在或已取消");
-            }
-            if (isExpired(after, LocalDateTime.now())) {
-                throw new BizException(42002, "分享已过期");
-            }
-            throw new BizException(42001, "分享不存在或已取消");
-        }
-        DownloadTicketResponse ticket = ticketService.issue(share.getFileId(), UserPrincipal.from(owner));
-        log.info("分享提取成功：share={} file={}", token, share.getFileId());
-        return new ShareVerifyResponse(
-                file.getFileId(),
-                file.getFileName(),
-                file.getFileSize(),
-                ticket.url(),
-                ticket.expiresAt(),
-                share.getExpiresAt());
     }
 
     // ==================================================================
@@ -339,7 +429,22 @@ public class ShareService {
         if (isExpired(share, now)) {
             return STATE_EXPIRED;
         }
+        if (isExhausted(share)) {
+            return STATE_EXHAUSTED;
+        }
         return STATE_ACTIVE;
+    }
+
+    private static boolean needCode(FileShare share) {
+        return share.getRequireCode() == null || share.getRequireCode() == 1;
+    }
+
+    private static long downloads(FileShare share) {
+        return share.getDownloadCount() == null ? 0L : share.getDownloadCount();
+    }
+
+    private static boolean isExhausted(FileShare share) {
+        return share.getMaxDownloads() != null && downloads(share) >= share.getMaxDownloads();
     }
 
     private boolean isExpired(FileShare share, LocalDateTime now) {

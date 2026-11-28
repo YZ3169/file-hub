@@ -28,6 +28,9 @@ public class UserAccount {
     /** 1=可登录 */
     private Integer enabled;
 
+    /** 存储配额（字节），-1 表示不限制 */
+    private Long storageQuotaBytes;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;

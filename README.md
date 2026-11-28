@@ -10,14 +10,16 @@ Windows 10/11 x64 用户：在发行版的 **Assets** 中，日常使用选 `Fil
 工作台支持「选择文件夹」或直接拖入文件夹，递归上传其中的文件，并在队列、文件列表和详情中保留相对路径。
 不同目录的同名文件独立记录，仍可分片、秒传和断点续传；刷新后重新选择原文件夹即可继续。
 空文件可以上传；空目录不创建记录，下载仍按单个文件进行。
-升级已有 MySQL 部署时，先执行 `scripts/migrate-v7-relative-path.sql` 增加路径字段；
+升级已有 MySQL 部署时，先执行 `scripts/migrate-v7-relative-path.sql`（若从更早版本升级）和
+`scripts/migrate-v8-features.sql` 补齐目录、回收站、配额、分享限制与审计表；
 桌面版 H2 会在启动时自动补齐，原有文件记录不受影响。
 
 一个自己实现存储层的文件服务：**分片上传 / 秒传 / 断点续传 / 分片级校验与自动补传**，
 外加一个 Vue 3 + Vite 的可视化传输工作台，以及**按账号隔离的鉴权与限流**。
+支持**在线预览（音视频 Range / 图片 / PDF / 代码文本）、目录层级浏览与批量 Zip 打包、30 天回收站、用户存储配额、S3 / MinIO 对象存储后端、WebDAV 挂载、免密/限次分享与一键转存、审计日志、上传并发/限速/剪贴板粘贴，以及桌面端托盘自启与本地目录同步**。
 
 和"调一个 OSS SDK 把文件传上去"不同，这个项目把对象存储那一层的语义自己写了一遍——
-内容寻址、分片状态、合并的原子性、并发去重——所以它替换掉本地磁盘实现就能接 OSS/MinIO，
+内容寻址、分片状态、合并的原子性、并发去重——并通过 `StorageBackend` 接口可插拔切换本地磁盘或 S3/MinIO/OSS，
 而不是把业务代码绑死在某个云厂商的 SDK 上。
 
 前端构建产物直接打进 `src/main/resources/static/`，**一个 jar + 一个静态工作台**，
@@ -372,17 +374,18 @@ KEY idx_share_expires (expires_at)
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/share` | `{fileId, expiresInDays}`，取值 `1/7/30/0`（0=永久），默认 7 天；仅文件所有者可创建 |
+| POST | `/api/share` | `{fileId, expiresInDays, requireCode?, maxDownloads?}`，`expiresInDays` 取值 `1/7/30/0`；支持关闭提取码和限制最大提取次数 |
 | GET | `/api/share/mine?page=1&size=20` | 我的分享（不返回提取码，库里只有 BCrypt 摘要） |
 | DELETE | `/api/share/{token}` | 取消分享，链接立即失效 |
 | POST | `/api/share/{token}/reset-code` | 换一个提取码，同时清零失败次数、解除锁定 |
-| GET | `/api/public/share/{token}` | 匿名查询状态；只返回 `state/expiresAt/locked/lockedUntil`，**不返回文件名、大小、所有者** |
-| POST | `/api/public/share/{token}/verify` | `{code}`，成功才返回文件名/大小和一张 5 分钟票据下载地址 |
+| POST | `/api/share/{token}/save` | `{code?, ticket?}`，已登录用户一键免拷贝转存到自己的网盘空间（校验配额并记录相对路径） |
+| GET | `/api/public/share/{token}` | 匿名查询状态；只返回 `state/requireCode/maxDownloads/downloadCount/expiresAt/locked/lockedUntil`，**不返回文件名、大小、所有者** |
+| POST | `/api/public/share/{token}/verify` | `{code?}`，免密分享可直接校验；成功才返回文件名/大小和一张 5 分钟票据下载地址 |
 
 - **链接形态**是 `index.html#/s/<43 位随机 token>`，用当前浏览器 origin 拼出来。反向代理部署时
   必须用对外域名访问，否则拼出来的是 `localhost`。
 - **提取码** 4 位，字母表去掉了 `0/O/1/I` 等易混字符；输入会 `trim` + 转大写。库里只存 BCrypt
-  摘要，明文只在创建/重置时返回一次。忘了只能重置，不能找回。
+  摘要，明文只在创建/重置时返回一次。也可创建 `requireCode=false` 的公开免密分享，并配合 `maxDownloads` 控制最多提取次数。
 - **防爆破**：每个分享连续错 10 次锁 15 分钟（`file-hub.share.*` 可调），匿名接口再按
   IP + token 限流 30 次/分钟、按 IP 总量 120 次/分钟（token 写法由客户端控制，只按 token
   分桶可以被编码变体绕过）。4 位码只有约 20 bit 熵，靠这两层兜底，别把它当高安全的口令。
@@ -393,22 +396,32 @@ KEY idx_share_expires (expires_at)
   `max-active-per-owner`），防止刷分享行和 BCrypt 编码拖垮 CPU。
 - **已知取舍**：锁定是按分享的，拿到链接的人可以故意输错把分享锁 15 分钟。这是防爆破和
   可用性之间选的边；被恶意锁定时，所有者重置提取码即可立刻解锁。
-- **下载完全复用现有链路**：校验通过后以**文件所有者**身份签发原有 5 分钟下载票据，所以 Range、
-  多段 Range、流式下载的行为与登录下载一模一样，没有第二套下载代码。
-- **失效语义**：取消/过期后新校验立即失败，但已经签发出去的票据最多还能再用 5 分钟；
-  要即时吊销，需要下一版把 `share_id` 写进票据表并在下载入口复查。
+- **下载与预览完全复用现有链路**：校验通过后以**文件所有者**身份签发原有 5 分钟下载票据，所以 Range、
+  多段 Range、流式下载与在线预览（`?inline=true`）行为与登录下载一模一样，没有第二套下载代码。
+- **失效语义**：取消/重置提取码/过期/达到 `maxDownloads` 上限后，新校验立即失败，
+  且取消或重置提取码时会按 `share_id` **立即吊销**已签发过的 5 分钟下载票据。
 - **桌面版**的分享链接是 `127.0.0.1:18080`，只能在同一台机器打开；界面会明确提示，
   跨机器分享请部署服务器版（Docker）。
 - 服务器部署建议套 HTTPS：提取码和票据都在 URL/请求体里，明文 HTTP 在不可信网络上没有保密性。
   未配 HTTPS 时前端复制链接会回退到 `execCommand`，功能可用但仅限可信局域网。
-- 已有 MySQL 库执行 `scripts/migrate-v6-share.sql`（只建新表，幂等）；桌面版 H2 启动时自动建表。
-  定时任务每 30 分钟清理已取消/过期超过 7 天的记录和文件已不存在的孤儿分享。
+- 已有 MySQL 库依次执行 `scripts/migrate-v6-share.sql`、`scripts/migrate-v8-features.sql`（幂等）；
+  桌面版 H2 启动时自动建表。定时任务每 30 分钟清理已取消/过期/耗尽超过 7 天的记录和文件已不存在的孤儿分享。
 
 错误码：`42001` 不存在或已取消、`42002` 已过期、`42003` 提取码错误（带剩余次数）、
 `42004` 次数过多已锁定、`42005` 文件已失效、`42006` 提取码格式不对、`42007` 不是文件所有者、
-`42008` 有效分享数量达到上限。
+`42008` 有效分享数量达到上限、`42009` 下载次数已达上限。
 
 ---
+
+## 工作台增强与企业能力（v8）
+
+- **在线预览**：`/api/file/{id}/download?inline=true` 按安全白名单推断 `Content-Type`，支持图片缩略/原图切换、HTML5 音视频 HTTP Range 拖拽播放、PDF 内嵌阅读、文本/代码前 2MB 带行号切片预览；SVG 强制附带 `Content-Security-Policy: sandbox` 防止 XSS。
+- **目录视图与批量打包**：支持「平铺列表 / 目录树」切换、面包屑导航、显式创建空目录（`file_folder`）、单文件/批量移动与重命名、文件夹/多选文件通过短期票据流式 `ZipOutputStream` 打包下载（`/api/file/zip-ticket` + `/api/file/zip`）。
+- **回收站（30 天软删除）**：工作台文件列表删除已完成文件优先进入回收站（`status=2`，`deleted_at`），可随时还原或彻底清空；回收站内文件仍纳入内容寻址引用计数，超过 `file-hub.trash-retention-days`（默认 30 天）后自动彻底清理。直接 `DELETE /api/file/{id}` 仍保持立即永久删除以兼容既有 API 与 E2E 脚本。
+- **存储配额与用户管理**：支持通过 `file-hub.quota.default-bytes`（`-1` 不限）与管理员面板（`/api/admin/users`）按用户设置配额与启停状态；上传初始化和分享转存前严格校验剩余可用额度。
+- **S3 / MinIO 对象存储后端**：设置 `file-hub.storage.type=s3` 后，通过 `S3StorageBackend`（AWS SDK v2 `url-connection-client`）对接 MinIO、AWS S3、阿里云 OSS、腾讯云 COS，支持大文件分片 multipart 上传、异常自动 `abortMultipartUpload` 清理、HTTP Range 读取和存储桶健康探针；分片暂存目录保留在本地磁盘。
+- **WebDAV 挂载服务**：内置 `/dav/*` 过滤器，支持 Windows 映射网络驱动器、macOS Finder、RaiDrive、rclone 等标准 WebDAV 客户端（`OPTIONS / PROPFIND / GET+Range / HEAD / PUT / MKCOL / DELETE / MOVE / COPY / LOCK / UNLOCK`），使用账号用户名 + 密码 HTTP Basic 认证或 Bearer Token。
+- **传输体验与操作审计**：支持 `Ctrl+V` 剪贴板粘贴文件或截图上传、队列分片并发数（1–8）与上行限速调节、一键重试所有失败任务、账号自助修改密码（`/api/auth/password`），以及关键上传/分享/删除/鉴权动作审计记录查询（`/api/audit/logs`）。
 
 ## 管理员完整性扫描与修复（v5）
 
@@ -454,13 +467,13 @@ KEY idx_share_expires (expires_at)
 
 ```bash
 export MYSQL_PWD=你的口令
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.1.0.jar \
   --server.port=8081 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
   --file-hub.cluster.redis-address=redis://127.0.0.1:6379
 
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar \
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.1.0.jar \
   --server.port=8082 \
   --file-hub.root=/shared/file-hub-data \
   --file-hub.cluster.enabled=true \
@@ -526,11 +539,21 @@ docker compose up --build
 docker compose -f docker-compose.cluster.yml up --build
 ```
 
+启用内置 MinIO 验证 S3 存储后端（`s3` profile，Console 端口 `9001`，S3 API 端口 `9000`）：
+
+```bash
+export FILE_HUB_STORAGE_TYPE=s3
+export FILE_HUB_S3_ENDPOINT=http://minio:9000
+export FILE_HUB_S3_ACCESS_KEY=minioadmin
+export FILE_HUB_S3_SECRET_KEY=minioadmin
+docker compose --profile s3 up --build
+```
+
 - 镜像多阶段构建：Maven 阶段 `package -DskipTests`，运行阶段用 JRE + 非 root 用户，
   存储根目录固定为 `/data` 卷。
 - 两个口令只从环境变量注入，compose 文件里没有明文；数据库端口没有映射到宿主机。
 - `schema.sql` 里含 `DROP TABLE IF EXISTS`，但只会在 MySQL 首次初始化**空数据卷**时执行一次；
-  已有数据请用 `scripts/migrate-v*.sql`，不要删卷重来。
+  已有数据请依次执行 `scripts/migrate-v*.sql`（新版升级需执行 `scripts/migrate-v8-features.sql`），不要删卷重来。
 - 前端产物已经提交在 `src/main/resources/static`，镜像里不需要再跑 npm。
 
 ---
@@ -543,7 +566,7 @@ docker compose -f docker-compose.cluster.yml up --build
 
 ### 安装与使用
 
-1. 运行 `FileHub-1.0.5.msi`（构建产物在 `build/desktop/dist/`）。
+1. 运行 `FileHub-1.1.0.msi`（构建产物在 `build/desktop/dist/`）。
    按用户安装，安装时可以改目录（默认 `%LOCALAPPDATA%\FileHub`），不需要管理员权限；
    选择的目录是**上级目录**，安装程序会自动在其中创建 `FileHub` 子文件夹
    （例如选 `D:\` 会装到 `D:\FileHub`），不需要手动新建文件夹；
@@ -552,8 +575,9 @@ docker compose -f docker-compose.cluster.yml up --build
 3. 第一次使用先注册。**第一个注册的账号自动成为管理员**（桌面版单人使用，
    不需要额外配置管理员密码）。
 4. 关闭窗口时会弹窗确认：可以「最小化到托盘」继续运行，或「直接退出」。
-   最小化后双击托盘图标恢复窗口；托盘菜单里还可以打开数据目录、退出程序。
-5. 重复双击只会把已有窗口调到前台，不会启动第二个进程
+   最小化后双击托盘图标恢复窗口；托盘菜单支持「复制访问地址」、「打开数据目录」、勾选「开机自启动」（写入当前用户 `HKCU\...\Run`，带 `--minimized` 参数开机静默最小化到托盘）和「退出程序」。
+5. 工作台顶栏提供「目录同步」面板：可通过 WebView2 原生目录选择对话框指定本地目录，启用后使用 Java NIO `WatchService` + 定时核对自动将本地文件单向增量同步备份到指定网盘目录。
+6. 重复双击只会把已有窗口调到前台，不会启动第二个进程
    （外壳单实例互斥量 + 数据目录文件锁）。
 6. 从旧版升级：直接运行新版本 MSI 即可，会替换旧版程序、保留
    `%LOCALAPPDATA%\FileHubData` 里的账号和文件。**新包的版本号必须高于旧版**
@@ -596,7 +620,7 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 
 # 产物
 #   build/desktop/dist/FileHub/FileHub.exe        免安装目录（可整体拷贝）
-#   build/desktop/dist/FileHub-1.0.5.msi           安装包
+#   build/desktop/dist/FileHub-1.1.0.msi           安装包
 ```
 
 安装目录里有两个 exe：`FileHub.exe` 是 WebView2 外壳（开始菜单/桌面快捷方式指向它），
@@ -613,8 +637,8 @@ WIX_BIN=D:/Tools/wix314 bash scripts/package-desktop.sh
 把 `pom.xml` 的版本号和标签对齐后推 tag：
 
 ```bash
-git tag v1.0.5
-git push origin v1.0.5
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 `.github/workflows/release-desktop.yml` 会在 `windows-latest` 上跑单测、下载 WiX 便携版、
@@ -698,7 +722,7 @@ export MYSQL_PWD=你的口令
 mvn clean package -DskipTests
 # 管理员密码只从环境变量注入；不设置就不创建管理员，普通用户仍可注册
 export FILE_HUB_ADMIN_PASSWORD='一个至少8位的口令'
-java -Dfile.encoding=UTF-8 -jar target/file-hub-1.0.5.jar
+java -Dfile.encoding=UTF-8 -jar target/file-hub-1.1.0.jar
 # → http://127.0.0.1:8081         Vue 工作台（先注册/登录）
 # → http://127.0.0.1:8081/classic.html   原始单页演示（共用同一份本机 Token）
 ```
@@ -762,35 +786,49 @@ localStorage 按用户隔离、任务卡进度 aria、文件表搜索/分页/筛
 | POST | `/api/auth/login` | 登录，返回 Token + 用户信息 |
 | GET | `/api/auth/me` | 当前用户与角色 |
 | POST | `/api/auth/logout` | 撤销当前 Token，幂等 |
+| POST | `/api/auth/password` | 修改当前用户密码 |
 | GET | `/api/file/config` | 分片大小、存储后端标识（公开） |
 | GET | `/api/file/check?hash=&size=` | 秒传预检（只在当前用户可见范围内找） |
-| POST | `/api/file/init` | 秒传 / 复用上传中任务 / 新建，返回已传分片 |
+| POST | `/api/file/init` | 秒传 / 复用上传中任务 / 新建，返回已传分片（校验配额） |
 | POST | `/api/file/chunk` | `fileId` + `index` + 可选 `chunkHash` + 分片 |
 | GET | `/api/file/{id}/status` | 以磁盘为准的已传分片（断点续传对齐） |
 | POST | `/api/file/{id}/complete` | 逐片 + 整文件校验、流式合并（30005 表示坏片已剔除） |
 | GET | `/api/file/list?page=&size=&keyword=&status=&sort=&scope=` | 分页文件列表（`items` + `total`）；ADMIN 可用 `scope=all` |
-| GET | `/api/file/stats?scope=` | 秒传节省统计；统计口径随账号隔离 |
+| GET | `/api/file/stats?scope=` | 秒传节省与存储配额统计；统计口径随账号隔离 |
 | GET | `/api/file/{id}/download-ticket` | 换取 5 分钟下载票据（浏览器用） |
-| GET | `/api/file/{id}/download` | 流式下载，支持单段/多段 `Range`；Bearer 或 `?ticket=` |
-| DELETE | `/api/file/{id}` | 删除自己的逻辑记录，最后一个引用才删物理文件 |
+| GET | `/api/file/{id}/download` | 流式下载/预览（支持 `inline=true` 与单段/多段 `Range`）；Bearer 或 `?ticket=` |
+| DELETE | `/api/file/{id}` | 永久删除自己的逻辑记录，最后一个引用才删物理文件 |
+| POST/GET/DELETE | `/api/file/{id}/trash`、`/restore`、`/trash` | 移入回收站、从回收站还原、查看回收站列表与清空回收站 |
+| GET/POST | `/api/file/tree`、`/folder`、`/{id}/move`、`/folder/*` | 目录树与面包屑、新建目录、文件/目录移动与重命名 |
+| POST/GET | `/api/file/batch/*`、`/zip-ticket`、`/zip` | 批量移动/回收/还原/删除，以及多文件/目录流式 Zip 打包下载 |
+| GET | `/api/audit/logs` | 分页审计日志查询（普通用户查自己，ADMIN 可选 `scope=all`） |
+| GET/PUT | `/api/admin/users`、`/{userId}/quota`、`/{userId}/status` | ADMIN：用户列表、修改用户存储配额、启用/禁用账号 |
 | GET | `/api/admin/integrity/scan?deep=&limit=` | ADMIN：扫描损坏文件（存在性/大小，可选 SHA-256 复算） |
 | POST | `/api/admin/integrity/repair` | ADMIN：`{fileIds}` 删除复检确认损坏的记录；普通用户 403 |
+| GET/POST/PUT/DELETE | `/api/desktop/sync/**` | 桌面端（`filehub.desktop=true`）本地目录自动备份同步规则管理 |
+| WebDAV | `/dav/*` | RFC 4918 WebDAV 服务（Basic / Bearer Auth，支持网盘挂载读写） |
 
 Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志会按 GBK 处理中文。
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `file-hub.root` | `D:/Projects/file-hub-data` | 存储根目录 |
+| `file-hub.storage.type` | `local` | 成品存储后端：`local`（本地磁盘）或 `s3`（S3/MinIO/OSS/COS） |
+| `file-hub.storage.s3.*` | 见 `application.yml` | S3 `endpoint`、`region`、`bucket`、`access-key`、`secret-key`、`key-prefix`、`path-style-access`、`auto-create-bucket` |
 | `file-hub.chunk-size` | 5MB | 分片大小，前端按它切片（服务端会校验取值范围） |
+| `file-hub.trash-retention-days` | 30 | 回收站文件保留天数，超期定时清理 |
+| `file-hub.quota.default-bytes` | `-1` | 新用户默认存储配额（字节，`-1` 表示不限制） |
+| `file-hub.max-stream-upload-bytes` | `2147483648`（2GB） | 单次流式上传（WebDAV `PUT` / 桌面同步）大小上限 |
 | `file-hub.orphan-file-grace-hours` | 168（7 天） | 无任何数据库记录引用的成品文件，超过这个时长才回收 |
 | `file-hub.auth.token-ttl-hours` | 168 | 登录 Token 有效期 |
 | `file-hub.auth.ticket-ttl-minutes` | 5 | 下载票据有效期 |
 | `file-hub.auth.allow-registration` | true | 是否开放自助注册 |
+| `file-hub.auth.docs-public` | `false` | Swagger/OpenAPI 默认仅 `ADMIN` 访问；设 `FILE_HUB_DOCS_PUBLIC=true` 可公开 |
 | `file-hub.cluster.enabled` | false | 开启后锁和限流切到 Redis（多实例） |
 | `file-hub.cluster.redis-address` | `redis://127.0.0.1:6379` | 集群模式的 Redis 地址 |
 | `file-hub.cluster.redis-database` | 0 | Redis database |
 | `file-hub.cluster.key-prefix` | `filehub:` | 锁和限流 key 的统一前缀 |
-| `file-hub.rate-limit.*` | 见 `application.yml` | 登录/注册/init/chunk/其他接口的固定窗口限额 |
+| `file-hub.rate-limit.*` | 见 `application.yml` | 登录/注册/init/chunk/WebDAV（`webdav-per-minute` / `webdav-auth-fail-per-minute`）限流阈值 |
 | `MYSQL_URL`（环境变量） | 本机 3306 | 覆盖 JDBC URL；容器里指向 `mysql:3306` |
 | `FILE_HUB_ROOT`（环境变量） | `file-hub.root` | 容器/共享目录部署时用，如 `/data` |
 | `SERVER_PORT`（环境变量） | 8081 | 容器内监听端口 |
@@ -802,10 +840,10 @@ Windows 下 `-Dfile.encoding=UTF-8` 不能省：不指定时 SnakeYAML / 日志�
 ### 验证
 
 ```bash
-mvn test                      # 127 个单元/集成测试（含续传、分享过期边界、分片清理、H2 桌面数据库）
+mvn test                      # 153 个单元/集成测试（含 S3 后端、WebDAV 限流、安全头、票据吊销、回收站、配额、审计、H2 桌面数据库）
 cd web && npm run lint && npm run format:check && npm run test:unit && npm run build
-                              # 前端：149 个单元/组件测试（含账号切换、摘要缓存核对、文件详情、分页及复制回退）+ 生产构建
-bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB，逐项断言，含跨用户隔离）
+                              # 前端：204 个单元/组件测试（含类型筛选、Markdown/连播预览、目录选择器、拖拽移动、批量操作、免密/限次分享与转存、粘贴上传）+ 生产构建
+bash scripts/e2e-test.sh      # 单机端到端验收（真传 120MB + v8 预览/目录/Zip/回收站/免密转存/WebDAV/审计）
 bash scripts/e2e-cluster.sh   # 多实例验收（两个 JVM + 共享目录 + Redis）
 bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 ```
@@ -816,23 +854,22 @@ bash scripts/bench.sh 1000 4  # 基准测试，输出 markdown 表格
 
 单元测试不需要 MySQL；E2E 需要一个已建库的 MySQL 和服务端，并会注册两个随机用户做租户隔离用例。
 设置 `FILE_HUB_ADMIN_PASSWORD`（启动服务时同一环境变量）还会验证管理员 `scope=all`、完整性扫描/
-修复和普通用户 403；不设置则跳过这些用例。E2E 结束时会删掉自己留下的上传中任务，可以重复执行。
+修复、Swagger 管理员访问和普通用户 403；不设置则跳过这些用例。E2E 结束时会删掉自己留下的上传中任务，可以重复执行。
 全文索引用例需要先执行 `scripts/migrate-v5-fulltext.sql`。
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 上跑五个任务：
+`.github/workflows/ci.yml` 在每次 push / PR 上跑八个任务：
 
 1. `mvn test`；
 2. 前端 `npm ci && npm run lint && npm run format:check && npm run test:unit && npm run build`
    （ESLint/Prettier 零容忍，Vitest 全绿，Vue 模板和 Worker 都能过编译）；
-3. 起 MySQL 8.0 service，导入 `schema.sql`，构建前端后打包，用临时存储目录和一次性管理员口令
-   启动 jar，安装 Playwright Chromium，跑 `web/e2e` 的浏览器用例（登录/刷新恢复/退出、
-   上传→列表→搜索→下载→删除、管理员身份）；失败时上传 trace/HTML 报告；
-4. 起一个 MySQL 8.0 service，导入 `schema.sql`，用临时存储目录和一次性管理员口令启动 jar，
-   再跑完整的 `scripts/e2e-test.sh`（注册/登录、跨用户隔离、票据下载、限流错误码都在里面）；
-5. 起 MySQL + Redis 7 service，同时启动 8081/8082 两个 JVM（同一数据库、同一共享目录、
-   `cluster.enabled=true`），跑 `scripts/e2e-cluster.sh`（跨节点上传/合并/秒传/并发完成/共享限流）。
+3. `ui-e2e`：起 MySQL 8.0，跑 `web/e2e` 浏览器 Playwright 全流程（含上传、分享、目录树、预览、回收站、审计日志）；
+4. `e2e`：起 MySQL 8.0 跑完整 `scripts/e2e-test.sh`；
+5. `e2e-cluster`：起 MySQL + Redis 7 双实例集群，跑 `scripts/e2e-cluster.sh`；
+6. `s3-minio-e2e`：起 MySQL 8.0 + MinIO 容器，以 `storage.type=s3` 实测分片上传、秒传、在线预览、WebDAV 与删除；
+7. `migration-check`：对干净新库及模拟旧版表结构重复执行两次 `scripts/migrate-v8-features.sql`，验证幂等升级不报错；
+8. `docker-build`：验证多阶段 `Dockerfile` 镜像可完整构建。
 
 CI 里的 MySQL 口令和 `FILE_HUB_ADMIN_PASSWORD` 都是一次性容器值，不是任何真实环境的口令。
 
@@ -902,14 +939,16 @@ Phase 3 的运维端点在同一个实例上手工验证过（2026-11-18），�
   （relativePath 或 name + size + lastModified）查找本地断点记录，重新核对内容摘要后，
   按服务端返回的分片状态续传，已上传的有效分片无需重传。
 - **多实例依赖共享目录和 Redis**：共享目录必须支持原子 rename、mtime 一致（NFS/SMB 的语义
-  要在目标环境实测）；Redis 目前是单点，没有做 Sentinel/Cluster 高可用。Redis 不可用时上传和
-  登录会明确失败（`20008` / HTTP 503），这是刻意的 fail-closed，不是降级。S3/MinIO 仍不在范围内。
-- **Token 存在 localStorage**：实现简单、刷新不掉线，但同源 XSS 能读到它。生产环境更稳妥的是
-  HttpOnly Cookie + CSRF 防护，或配合严格 CSP；当前只做了「退出即撤销 + 7 天过期」。
-- **认证范围有限**：没有找回密码、邮箱验证、OAuth、2FA、登录审计表；限流是固定窗口
-  （单机 Caffeine、多实例 Redis），不是令牌桶/漏桶。
+  要在目标环境实测）；`storage.type=s3` 模式下成品直接入对象存储，分片暂存仍需各自或共享的本地临时盘；
+  Redis 目前是单点，没有做 Sentinel/Cluster 高可用。Redis 不可用时上传和登录会明确失败
+  （`20008` / HTTP 503），这是刻意的 fail-closed，不是降级。
+- **Token 存在 localStorage**：实现简单、刷新不掉线，已配合全站 CSP、`X-Content-Type-Options: nosniff`
+  与 `Referrer-Policy: no-referrer`（并隔离 SVG 预览）降低风险，高敏场景下更稳妥的做法仍是 `HttpOnly Cookie + CSRF`；
+  改密与禁用账号均会立即撤销既有会话。
+- **认证范围有限**：已补齐账号自助改密、操作审计日志（`audit_log`）、WebDAV 认证失败限流与
+  分享下载票据按 `share_id` 严格绑定及即时吊销；尚未做找回密码、邮箱验证、OAuth/2FA，限流仍为固定窗口。
 - **管理员能看旧文件**：`owner_id IS NULL` 的历史数据只对 ADMIN 可见，这是迁移期的兼容策略，
-  不是团队共享空间；不做跨用户共享/协作。
+  不是团队共享空间；团队跨用户协作目前通过「分享 + 一键转存」实现。
 - **多段 Range 有硬上限**：单次最多 8 段、总长不超过 64 MB，超出直接 416 而不是降级成
   200 整文件；每段统一按 `application/octet-stream` 输出，没有做按段内容类型协商。
 - **全文索引依赖 MySQL 8 ngram**：1 个字的关键词回退 `LIKE %kw%`（会全表扫），2 字以上才走
@@ -930,11 +969,10 @@ Phase 3 的运维端点在同一个实例上手工验证过（2026-11-18），�
 - **观测性只到“本进程”**：指标存在内存里，重启归零；没有接 Prometheus Server/Grafana，
   tracing 只做本地 MDC 关联（没配 Zipkin exporter），采样率固定 100%。生产要按流量调低采样，
   并把 `/actuator/prometheus` 交给内网采集器而不是浏览器。
-- **接口文档在演示环境是公开的**：`/swagger-ui.html` 和 `/v3/api-docs` 当前 permitAll，
-  方便面试演示和本地调试；生产应改成仅管理员/内网（`SecurityConfig` 一行）或关掉 swagger。
-- **Docker 镜像没有进 CI**：镜像构建与单机/集群 compose 已在本机 Docker Desktop 实测通过
-  （2026-11-18），但 CI 没有加 `docker build` / `docker compose up` 任务，也没有推镜像仓库；
-  换机器或换架构（如 arm64）仍需自行验证。
+- **Swagger 文档默认受保护**：`file-hub.auth.docs-public` 默认 `false`（仅 `ADMIN` 可访问），
+  演示环境如需开放可在启动时加 `--file-hub.auth.docs-public=true` 或环境变量 `FILE_HUB_DOCS_PUBLIC=true`。
+- **容器运行时环境差异**：CI 已加入 `docker build` 与 MinIO 容器联调，但仅验证了 Linux x86_64
+  runner；arm64 等其他架构镜像仍需在目标宿主机实测。
 
 ---
 

@@ -92,4 +92,27 @@ describe('UploadZone', () => {
       expect(toast).not.toHaveBeenCalled()
     },
   )
+
+  it('支持 Ctrl+V 粘贴文件进入上传队列，并忽略输入框内的文本粘贴', () => {
+    const pasted = new File(['png-bytes'], 'image.png', { type: 'image/png' })
+    const evt = Object.assign(new Event('paste', { bubbles: true, cancelable: true }), {
+      clipboardData: { files: [pasted] },
+    })
+    window.dispatchEvent(evt)
+    expect(addFiles).toHaveBeenCalledOnce()
+    expect(addFiles.mock.calls[0][0][0].name).toMatch(/^screenshot-.*\.png$/)
+
+    vi.clearAllMocks()
+    const input = document.createElement('input')
+    document.body.appendChild(input)
+    try {
+      const inputEvt = Object.assign(new Event('paste', { bubbles: true, cancelable: true }), {
+        clipboardData: { files: [pasted] },
+      })
+      input.dispatchEvent(inputEvt)
+      expect(addFiles).not.toHaveBeenCalled()
+    } finally {
+      input.remove()
+    }
+  })
 })

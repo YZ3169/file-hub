@@ -2,6 +2,7 @@ package com.yuzhuo.filehub.auth;
 
 import com.yuzhuo.filehub.common.Result;
 import com.yuzhuo.filehub.dto.AuthResponse;
+import com.yuzhuo.filehub.dto.ChangePasswordRequest;
 import com.yuzhuo.filehub.dto.LoginRequest;
 import com.yuzhuo.filehub.dto.RegisterRequest;
 import com.yuzhuo.filehub.dto.UserVO;
@@ -44,6 +45,15 @@ public class AuthController {
     public Result<Void> logout(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
         authService.logout(authorization);
+        return Result.ok();
+    }
+
+    @PostMapping("/password")
+    public Result<Void> changePassword(
+            @Valid @RequestBody ChangePasswordRequest request,
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        authService.changePassword(principal, request, TokenService.extractBearer(authorization));
         return Result.ok();
     }
 }

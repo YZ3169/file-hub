@@ -24,5 +24,8 @@ USER filehub
 EXPOSE 8081
 VOLUME ["/data"]
 
-# 用 sh -c 是为了让 JAVA_OPTS 里的参数能被展开
-ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=6 \
+  CMD wget -q -O /dev/null "http://127.0.0.1:${SERVER_PORT:-8081}/actuator/health" || exit 1
+
+# 用 sh -c 是为了让 JAVA_OPTS 里的参数能被展开，并显式指定 UTF-8 避免中文编码异常
+ENTRYPOINT ["sh", "-c", "exec java -Dfile.encoding=UTF-8 $JAVA_OPTS -jar /app/app.jar"]

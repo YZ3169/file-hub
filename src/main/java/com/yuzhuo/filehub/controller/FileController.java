@@ -14,12 +14,16 @@ import com.yuzhuo.filehub.dto.PageResponse;
 import com.yuzhuo.filehub.dto.StatsResponse;
 import com.yuzhuo.filehub.dto.UploadStatusResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
+import com.yuzhuo.filehub.service.AuditService;
 import com.yuzhuo.filehub.service.FileStorageService;
 import com.yuzhuo.filehub.storage.StorageBackend;
+import com.yuzhuo.filehub.util.FileMediaTypeResolver;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpHeaders;
@@ -68,6 +72,12 @@ public class FileController {
     private final StorageBackend storageBackend;
     private final StorageProperties props;
     private final DownloadTicketService ticketService;
+    private AuditService auditService;
+
+    @Autowired(required = false)
+    public void setAuditService(AuditService auditService) {
+        this.auditService = auditService;
+    }
 
     /** desktop profile 下为 true；前端据此显示桌面版提示，不写死端口 */
     @Value("${file-hub.desktop:false}")
@@ -118,8 +128,11 @@ public class FileController {
     /** 合并分片 */
     @PostMapping("/{fileId}/complete")
     public Result<FileVO> complete(@PathVariable("fileId") String fileId,
-                                   @AuthenticationPrincipal UserPrincipal user) {
-        return Result.ok(service.complete(fileId, user));
+                                   @AuthenticationPrincipal UserPrincipal user,
+                                   HttpServletRequest request) {
+        FileVO vo = service.complete(fileId, user);
+        audit(user, "UPLOAD_DONE", "FILE", vo.fileId(), vo.fileName(), request);
+        return Result.ok(vo);
     }
 
     /** 上传任务状态：以磁盘为准的已传分片，断点续传/坏片补传前先对齐一次 */
@@ -144,10 +157,11 @@ public class FileController {
             @RequestParam(value = "size", defaultValue = "20") int size,
             @RequestParam(value = "keyword", required = false) String keyword,
             @RequestParam(value = "status", required = false) Integer status,
+            @RequestParam(value = "category", required = false) String category,
             @RequestParam(value = "sort", defaultValue = "time_desc") String sort,
             @RequestParam(value = "scope", required = false) String scope,
             @AuthenticationPrincipal UserPrincipal user) {
-        return Result.ok(service.list(page, size, keyword, status, sort, user, scope));
+        return Result.ok(service.list(page, size, keyword, status, category, sort, user, scope));
     }
 
     @GetMapping("/stats")
@@ -170,14 +184,15 @@ public class FileController {
     }
 
     /**
-     * 下载。支持 HTTP Range，浏览器/下载器断点续传下载时只请求缺的那一段；
-     * 流式输出，不把整个文件读进内存。
+     * 下载或在线预览。支持 HTTP Range，浏览器/下载器/音视频播放器只请求需要的区间；
+     * {@code inline=true} 时按安全媒体类型输出 {@code Content-Disposition: inline}。
      */
     @GetMapping("/{fileId}/download")
     public ResponseEntity<InputStreamResource> download(
             @PathVariable("fileId") String fileId,
             @RequestParam(value = "ticket", required = false) String ticket,
             @RequestHeader(value = HttpHeaders.RANGE, required = false) String rangeHeader,
+            @RequestParam(value = "inline", defaultValue = "false") boolean inline,
             @AuthenticationPrincipal UserPrincipal user) {
         // 下载接口在 SecurityConfig 里放行，鉴权必须在这里完成：
         // 优先兑换票据（浏览器），否则使用 Bearer Token（脚本/curl）。两者都没有就是 401。
@@ -193,10 +208,14 @@ public class FileController {
         }
         FileInfo info = service.requireInfo(fileId, accessor);
         long size = info.getFileSize();
-        HttpHeaders headers = downloadHeaders(info);
+        MediaType mediaType = inline
+                ? FileMediaTypeResolver.resolveForInline(info.getFileName())
+                : MediaType.APPLICATION_OCTET_STREAM;
+        boolean useInline = inline && FileMediaTypeResolver.isSafeInline(info.getFileName());
+        HttpHeaders headers = downloadHeaders(info, useInline);
 
         if (rangeHeader == null || rangeHeader.isBlank()) {
-            return fullResponse(info, headers);
+            return fullResponse(info, headers, mediaType);
         }
 
         List<HttpRange> ranges;
@@ -206,7 +225,7 @@ public class FileController {
             return rangeNotSatisfiable(size);
         }
         if (ranges.isEmpty()) {
-            return fullResponse(info, headers);
+            return fullResponse(info, headers, mediaType);
         }
         // 多段请求最多 8 段、总计 64MB：再大就不值得为「并行下载」多开这么多流，
         // 也避免一个请求被构造出几十万个区间把内存/连接占满。
@@ -244,11 +263,17 @@ public class FileController {
             headers.set(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + size);
             return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
                     .headers(headers)
-                    .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                    .contentType(mediaType)
                     .contentLength(length)
                     .body(new InputStreamResource(new BoundedInputStream(in, length)));
         }
         return multipartResponse(info, headers, size, spans);
+    }
+
+    /** 兼容旧签名的重载（供单元测试直接调用） */
+    public ResponseEntity<InputStreamResource> download(
+            String fileId, String ticket, String rangeHeader, UserPrincipal user) {
+        return download(fileId, ticket, rangeHeader, false, user);
     }
 
     /**
@@ -292,21 +317,28 @@ public class FileController {
                 .body(new InputStreamResource(new SequenceInputStream(Collections.enumeration(parts))));
     }
 
-    private ResponseEntity<InputStreamResource> fullResponse(FileInfo info, HttpHeaders headers) {
+    private ResponseEntity<InputStreamResource> fullResponse(FileInfo info, HttpHeaders headers, MediaType mediaType) {
         InputStream in = service.openForRead(info);
         return ResponseEntity.ok()
                 .headers(headers)
-                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .contentType(mediaType)
                 .contentLength(info.getFileSize())
                 .body(new InputStreamResource(in));
     }
 
-    private HttpHeaders downloadHeaders(FileInfo info) {
+    private HttpHeaders downloadHeaders(FileInfo info, boolean inline) {
         // 文件名可能含中文/空格，必须走 RFC 5987 的 filename* 形式，否则浏览器的响应头会乱码
         String encoded = URLEncoder.encode(info.getFileName(), StandardCharsets.UTF_8).replace("+", "%20");
         HttpHeaders headers = new HttpHeaders();
+        String dispositionType = inline ? "inline" : "attachment";
         headers.set(HttpHeaders.CONTENT_DISPOSITION,
-                "attachment; filename=\"" + encoded + "\"; filename*=UTF-8''" + encoded);
+                dispositionType + "; filename=\"" + encoded + "\"; filename*=UTF-8''" + encoded);
+        if (inline) {
+            headers.set("X-Content-Type-Options", "nosniff");
+            if (FileMediaTypeResolver.needsSandboxCsp(info.getFileName())) {
+                headers.set("Content-Security-Policy", "sandbox");
+            }
+        }
         // 支持断点续传下载；ETag 用内容哈希，内容相同即相同版本
         headers.set(HttpHeaders.ACCEPT_RANGES, "bytes");
         headers.setETag("\"" + info.getFileHash() + "\"");
@@ -374,8 +406,58 @@ public class FileController {
 
     @DeleteMapping("/{fileId}")
     public Result<Void> delete(@PathVariable("fileId") String fileId,
-                               @AuthenticationPrincipal UserPrincipal user) {
-        service.delete(fileId, user);
+                               @RequestParam(value = "trash", defaultValue = "false") boolean trash,
+                               @AuthenticationPrincipal UserPrincipal user,
+                               HttpServletRequest request) {
+        if (trash) {
+            service.moveToTrash(fileId, user);
+            audit(user, "TRASH", "FILE", fileId, null, request);
+        } else {
+            service.delete(fileId, user);
+            audit(user, "DELETE", "FILE", fileId, null, request);
+        }
         return Result.ok();
+    }
+
+    @PostMapping("/{fileId}/trash")
+    public Result<Void> trash(@PathVariable("fileId") String fileId,
+                              @AuthenticationPrincipal UserPrincipal user,
+                              HttpServletRequest request) {
+        service.moveToTrash(fileId, user);
+        audit(user, "TRASH", "FILE", fileId, null, request);
+        return Result.ok();
+    }
+
+    @PostMapping("/{fileId}/restore")
+    public Result<FileVO> restore(@PathVariable("fileId") String fileId,
+                                  @AuthenticationPrincipal UserPrincipal user,
+                                  HttpServletRequest request) {
+        FileVO vo = service.restoreFromTrash(fileId, user);
+        audit(user, "RESTORE", "FILE", fileId, vo.fileName(), request);
+        return Result.ok(vo);
+    }
+
+    @GetMapping("/trash")
+    public Result<PageResponse<FileVO>> listTrash(
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "size", defaultValue = "20") int size,
+            @AuthenticationPrincipal UserPrincipal user) {
+        return Result.ok(service.listTrash(page, size, user));
+    }
+
+    @DeleteMapping("/trash")
+    public Result<Map<String, Integer>> emptyTrash(@AuthenticationPrincipal UserPrincipal user,
+                                                   HttpServletRequest request) {
+        int cleared = service.emptyTrash(user);
+        audit(user, "EMPTY_TRASH", "FILE", null, "count=" + cleared, request);
+        return Result.ok(Map.of("cleared", cleared));
+    }
+
+    private void audit(UserPrincipal user, String action, String targetType,
+                       String targetId, String detail, HttpServletRequest request) {
+        if (auditService != null) {
+            auditService.record(user, action, targetType, targetId, detail,
+                    request == null ? null : request.getRemoteAddr());
+        }
     }
 }

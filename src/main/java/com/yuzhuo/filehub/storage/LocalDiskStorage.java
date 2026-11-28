@@ -229,6 +229,7 @@ public class LocalDiskStorage implements StorageBackend {
      * files/ 下所有成品文件的相对路径（{@code yyyy/MM/dd/{fileId}}，统一用 / 分隔）。
      * 只返回文件名是 UUID 形状的普通文件，避免把用户手工放进来的东西当成成品清理。
      */
+    @Override
     public List<String> listFilePaths() {
         if (!Files.isDirectory(filesDir)) {
             return List.of();
@@ -245,6 +246,7 @@ public class LocalDiskStorage implements StorageBackend {
     }
 
     /** 成品文件是否已经超过 age 没有任何变化（用于孤儿文件回收的宽限期） */
+    @Override
     public boolean fileOlderThan(String relativePath, Duration age) {
         try {
             FileTime t = Files.getLastModifiedTime(resolveSafe(relativePath));

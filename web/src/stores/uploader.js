@@ -33,7 +33,15 @@ class StoppedError extends Error {
 }
 
 function emptyStats() {
-  return { doneFiles: 0, uploadingFiles: 0, logicalBytes: 0, physicalBytes: 0, savedBytes: 0 }
+  return {
+    doneFiles: 0,
+    uploadingFiles: 0,
+    logicalBytes: 0,
+    physicalBytes: 0,
+    savedBytes: 0,
+    quotaBytes: -1,
+    quotaUsedBytes: 0,
+  }
 }
 
 function uid() {
@@ -56,10 +64,17 @@ export const state = reactive({
     total: 0,
     keyword: '',
     status: null,
+    category: '',
     sort: 'time_desc',
   },
   stats: emptyStats(),
   concurrency: 4,
+  speedLimitKBps: 0,
+  viewMode: 'list',
+  currentDir: '',
+  tree: { currentDir: '', breadcrumbs: [{ name: '全部文件', path: '' }], folders: [], files: [] },
+  treeLoading: false,
+  treeError: '',
   toasts: [],
   processing: false,
   pendingResumable: [],
@@ -145,7 +160,10 @@ function sleepBeforeRetry(backoff, task, error) {
   return sleep(delay, task)
 }
 
-function newTask(file, fingerprint, saved) {
+function newTask(file, fingerprint, saved, targetDir = '') {
+  const rawRel = relativePathOf(file)
+  const cleanDir = String(targetDir || '').replace(/^\/+|\/+$/g, '')
+  const relPath = cleanDir ? `${cleanDir}/${rawRel || file.name}` : rawRel
   return {
     id: uid(),
     _workspaceEpoch: workspaceEpoch,
@@ -153,7 +171,7 @@ function newTask(file, fingerprint, saved) {
     file: markRaw(file),
     fingerprint,
     name: file.name,
-    relativePath: relativePathOf(file),
+    relativePath: relPath,
     size: file.size,
     lastModified: file.lastModified,
     state: 'queued',
@@ -348,10 +366,26 @@ async function callWithRetry(fn, task, attempts = 3) {
   throw lastError
 }
 
+let paceNextAt = 0
+
+async function paceUpload(bytes, task) {
+  const kbps = Number(state.speedLimitKBps) || 0
+  if (kbps <= 0 || bytes <= 0) return
+  const now = performance.now()
+  const durationMs = (bytes / (kbps * 1024)) * 1000
+  const scheduled = Math.max(now, paceNextAt)
+  paceNextAt = scheduled + durationMs
+  const waitMs = scheduled - now
+  if (waitMs > 12) {
+    await sleep(waitMs, task)
+  }
+}
+
 async function uploadOneChunk(task, index) {
   const start = index * task.chunkSize
   const end = Math.min(start + task.chunkSize, task.size)
   const expectedBytes = end - start
+  await paceUpload(expectedBytes, task)
 
   // 只从文件读一次：把分片读成 ArrayBuffer，摘要和上传都用这一份字节。
   // 之前是「slice 算摘要 → 再把同一个 Blob 交给 FormData」，同一片要读两遍盘。
@@ -596,7 +630,7 @@ async function runTask(task) {
       refreshPending()
       toast(`⚡ ${task.name} 秒传完成，0 字节上传`, 'success')
       state.filePage.page = 1
-      refreshFiles()
+      refreshActiveView()
       refreshStats()
       return
     }
@@ -637,7 +671,7 @@ async function runTask(task) {
     toast(`✅ ${task.name} 上传完成`, 'success')
     // 新文件按时间排在最新一页，回到第 1 页让用户能立刻看到
     state.filePage.page = 1
-    refreshFiles()
+    refreshActiveView()
     refreshStats()
   } catch (e) {
     // 退出/切换账号后的回调不能写入当前用户的缓存、断点记录或提示。
@@ -688,9 +722,15 @@ async function processQueue() {
   }
 }
 
-export function addFiles(fileList) {
+export function addFiles(fileList, options = {}) {
   const files = Array.from(fileList || [])
   if (!files.length) return
+  const targetDir =
+    options.targetDir !== undefined
+      ? options.targetDir
+      : state.viewMode === 'tree'
+        ? state.currentDir
+        : ''
 
   let added = 0
   for (const file of files) {
@@ -706,11 +746,37 @@ export function addFiles(fileList) {
     if (saved && !saved.hash) {
       saved.hash = getCachedHash(fingerprint)
     }
-    state.tasks.push(newTask(file, fingerprint, saved))
+    state.tasks.push(newTask(file, fingerprint, saved, targetDir))
     added += 1
   }
 
   if (added > 0) processQueue()
+}
+
+export function setConcurrency(n) {
+  const num = Number(n)
+  if (Number.isInteger(num) && num >= 1 && num <= 8) state.concurrency = num
+}
+
+export function setSpeedLimit(kbps) {
+  const val = Number(kbps)
+  state.speedLimitKBps = Number.isFinite(val) && val > 0 ? val : 0
+  paceNextAt = 0
+}
+
+export function retryAllFailed() {
+  let count = 0
+  for (const task of state.tasks) {
+    if (task.state === 'error') {
+      task.paused = false
+      task.canceled = false
+      task.errorCode = 0
+      task.message = ''
+      task.state = 'queued'
+      count++
+    }
+  }
+  if (count > 0) processQueue()
 }
 
 export function pauseTask(task) {
@@ -771,8 +837,56 @@ export function clearAllTasks() {
 }
 
 let filesRequest = 0
+let treeRequest = 0
 let statsRequest = 0
 let filesController = null
+let treeController = null
+
+export async function refreshTree(dir = state.currentDir) {
+  const requestId = ++treeRequest
+  treeController?.abort()
+  treeController = new AbortController()
+  state.treeLoading = true
+  state.treeError = ''
+  try {
+    const res = await api.getFolderTree({
+      dir,
+      keyword: state.filePage.keyword,
+      category: state.filePage.category,
+      sort: state.filePage.sort,
+      signal: treeController.signal,
+    })
+    if (requestId !== treeRequest) return
+    state.currentDir = res.currentDir || ''
+    state.tree = res
+    state.online = true
+  } catch (e) {
+    if (requestId !== treeRequest || e.name === 'AbortError') return
+    state.treeError = e.message || '目录加载失败，请重试'
+    if (!(e instanceof ApiError) || e.status === 0) state.online = false
+  } finally {
+    if (requestId === treeRequest) state.treeLoading = false
+  }
+}
+
+export async function enterDir(dir) {
+  state.currentDir = dir || ''
+  state.viewMode = 'tree'
+  await refreshTree(state.currentDir)
+}
+
+export async function setViewMode(mode) {
+  state.viewMode = mode === 'tree' ? 'tree' : 'list'
+  await refreshActiveView()
+}
+
+export async function refreshActiveView() {
+  if (state.viewMode === 'tree') {
+    await refreshTree(state.currentDir)
+  } else {
+    await refreshFiles()
+  }
+}
 
 export async function refreshFiles() {
   const requestId = ++filesRequest
@@ -810,13 +924,14 @@ export async function refreshFiles() {
 export async function updateFileQuery(patch = {}) {
   if ('keyword' in patch) state.filePage.keyword = patch.keyword || ''
   if ('status' in patch) state.filePage.status = patch.status
+  if ('category' in patch) state.filePage.category = patch.category || ''
   if ('sort' in patch) state.filePage.sort = patch.sort
   if ('size' in patch) {
     const size = Number(patch.size)
     if (Number.isInteger(size) && size >= 1 && size <= 100) state.filePage.size = size
   }
   state.filePage.page = 1
-  await refreshFiles()
+  await refreshActiveView()
 }
 
 export async function goFilePage(page) {
@@ -841,19 +956,68 @@ export async function refreshStats() {
 }
 
 export async function deleteServerFile(file) {
+  const isDone = file.status === 1
   const ok = window.confirm(
-    `确认删除「${file.relativePath || file.fileName}」？\n若已没有其他记录引用同一份物理文件，磁盘上的文件会一并删除。`,
+    isDone
+      ? `确认将「${file.relativePath || file.fileName}」移入回收站？（30 天内可恢复）`
+      : `确认删除上传中任务「${file.relativePath || file.fileName}」？`,
   )
   if (!ok) return
   const epoch = workspaceEpoch
   try {
-    await api.deleteFile(file.fileId)
+    if (isDone) {
+      await api.trashFile(file.fileId)
+    } else {
+      await api.deleteFile(file.fileId)
+    }
     if (epoch !== workspaceEpoch) return
-    toast(`已删除 ${file.relativePath || file.fileName}`, 'success')
-    await Promise.all([refreshFiles(), refreshStats()])
+    toast(
+      isDone
+        ? `已将 ${file.relativePath || file.fileName} 移入回收站`
+        : `已删除 ${file.relativePath || file.fileName}`,
+      'success',
+    )
+    await Promise.all([refreshActiveView(), refreshStats()])
   } catch (e) {
     if (epoch !== workspaceEpoch) return
     toast(`删除失败：${e.message}`, 'error')
+  }
+}
+
+export async function downloadZip({ fileIds = null, folderPath = null } = {}) {
+  const epoch = workspaceEpoch
+  const label = folderPath ? `${folderPath}.zip` : `批量打包 (${fileIds?.length || 0} 个文件)`
+  const download = reactive({
+    id: uid(),
+    fileId: `zip-${Date.now()}`,
+    fileName: label,
+    fileSize: 0,
+    status: 'preparing',
+    error: '',
+  })
+  state.downloads = [
+    download,
+    ...state.downloads.filter((item) => item.status === 'preparing'),
+    ...state.downloads.filter((item) => item.status !== 'preparing').slice(0, 4),
+  ]
+  try {
+    const ticket = await api.createZipTicket({ fileIds, folderPath })
+    if (epoch !== workspaceEpoch) return
+    download.fileName = ticket.zipName
+    download.fileSize = ticket.totalBytes
+    const a = document.createElement('a')
+    a.href = ticket.downloadUrl
+    a.download = ticket.zipName
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    download.status = 'submitted'
+    toast(`已发起打包下载 ${ticket.zipName}（共 ${ticket.fileCount} 个文件）`, 'success')
+  } catch (e) {
+    if (epoch !== workspaceEpoch) return
+    download.status = 'error'
+    download.error = e.message || '打包下载失败'
+    toast(`打包下载失败：${e.message}`, 'error')
   }
 }
 
@@ -928,9 +1092,12 @@ export function resetWorkspace() {
   workspaceEpoch++
   workspaceToken = auth.token
   filesRequest++
+  treeRequest++
   statsRequest++
   filesController?.abort()
   filesController = null
+  treeController?.abort()
+  treeController = null
   for (const task of state.tasks) {
     task.controller?.abort()
   }
@@ -939,6 +1106,16 @@ export function resetWorkspace() {
   state.files = []
   state.filesLoading = false
   state.filesError = ''
+  state.viewMode = 'list'
+  state.currentDir = ''
+  state.tree = {
+    currentDir: '',
+    breadcrumbs: [{ name: '全部文件', path: '' }],
+    folders: [],
+    files: [],
+  }
+  state.treeLoading = false
+  state.treeError = ''
   state.downloads = []
   state.toasts = []
   state.filePage = {
@@ -947,6 +1124,7 @@ export function resetWorkspace() {
     total: 0,
     keyword: '',
     status: null,
+    category: '',
     sort: 'time_desc',
   }
   state.stats = emptyStats()

@@ -25,6 +25,10 @@ public class DownloadTicketService {
     private final AuthProperties properties;
 
     public DownloadTicketResponse issue(String fileId, UserPrincipal user) {
+        return issue(fileId, user, null);
+    }
+
+    public DownloadTicketResponse issue(String fileId, UserPrincipal user, Long shareId) {
         String raw = OpaqueToken.generate();
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime expiresAt = now.plusMinutes(Math.max(1, properties.getTicketTtlMinutes()));
@@ -33,12 +37,21 @@ public class DownloadTicketService {
         ticket.setTicketHash(OpaqueToken.hash(raw));
         ticket.setFileId(fileId);
         ticket.setUserId(user.id());
+        ticket.setShareId(shareId);
         ticket.setExpiresAt(expiresAt);
         ticket.setCreatedAt(now);
         ticketMapper.insert(ticket);
 
         String url = "/api/file/" + fileId + "/download?ticket=" + raw;
         return new DownloadTicketResponse(raw, expiresAt, url);
+    }
+
+    /** 取消或重置分享时，立即吊销该分享签发过的所有短期下载票据 */
+    public int revokeByShareId(Long shareId) {
+        if (shareId == null) {
+            return 0;
+        }
+        return ticketMapper.deleteByShareId(shareId);
     }
 
     /**
@@ -51,6 +64,23 @@ public class DownloadTicketService {
         DownloadTicket ticket = ticketMapper.findValid(
                 OpaqueToken.hash(rawTicket), fileId, LocalDateTime.now());
         if (ticket == null) {
+            return null;
+        }
+        UserAccount user = userMapper.selectById(ticket.getUserId());
+        if (user == null || !user.isActive()) {
+            return null;
+        }
+        return UserPrincipal.from(user);
+    }
+
+    /** 校验严格绑定到指定 shareId 的下载票据，防止跨分享或普通下载票据混淆绕过提取码/次数限制 */
+    public UserPrincipal resolveForShare(String fileId, Long shareId, String rawTicket) {
+        if (rawTicket == null || rawTicket.isBlank() || shareId == null) {
+            return null;
+        }
+        DownloadTicket ticket = ticketMapper.findValid(
+                OpaqueToken.hash(rawTicket), fileId, LocalDateTime.now());
+        if (ticket == null || ticket.getShareId() == null || !ticket.getShareId().equals(shareId)) {
             return null;
         }
         UserAccount user = userMapper.selectById(ticket.getUserId());

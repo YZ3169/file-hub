@@ -173,15 +173,28 @@ check_eq "403" "$CODE" "普通用户读取 Prometheus 指标返回 403"
 REQ_ID="e2e-rid-$RUN_ID"
 curl -s -D "$WORK/rid-headers.txt" -o /dev/null -H "X-Request-Id: $REQ_ID" \
     "$BASE/api/file/config"
-check_contains "$(tr -d '\r' < "$WORK/rid-headers.txt")" "X-Request-Id: $REQ_ID" \
+RID_HDRS="$(tr -d '\r' < "$WORK/rid-headers.txt")"
+check_contains "$RID_HDRS" "X-Request-Id: $REQ_ID" \
     "响应头回传调用方的 X-Request-Id"
+check_contains "$RID_HDRS" "X-Content-Type-Options: nosniff" \
+    "响应头包含 X-Content-Type-Options: nosniff"
+check_contains "$RID_HDRS" "Referrer-Policy: no-referrer" \
+    "响应头包含 Referrer-Policy: no-referrer"
 
-# 桌面 profile 主动关闭了 Swagger/OpenAPI（本地单机不需要暴露接口文档）
+# Swagger/OpenAPI 默认受管理员保护（除非显式开启 FILE_HUB_DOCS_PUBLIC=true 或 desktop 关闭）
 if curl -s "$BASE/api/file/config" | grep -q '"desktop":true'; then
     ok "桌面版未暴露 OpenAPI 文档（按设计跳过）"
 else
-    R="$(curl -s "$BASE/v3/api-docs")"
-    check_contains "$R" '"title":"file-hub API"' "OpenAPI 文档可读取且标题正确"
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v3/api-docs")"
+    if [ "$CODE" = "401" ]; then
+        ok "未登录访问 /v3/api-docs 返回 401（默认受保护）"
+        CODE_USER="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+            "$BASE/v3/api-docs")"
+        check_eq "403" "$CODE_USER" "普通用户访问 /v3/api-docs 返回 403"
+    else
+        R="$(curl -s "$BASE/v3/api-docs")"
+        check_contains "$R" '"title":"file-hub API"' "OpenAPI 文档（公开模式）可读取且标题正确"
+    fi
 fi
 
 # ---------------------------------------------------------------- 1. 全量上传
@@ -701,6 +714,10 @@ if [ -n "$TOKEN_ADMIN" ]; then
     CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN_ADMIN" \
         "$BASE/actuator/prometheus")"
     check_eq "200" "$CODE" "管理员可以读取 Prometheus 指标"
+    if ! curl -s "$BASE/api/file/config" | grep -q '"desktop":true'; then
+        R_DOCS="$(api_as "$TOKEN_ADMIN" GET "/v3/api-docs")"
+        check_contains "$R_DOCS" '"title":"file-hub API"' "管理员可以读取 OpenAPI 文档"
+    fi
 
     # HEAL_ID 已经合并完成；手工删掉物理文件，模拟磁盘丢失/外部误删
     HEAL_FILE="$(find "$STORAGE_ROOT/files" -type f -name "$HEAL_ID" 2>/dev/null | head -n1)"
@@ -728,6 +745,98 @@ if [ -n "$TOKEN_ADMIN" ]; then
 else
     echo "  ↳ 未设置 FILE_HUB_ADMIN_PASSWORD，跳过管理员完整性用例"
 fi
+
+# ---------------------------------------------------------------- 4.9 v8 企业与网盘能力端到端
+
+section "4.9 在线预览 / 目录树 / Zip 打包 / 回收站 / 免密限次分享 / 吊销 / WebDAV / 审计"
+
+printf 'hello-v8-%s\n' "$RUN_ID" > "$WORK/v8-note.txt"
+V8_HASH="$(sha256sum "$WORK/v8-note.txt" | cut -d' ' -f1)"
+V8_SIZE="$(stat -c %s "$WORK/v8-note.txt")"
+R="$(post_json /api/file/init "{\"fileName\":\"v8-note-$RUN_ID.txt\",\"fileSize\":$V8_SIZE,\"fileHash\":\"$V8_HASH\"}")"
+V8_ID="$(jget "$R" "['data']['fileId']")"
+V8_INSTANT="$(jget "$R" "['data']['instant']")"
+if [ "$V8_INSTANT" != "True" ]; then
+    curl -s -X POST "$BASE/api/file/chunk" -H "Authorization: Bearer $TOKEN" \
+        -F "fileId=$V8_ID" -F "index=0" -F "chunkHash=$V8_HASH" \
+        -F "chunk=@$WORK/v8-note.txt" > /dev/null
+    api POST "/api/file/$V8_ID/complete" > /dev/null
+fi
+
+# 在线预览 (?inline=true)
+curl -s -D "$WORK/inline-hdr.txt" -o "$WORK/inline-body.txt" -H "Authorization: Bearer $TOKEN" \
+    "$BASE/api/file/$V8_ID/download?inline=true"
+INLINE_HDR="$(tr -d '\r' < "$WORK/inline-hdr.txt")"
+check_contains "$INLINE_HDR" "inline" "预览响应 Content-Disposition 为 inline"
+check_eq "$V8_HASH" "$(sha256sum "$WORK/inline-body.txt" | cut -d' ' -f1)" "预览内容与原文件一致"
+
+# 目录创建、移动与树浏览
+R="$(post_json /api/file/folder "{\"path\":\"v8-docs-$RUN_ID\"}")"
+check_eq "0" "$(jget "$R" "['code']")" "显式创建文件夹成功"
+R="$(post_json "/api/file/$V8_ID/move" "{\"targetDir\":\"v8-docs-$RUN_ID\",\"newName\":\"renamed-$RUN_ID.txt\"}")"
+check_eq "0" "$(jget "$R" "['code']")" "文件移动与重命名成功"
+R="$(api GET "/api/file/tree?dir=v8-docs-$RUN_ID")"
+check_contains "$R" "renamed-$RUN_ID.txt" "目录树列出移动后的文件"
+
+# 批量打包 Zip
+R="$(post_json /api/file/zip-ticket "{\"fileIds\":[\"$V8_ID\"]}")"
+ZIP_URL="$(jget "$R" "['data']['downloadUrl']")"
+curl -s -o "$WORK/bundle.zip" "$BASE$ZIP_URL"
+ZIP_CHECK="$(python -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(','.join(z.namelist()))" "$WORK/bundle.zip" 2>/dev/null)"
+check_contains "$ZIP_CHECK" "renamed-$RUN_ID.txt" "Zip 打包流中包含目标文件"
+
+# 回收站移入 -> 隐藏 -> 恢复
+R="$(api POST "/api/file/$V8_ID/trash")"
+check_eq "0" "$(jget "$R" "['code']")" "文件移入回收站成功"
+R="$(api GET "/api/file/list?keyword=renamed-$RUN_ID.txt")"
+check_eq "0" "$(jget "$R" "['data']['total']")" "回收站文件不再出现在主列表"
+R="$(api GET "/api/file/trash")"
+check_contains "$R" "$V8_ID" "回收站列表包含已删文件"
+R="$(api POST "/api/file/$V8_ID/restore")"
+check_eq "0" "$(jget "$R" "['code']")" "从回收站恢复文件成功"
+
+# 免密限次分享 + 转存 + 取消分享立即吊销已发票据
+R="$(post_json /api/share "{\"fileId\":\"$V8_ID\",\"expiresInDays\":7,\"requireCode\":false,\"maxDownloads\":1}")"
+V8_SHARE_TOKEN="$(jget "$R" "['data']['token']")"
+check_eq "False" "$(jget "$R" "['data']['requireCode']")" "支持免提取码公开分享"
+R="$(post_json_as "" "/api/public/share/$V8_SHARE_TOKEN/verify" "{}")"
+V8_DL_URL="$(jget "$R" "['data']['downloadUrl']")"
+check_contains "$V8_DL_URL" "ticket=" "免提取码首次提取返回下载票据"
+R="$(post_json_as "" "/api/public/share/$V8_SHARE_TOKEN/verify" "{}")"
+check_eq "42009" "$(jget "$R" "['code']")" "超出 maxDownloads 后第 2 次提取返回 42009"
+
+V8_TICKET="${V8_DL_URL#*ticket=}"
+R="$(post_json_as "$TOKEN_B" "/api/share/$V8_SHARE_TOKEN/save" "{\"ticket\":\"$V8_TICKET\"}")"
+V8_SAVED_ID="$(jget "$R" "['data']['fileId']")"
+check_eq "0" "$(jget "$R" "['code']")" "用户 B 凭分享转存到自己网盘成功"
+
+CODE_BEFORE_CANCEL="$(curl -s -o /dev/null -w '%{http_code}' "$BASE$V8_DL_URL")"
+check_eq "200" "$CODE_BEFORE_CANCEL" "取消前分享下载票据有效"
+api DELETE "/api/share/$V8_SHARE_TOKEN" > /dev/null
+CODE_AFTER_CANCEL="$(curl -s -o /dev/null -w '%{http_code}' "$BASE$V8_DL_URL")"
+check_eq "401" "$CODE_AFTER_CANCEL" "取消分享后同一票据立即被吊销（返回 401）"
+
+# WebDAV（OPTIONS / MKCOL / PUT / PROPFIND / GET / DELETE）
+CODE_DAV_OPT="$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/dav/")"
+check_eq "200" "$CODE_DAV_OPT" "WebDAV OPTIONS 返回 200"
+CODE_DAV_MKCOL="$(curl -s -o /dev/null -w '%{http_code}' -u "$USER_A:$PASSWORD" -X MKCOL "$BASE/dav/dav-$RUN_ID")"
+check_eq "201" "$CODE_DAV_MKCOL" "WebDAV MKCOL 创建目录成功"
+CODE_DAV_PUT="$(curl -s -o /dev/null -w '%{http_code}' -u "$USER_A:$PASSWORD" -T "$WORK/v8-note.txt" "$BASE/dav/dav-$RUN_ID/dav.txt")"
+check_eq "201" "$CODE_DAV_PUT" "WebDAV PUT 上传文件成功"
+DAV_PROP="$(curl -s -u "$USER_A:$PASSWORD" -X PROPFIND -H "Depth: 1" "$BASE/dav/dav-$RUN_ID")"
+check_contains "$DAV_PROP" "dav.txt" "WebDAV PROPFIND 列出刚上传文件"
+curl -s -u "$USER_A:$PASSWORD" -o "$WORK/dav-out.txt" "$BASE/dav/dav-$RUN_ID/dav.txt"
+check_eq "$V8_HASH" "$(sha256sum "$WORK/dav-out.txt" | cut -d' ' -f1)" "WebDAV GET 下载内容与原文件一致"
+CODE_DAV_DEL="$(curl -s -o /dev/null -w '%{http_code}' -u "$USER_A:$PASSWORD" -X DELETE "$BASE/dav/dav-$RUN_ID")"
+check_eq "204" "$CODE_DAV_DEL" "WebDAV DELETE 目录移入回收站成功"
+
+# 审计日志校验 + 清理本节临时文件
+R="$(api GET "/api/audit/logs?page=1&size=20")"
+check_contains "$R" "WEBDAV_PUT" "审计日志记录 WebDAV 写入操作"
+api DELETE "/api/file/$V8_ID" > /dev/null
+api_as "$TOKEN_B" DELETE "/api/file/$V8_SAVED_ID" > /dev/null
+api DELETE "/api/file/trash" > /dev/null
+
 
 # ---------------------------------------------------------------- 5. 引用计数删除
 

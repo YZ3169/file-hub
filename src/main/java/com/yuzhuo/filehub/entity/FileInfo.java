@@ -13,6 +13,7 @@ public class FileInfo {
 
     public static final int STATUS_UPLOADING = 0;
     public static final int STATUS_DONE = 1;
+    public static final int STATUS_TRASH = 2;
 
     @TableId(type = IdType.AUTO)
     private Long id;
@@ -37,11 +38,14 @@ public class FileInfo {
     /** 成品在存储后端中的相对路径，上传中为 null */
     private String storagePath;
 
-    /** 0=上传中 1=已完成 */
+    /** 0=上传中 1=已完成 2=回收站 */
     private Integer status;
 
     /** 文件所有者；NULL 表示升级前创建的历史数据，仅管理员可见 */
     private Long ownerId;
+
+    /** 移入回收站的时间；正常文件为 NULL */
+    private LocalDateTime deletedAt;
 
     private LocalDateTime createTime;
 

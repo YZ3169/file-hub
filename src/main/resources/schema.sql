@@ -17,9 +17,10 @@ CREATE TABLE `user_account`
     `id`            BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     `username`      VARCHAR(32)  NOT NULL COMMENT '登录名（唯一，大小写不敏感）',
     `password_hash` VARCHAR(100) NOT NULL COMMENT 'BCrypt 密码摘要，绝不存明文',
-    `role`          VARCHAR(16)  NOT NULL DEFAULT 'USER' COMMENT 'USER / ADMIN',
-    `enabled`       TINYINT      NOT NULL DEFAULT 1 COMMENT '1=可登录',
-    `created_at`    DATETIME     NOT NULL,
+    `role`                VARCHAR(16)  NOT NULL DEFAULT 'USER' COMMENT 'USER / ADMIN',
+    `enabled`             TINYINT      NOT NULL DEFAULT 1 COMMENT '1=可登录',
+    `storage_quota_bytes` BIGINT       NOT NULL DEFAULT -1 COMMENT '存储配额（字节），-1 表示不限制',
+    `created_at`          DATETIME     NOT NULL,
     `updated_at`    DATETIME     NOT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_username` (`username`)
@@ -49,11 +50,13 @@ CREATE TABLE `download_ticket`
     `ticket_hash` CHAR(64)    NOT NULL,
     `file_id`     VARCHAR(64) NOT NULL,
     `user_id`     BIGINT      NOT NULL,
+    `share_id`    BIGINT               DEFAULT NULL COMMENT '关联分享 ID（取消或重置提取码时立即吊销）',
     `expires_at`  DATETIME    NOT NULL,
     `created_at`  DATETIME    NOT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_ticket_hash` (`ticket_hash`),
-    KEY `idx_ticket_expires` (`expires_at`)
+    KEY `idx_ticket_expires` (`expires_at`),
+    KEY `idx_ticket_share` (`share_id`)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='浏览器下载用短期票据';
 
@@ -70,8 +73,9 @@ CREATE TABLE `file_info`
     `chunk_size`   INT          NOT NULL COMMENT '该次上传约定的分片大小',
     `chunk_total`  INT          NOT NULL COMMENT '分片总数',
     `storage_path` VARCHAR(500)          DEFAULT NULL COMMENT '成品在存储后端中的相对路径；上传中为 NULL',
-    `status`       TINYINT      NOT NULL DEFAULT 0 COMMENT '0=上传中 1=已完成',
+    `status`       TINYINT      NOT NULL DEFAULT 0 COMMENT '0=上传中 1=已完成 2=回收站',
     `owner_id`     BIGINT                DEFAULT NULL COMMENT '所属用户；旧数据为 NULL，仅管理员可见',
+    `deleted_at`   DATETIME              DEFAULT NULL COMMENT '移入回收站时间',
     `create_time`  DATETIME     NOT NULL COMMENT '创建时间',
     `update_time`  DATETIME     NOT NULL COMMENT '更新时间',
     PRIMARY KEY (`id`),
@@ -82,6 +86,8 @@ CREATE TABLE `file_info`
     KEY `idx_storage_path` (`storage_path`),
     -- 定时清理的查询条件就是 (status = 0, update_time < cutoff)
     KEY `idx_status_update` (`status`, `update_time`),
+    -- 回收站过期清理
+    KEY `idx_status_deleted` (`status`, `deleted_at`),
     -- 列表按状态过滤后按 id 倒序分页
     KEY `idx_status_id` (`status`, `id`),
     -- 用户列表：先按 owner 过滤，再按 status 过滤/排序
@@ -119,10 +125,12 @@ CREATE TABLE `file_share`
         COMMENT '链接中的随机标识（43 字符）；只是定位符，不是口令。必须大小写敏感',
     `file_id`         VARCHAR(64) NOT NULL COMMENT '被分享文件',
     `owner_id`        BIGINT      NOT NULL COMMENT '创建者，也是匿名下载票据的签发主体',
-    `code_hash`       VARCHAR(100) NOT NULL COMMENT '4 位提取码的 BCrypt 摘要，绝不存明文',
+    `code_hash`       VARCHAR(100) NOT NULL DEFAULT '' COMMENT '4 位提取码的 BCrypt 摘要，免码分享为空',
+    `require_code`    TINYINT     NOT NULL DEFAULT 1 COMMENT '1=需要提取码 0=免提取码公开链接',
     `expires_at`      DATETIME             DEFAULT NULL COMMENT 'NULL=永久有效',
     `status`          TINYINT     NOT NULL DEFAULT 1 COMMENT '1=有效 0=已取消',
     `download_count`  BIGINT      NOT NULL DEFAULT 0 COMMENT '成功校验提取码的次数',
+    `max_downloads`   BIGINT               DEFAULT NULL COMMENT '最大允许验证/下载次数，NULL=不限制',
     `failed_attempts` INT         NOT NULL DEFAULT 0 COMMENT '当前窗口内连续输错次数',
     `locked_until`    DATETIME             DEFAULT NULL COMMENT '锁定截止时间；NULL=未锁定',
     `create_time`     DATETIME    NOT NULL,
@@ -136,3 +144,55 @@ CREATE TABLE `file_share`
     KEY `idx_share_expires` (`expires_at`)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='文件分享（链接 + 提取码）';
+
+-- 显式文件夹（用于新建空文件夹、文件夹重命名/移动、空目录展示）
+DROP TABLE IF EXISTS `file_folder`;
+CREATE TABLE `file_folder`
+(
+    `id`               BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `owner_id`         BIGINT        NOT NULL COMMENT '所属用户',
+    `folder_path`      VARCHAR(4096) NOT NULL COMMENT '相对目录路径（不含首尾斜杠），如 docs/2026',
+    `folder_path_hash` CHAR(64)      NOT NULL COMMENT 'folder_path 的 SHA-256（大小写敏感唯一约束）',
+    `create_time`      DATETIME      NOT NULL,
+    `update_time`      DATETIME      NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_owner_folder_hash` (`owner_id`, `folder_path_hash`),
+    KEY `idx_folder_owner` (`owner_id`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='显式文件夹记录';
+
+-- 操作审计日志
+DROP TABLE IF EXISTS `audit_log`;
+CREATE TABLE `audit_log`
+(
+    `id`          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `user_id`     BIGINT                DEFAULT NULL COMMENT '操作人 ID，匿名操作为 NULL',
+    `username`    VARCHAR(64)           DEFAULT NULL COMMENT '操作人用户名',
+    `action`      VARCHAR(64)  NOT NULL COMMENT '动作标识',
+    `target_type` VARCHAR(32)           DEFAULT NULL COMMENT '对象类型',
+    `target_id`   VARCHAR(128)          DEFAULT NULL COMMENT '对象标识',
+    `detail`      VARCHAR(512)          DEFAULT NULL COMMENT '详情摘要',
+    `client_ip`   VARCHAR(64)           DEFAULT NULL COMMENT '来源 IP',
+    `created_at`  DATETIME     NOT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_audit_user_time` (`user_id`, `created_at`),
+    KEY `idx_audit_created` (`created_at`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='操作审计日志';
+
+-- 批量/文件夹打包下载短期票据
+DROP TABLE IF EXISTS `zip_ticket`;
+CREATE TABLE `zip_ticket`
+(
+    `id`          BIGINT       NOT NULL AUTO_INCREMENT,
+    `ticket_hash` CHAR(64)     NOT NULL,
+    `user_id`     BIGINT       NOT NULL,
+    `zip_name`    VARCHAR(255) NOT NULL,
+    `payload`     MEDIUMTEXT   NOT NULL,
+    `expires_at`  DATETIME     NOT NULL,
+    `created_at`  DATETIME     NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_zip_ticket_hash` (`ticket_hash`),
+    KEY `idx_zip_ticket_expires` (`expires_at`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='打包下载短期票据';

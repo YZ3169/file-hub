@@ -18,6 +18,9 @@ public interface DownloadTicketMapper extends BaseMapper<DownloadTicket> {
                              @Param("fileId") String fileId,
                              @Param("now") LocalDateTime now);
 
+    @Delete("DELETE FROM download_ticket WHERE share_id = #{shareId}")
+    int deleteByShareId(@Param("shareId") Long shareId);
+
     @Delete("DELETE FROM download_ticket WHERE expires_at <= #{now}")
     int deleteExpired(@Param("now") LocalDateTime now);
 }

@@ -26,4 +26,10 @@ public class AuthProperties {
 
     /** 由 FILE_HUB_ADMIN_PASSWORD 注入；不要写进仓库 */
     private String adminPassword = "";
+
+    /**
+     * 是否公开 Swagger/OpenAPI 文档。默认 false（仅 ADMIN 可访问），
+     * 本地/演示环境如需公开浏览可改为 true（或设 FILE_HUB_DOCS_PUBLIC=true）。
+     */
+    private boolean docsPublic = false;
 }

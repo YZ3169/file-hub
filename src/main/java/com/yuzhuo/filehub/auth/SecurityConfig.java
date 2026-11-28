@@ -13,6 +13,11 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.firewall.HttpFirewall;
+import org.springframework.security.web.firewall.StrictHttpFirewall;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+
+import java.util.List;
 
 @Configuration
 @EnableWebSecurity
@@ -23,9 +28,21 @@ public class SecurityConfig {
 
     private final SecurityJsonWriter jsonWriter;
 
+    private final AuthProperties authProperties;
+
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder(10);
+    }
+
+    /** 放行 WebDAV（RFC 4918）扩展 HTTP 方法，避免被 StrictHttpFirewall 直接拦截返回 400 */
+    @Bean
+    public HttpFirewall allowWebDavHttpFirewall() {
+        StrictHttpFirewall firewall = new StrictHttpFirewall();
+        firewall.setAllowedHttpMethods(List.of(
+                "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+                "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"));
+        return firewall;
     }
 
     /**
@@ -56,25 +73,51 @@ public class SecurityConfig {
                                 jsonWriter.unauthorized(response, "请先登录"))
                         .accessDeniedHandler((request, response, ex) ->
                                 jsonWriter.forbidden(response, "没有权限执行该操作")))
-                .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/", "/index.html", "/assets/**", "/favicon.svg",
-                                "/classic.html", "/error").permitAll()
-                        // 开发/演示环境开放接口文档；生产建议只在内网或改成 ADMIN（见 README）
-                        .requestMatchers("/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
-                        // health 给容器探针用，不要求 Token；metrics/prometheus 仍要 ADMIN
-                        .requestMatchers("/actuator/health", "/actuator/health/**",
-                                "/actuator/info").permitAll()
-                        .requestMatchers("/api/auth/login", "/api/auth/register").permitAll()
-                        .requestMatchers("/api/file/config").permitAll()
-                        // 匿名提取：只放行公共前缀；管理接口 /api/share/** 仍需登录
-                        .requestMatchers(HttpMethod.GET, "/api/public/share/*").permitAll()
-                        .requestMatchers(HttpMethod.POST, "/api/public/share/*/verify").permitAll()
-                        // 下载接口由 Controller 内部校验 Bearer 或短期票据
-                        .requestMatchers(HttpMethod.GET, "/api/file/*/download").permitAll()
-                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
-                        .requestMatchers("/actuator/**").hasRole("ADMIN")
-                        .requestMatchers("/api/**").authenticated()
-                        .anyRequest().permitAll())
+                .headers(headers -> headers
+                        .contentTypeOptions(Customizer.withDefaults())
+                        .frameOptions(frame -> frame.sameOrigin())
+                        .referrerPolicy(ref -> ref.policy(
+                                ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+                        .contentSecurityPolicy(csp -> csp.policyDirectives(
+                                "default-src 'self'; "
+                                        + "script-src 'self' 'unsafe-inline'; "
+                                        + "style-src 'self' 'unsafe-inline'; "
+                                        + "img-src 'self' data: blob:; "
+                                        + "media-src 'self' blob:; "
+                                        + "worker-src 'self' blob:; "
+                                        + "frame-src 'self'; "
+                                        + "object-src 'none'; "
+                                        + "base-uri 'self'; "
+                                        + "form-action 'self'; "
+                                        + "frame-ancestors 'self'")))
+                .authorizeHttpRequests(auth -> {
+                    auth.requestMatchers("/", "/index.html", "/assets/**", "/favicon.svg",
+                            "/classic.html", "/download.html", "/error").permitAll();
+                    if (authProperties.isDocsPublic()) {
+                        auth.requestMatchers("/swagger-ui.html", "/swagger-ui/**",
+                                "/v3/api-docs/**").permitAll();
+                    } else {
+                        auth.requestMatchers("/swagger-ui.html", "/swagger-ui/**",
+                                "/v3/api-docs/**").hasRole("ADMIN");
+                    }
+                    // health 给容器探针用，不要求 Token；metrics/prometheus 仍要 ADMIN
+                    auth.requestMatchers("/actuator/health", "/actuator/health/**",
+                            "/actuator/info").permitAll()
+                            .requestMatchers("/api/auth/login", "/api/auth/register").permitAll()
+                            .requestMatchers("/api/file/config").permitAll()
+                            // 匿名提取：只放行公共前缀；管理接口 /api/share/** 仍需登录
+                            .requestMatchers(HttpMethod.GET, "/api/public/share/*").permitAll()
+                            .requestMatchers(HttpMethod.POST, "/api/public/share/*/verify").permitAll()
+                            // 下载与打包下载接口由 Controller 内部校验 Bearer 或短期票据
+                            .requestMatchers(HttpMethod.GET, "/api/file/*/download").permitAll()
+                            .requestMatchers(HttpMethod.GET, "/api/file/zip").permitAll()
+                            // WebDAV 由独立 Filter 走 HTTP Basic / Bearer 鉴权与限流
+                            .requestMatchers("/dav", "/dav/**").permitAll()
+                            .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                            .requestMatchers("/actuator/**").hasRole("ADMIN")
+                            .requestMatchers("/api/**").authenticated()
+                            .anyRequest().permitAll();
+                })
                 .addFilterBefore(bearerTokenFilter, UsernamePasswordAuthenticationFilter.class);
         return http.build();
     }
