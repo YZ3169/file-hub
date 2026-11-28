@@ -342,7 +342,7 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:8081/actuator/health | grep -q '"UP"'
-          curl -fsS http://127.0.0.1:8081/api/file/config | grep -q 'S3'
+          curl -fsS http://127.0.0.1:8081/api/file/config | grep -q '"backend":"s3"'
           REG=$(curl -fsS -X POST -H 'Content-Type: application/json' \
             -d '{"username":"minio_ci","password":"password-123"}' http://127.0.0.1:8081/api/auth/register)
           TOK=$(python -c "import sys,json;print(json.loads(sys.argv[1])['data']['token'])" "$REG")
