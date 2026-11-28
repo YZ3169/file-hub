@@ -39,6 +39,7 @@ import java.util.zip.ZipInputStream;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -386,7 +387,17 @@ class FeatureIntegrationTest {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(200, optionsRes.statusCode());
-        assertTrue(optionsRes.headers().firstValue("DAV").orElse("").contains("1"));
+        String davCap = optionsRes.headers().firstValue("DAV").orElse("");
+        assertTrue(davCap.contains("1"));
+        assertFalse(davCap.contains("2"));
+
+        HttpResponse<String> lockRes = http.send(
+                HttpRequest.newBuilder(URI.create(davBase + "/webdav-dir"))
+                        .header(HttpHeaders.AUTHORIZATION, bobBasic)
+                        .method("LOCK", HttpRequest.BodyPublishers.noBody())
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(405, lockRes.statusCode());
 
         HttpResponse<String> unauthRes = http.send(
                 HttpRequest.newBuilder(URI.create(davBase + "/"))
@@ -474,22 +485,65 @@ class FeatureIntegrationTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(204, delRes.statusCode());
 
-        // 10. 桌面端本地目录同步（拦截 FileHub 数据目录，正常目录同步成功）
+        // 10. 桌面端本地目录同步（必须通过本机目录选择器授权凭证；普通用户伪造或无授权凭据一律拒绝）
+        String shellSecret = Files.readString(DATA_DIR.resolve("desktop-shell.secret"), StandardCharsets.UTF_8).trim();
+
+        // 10.1 拒绝直接传 localDir、伪造 grantId 或无凭据调用 shell-grant
         mvc.perform(post("/api/desktop/sync")
-                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + bobToken)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"localDir\":\"" + DATA_DIR.toString().replace("\\", "\\\\") + "\",\"targetDir\":\"bad\"}"))
+                        .content("{\"localDir\":\"" + syncDir.toString().replace("\\", "\\\\") + "\",\"targetDir\":\"bad\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(10001));
+
+        mvc.perform(post("/api/desktop/sync")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + bobToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"grantId\":\"forged-grant\",\"targetDir\":\"bad\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(40003));
+
+        mvc.perform(post("/api/desktop/sync/shell-grant")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"localDir\":\"" + syncDir.toString().replace("\\", "\\\\") + "\"}"))
+                .andExpect(status().isForbidden());
+
+        // 10.2 有效外壳凭据仍拦截 FileHub 数据目录
+        mvc.perform(post("/api/desktop/sync/shell-grant")
+                        .header("X-Desktop-Shell-Secret", shellSecret)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"localDir\":\"" + DATA_DIR.toString().replace("\\", "\\\\") + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(10001));
+
+        // 10.3 合法业务目录签发一次性 grantId，绑定规则后立即作废
+        MvcResult grantRes = mvc.perform(post("/api/desktop/sync/shell-grant")
+                        .header("X-Desktop-Shell-Secret", shellSecret)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"localDir\":\"" + syncDir.toString().replace("\\", "\\\\") + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andReturn();
+        String grantId = objectMapper.readTree(grantRes.getResponse().getContentAsString())
+                .get("data").get("grantId").asText();
+
         Files.writeString(syncDir.resolve("sync-note.txt"), "synced content", StandardCharsets.UTF_8);
         MvcResult syncAdd = mvc.perform(post("/api/desktop/sync")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"localDir\":\"" + syncDir.toString().replace("\\", "\\\\") + "\",\"targetDir\":\"desktop-backup\"}"))
+                        .content("{\"grantId\":\"" + grantId + "\",\"targetDir\":\"desktop-backup\"}"))
                 .andExpect(status().isOk())
                 .andReturn();
         String ruleId = objectMapper.readTree(syncAdd.getResponse().getContentAsString())
                 .get("data").get("id").asText();
+
+        // 同一 grantId 不可重复使用
+        mvc.perform(post("/api/desktop/sync")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"grantId\":\"" + grantId + "\",\"targetDir\":\"desktop-backup-2\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(40003));
 
         mvc.perform(post("/api/desktop/sync/" + ruleId + "/run")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken))

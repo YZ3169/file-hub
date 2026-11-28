@@ -356,6 +356,59 @@ class FileStorageServiceTest {
         verify(fileInfoMapper, never()).touchUploading(anyString());
     }
 
+    @Test
+    @DisplayName("安全：仅知道他人私有文件的 SHA-256 与大小不能跨账号免传秒传")
+    void initDoesNotInstantUploadUsingOtherUsersFile() {
+        String hash = "b".repeat(64);
+        when(fileInfoMapper.findDoneListByOwnerAndHashAndSize(hash, 5L, OTHER_USER.id(), false))
+                .thenReturn(List.of());
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of());
+
+        var resp = service.init(new InitUploadRequest("secret.bin", 5L, hash), OTHER_USER);
+
+        assertFalse(resp.instant());
+        verify(fileInfoMapper).findDoneListByOwnerAndHashAndSize(hash, 5L, OTHER_USER.id(), false);
+        verify(fileInfoMapper, never()).findDoneListByHashAndSize(hash, 5L);
+    }
+
+    @Test
+    @DisplayName("清空回收站：并发恢复的文件（status 已不是 TRASH）不会被误删")
+    void emptyTrashSkipsConcurrentlyRestoredFile() {
+        FileInfo staleSnapshot = doneInfo();
+        staleSnapshot.setStatus(FileInfo.STATUS_TRASH);
+
+        FileInfo restoredNow = doneInfo();
+        restoredNow.setStatus(FileInfo.STATUS_DONE);
+
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of(staleSnapshot));
+        when(fileInfoMapper.selectOne(any())).thenReturn(restoredNow);
+
+        int count = service.emptyTrash(USER);
+
+        assertEquals(0, count);
+        verify(fileInfoMapper, never()).deleteById(any(java.io.Serializable.class));
+        verify(fileInfoMapper, never()).deleteTrashById(any());
+        verify(storage, never()).delete(anyString());
+    }
+
+    @Test
+    @DisplayName("清空回收站：仅当条件删除成功删除 TRASH 行时才清理物理引用")
+    void emptyTrashDeletesOnlyWhenTrashRowDeleted() {
+        FileInfo trashed = doneInfo();
+        trashed.setStatus(FileInfo.STATUS_TRASH);
+
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of(trashed));
+        when(fileInfoMapper.selectOne(any())).thenReturn(trashed);
+        when(fileInfoMapper.deleteTrashById(1L)).thenReturn(1);
+        when(fileInfoMapper.countByStoragePath(trashed.getStoragePath())).thenReturn(0);
+
+        int count = service.emptyTrash(USER);
+
+        assertEquals(1, count);
+        verify(fileInfoMapper).deleteTrashById(1L);
+        verify(storage).delete(trashed.getStoragePath());
+    }
+
     private static FileInfo doneInfo() {
         FileInfo info = uploadingInfo();
         info.setStatus(FileInfo.STATUS_DONE);

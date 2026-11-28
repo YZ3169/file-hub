@@ -349,15 +349,97 @@ namespace FileHubShell
                     dlg.ShowNewFolderButton = true;
                     if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
                     {
-                        if (webView != null && webView.CoreWebView2 != null)
+                        string selectedPath = dlg.SelectedPath;
+                        string currentDataDir = dataDir != null ? dataDir : GetDataDir();
+                        Task.Run(delegate
                         {
-                            string payload = "{\"type\":\"pickedFolder\",\"path\":"
-                                    + EscapeJsonString(dlg.SelectedPath) + "}";
-                            webView.CoreWebView2.PostWebMessageAsJson(payload);
-                        }
+                            string payload = RequestShellFolderGrant(currentDataDir, selectedPath);
+                            try
+                            {
+                                BeginInvoke(new MethodInvoker(delegate
+                                {
+                                    if (!exiting && !IsDisposed && webView != null && webView.CoreWebView2 != null)
+                                    {
+                                        webView.CoreWebView2.PostWebMessageAsJson(payload);
+                                    }
+                                }));
+                            }
+                            catch (Exception)
+                            {
+                                // 窗口正在关闭，忽略回调
+                            }
+                        });
                     }
                 }
             }));
+        }
+
+        private static string RequestShellFolderGrant(string baseDataDir, string selectedPath)
+        {
+            try
+            {
+                string secretPath = Path.Combine(baseDataDir, "desktop-shell.secret");
+                if (!File.Exists(secretPath))
+                {
+                    return "{\"type\":\"pickedFolder\",\"error\":" + EscapeJsonString(ShellUi.T(
+                            "未找到本机桌面授权凭据，请重启 FileHub 后重试",
+                            "Desktop shell credential was not found. Please restart FileHub.")) + "}";
+                }
+                string secret = File.ReadAllText(secretPath, Encoding.UTF8).Trim();
+                if (string.IsNullOrEmpty(secret))
+                {
+                    return "{\"type\":\"pickedFolder\",\"error\":" + EscapeJsonString(ShellUi.T(
+                            "本机桌面授权凭据为空，请重启 FileHub 后重试",
+                            "Desktop shell credential is empty. Please restart FileHub.")) + "}";
+                }
+
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(
+                        Program.AppUrl + "/api/desktop/sync/shell-grant");
+                request.Method = "POST";
+                request.Proxy = null;
+                request.Timeout = 5000;
+                request.ReadWriteTimeout = 5000;
+                request.KeepAlive = false;
+                request.ContentType = "application/json; charset=utf-8";
+                request.Headers["X-Desktop-Shell-Secret"] = secret;
+                byte[] bodyBytes = Encoding.UTF8.GetBytes("{\"localDir\":" + EscapeJsonString(selectedPath) + "}");
+                request.ContentLength = bodyBytes.Length;
+                using (Stream reqStream = request.GetRequestStream())
+                {
+                    reqStream.Write(bodyBytes, 0, bodyBytes.Length);
+                }
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                {
+                    string responseBody = reader.ReadToEnd();
+                    return "{\"type\":\"pickedFolder\",\"result\":" + responseBody + "}";
+                }
+            }
+            catch (WebException ex)
+            {
+                if (ex.Response != null)
+                {
+                    try
+                    {
+                        using (StreamReader reader = new StreamReader(ex.Response.GetResponseStream(), Encoding.UTF8))
+                        {
+                            string errBody = reader.ReadToEnd();
+                            if (!string.IsNullOrEmpty(errBody) && errBody.TrimStart().StartsWith("{"))
+                            {
+                                return "{\"type\":\"pickedFolder\",\"result\":" + errBody + "}";
+                            }
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                return "{\"type\":\"pickedFolder\",\"error\":" + EscapeJsonString(ex.Message) + "}";
+            }
+            catch (Exception ex)
+            {
+                return "{\"type\":\"pickedFolder\",\"error\":" + EscapeJsonString(ex.Message) + "}";
+            }
         }
 
         private static string EscapeJsonString(string value)

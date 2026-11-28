@@ -45,12 +45,22 @@ public interface FileShareMapper extends BaseMapper<FileShare> {
     /**
      * 提取次数 +1。过期、取消都在 WHERE 里兜底，避免边界时刻先判定未过期、
      * BCrypt 跑完后分享已经失效却仍计数。
+     *
+     * <p>同时校验 {@code auth_version}：验码期间提取码被重置（或分享被取消）时版本已变，
+     * 这次按旧码通过的验证不能再换到额度。</p>
      */
     @Update("UPDATE file_share SET download_count = download_count + 1, update_time = #{now} "
-            + "WHERE id = #{id} AND status = 1 "
+            + "WHERE id = #{id} AND status = 1 AND auth_version = #{version} "
             + "AND (expires_at IS NULL OR expires_at > #{now}) "
             + "AND (max_downloads IS NULL OR download_count < max_downloads)")
-    int incrementDownload(@Param("id") Long id, @Param("now") LocalDateTime now);
+    int incrementDownload(@Param("id") Long id,
+                          @Param("version") int version,
+                          @Param("now") LocalDateTime now);
+
+    /** 转存在消费额度后失败（如接收者配额不足）时退还这一次 */
+    @Update("UPDATE file_share SET download_count = download_count - 1, update_time = #{now} "
+            + "WHERE id = #{id} AND download_count > 0")
+    int refundDownload(@Param("id") Long id, @Param("now") LocalDateTime now);
 
     /** 已登录用户某个文件的有效分享数（用于创建配额） */
     @Select("SELECT COUNT(*) FROM file_share WHERE owner_id = #{ownerId} AND file_id = #{fileId} "
@@ -69,15 +79,16 @@ public interface FileShareMapper extends BaseMapper<FileShare> {
             + "WHERE id = #{id} AND locked_until IS NOT NULL AND locked_until <= #{now}")
     int clearExpiredLock(@Param("id") Long id, @Param("now") LocalDateTime now);
 
-    @Update("UPDATE file_share SET status = 0, update_time = #{now} "
+    /** 取消时同时推进授权版本，并发签发中的票据即使稍后才写入也无法兑换 */
+    @Update("UPDATE file_share SET status = 0, auth_version = auth_version + 1, update_time = #{now} "
             + "WHERE share_token = #{token} AND owner_id = #{ownerId} AND status = 1")
     int cancel(@Param("token") String token,
                @Param("ownerId") Long ownerId,
                @Param("now") LocalDateTime now);
 
-    /** 重置提取码并解除锁定；返回 0 表示不是自己的或已取消 */
+    /** 重置提取码并解除锁定、推进授权版本；返回 0 表示不是自己的或已取消 */
     @Update("UPDATE file_share SET code_hash = #{codeHash}, failed_attempts = 0, "
-            + "locked_until = NULL, update_time = #{now} "
+            + "locked_until = NULL, auth_version = auth_version + 1, update_time = #{now} "
             + "WHERE share_token = #{token} AND owner_id = #{ownerId} AND status = 1")
     int resetCode(@Param("token") String token,
                   @Param("ownerId") Long ownerId,

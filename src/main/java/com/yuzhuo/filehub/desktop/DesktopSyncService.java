@@ -3,6 +3,7 @@ package com.yuzhuo.filehub.desktop;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yuzhuo.filehub.auth.OpaqueToken;
 import com.yuzhuo.filehub.auth.UserPrincipal;
 import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.config.StorageProperties;
@@ -26,8 +27,12 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
+import java.awt.GraphicsEnvironment;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -40,8 +45,11 @@ import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
@@ -55,6 +63,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.swing.JFileChooser;
+import javax.swing.JFrame;
+import javax.swing.SwingUtilities;
 
 /**
  * 桌面端本地目录自动单向备份同步服务（仅在 {@code file-hub.desktop=true} 时启用）。
@@ -70,6 +82,8 @@ public class DesktopSyncService {
 
     private static final Set<String> IGNORED_NAMES = Set.of(".DS_Store", "Thumbs.db", "desktop.ini");
     private static final long MAX_SYNC_FILE_BYTES = 2L * 1024 * 1024 * 1024;
+    private static final Duration GRANT_TTL = Duration.ofMinutes(10);
+    private static final int MAX_PENDING_GRANTS = 64;
 
     private final FileStorageService fileStorageService;
     private final FolderService folderService;
@@ -84,9 +98,17 @@ public class DesktopSyncService {
 
     private final List<SyncRule> rules = new CopyOnWriteArrayList<>();
     private final Map<WatchKey, WatchEntry> watchKeys = new ConcurrentHashMap<>();
+    private final Map<String, DirectoryGrant> directoryGrants = new ConcurrentHashMap<>();
+    private volatile byte[] shellSecretBytes;
     private WatchService watchService;
     private ExecutorService watcherExecutor;
     private ScheduledExecutorService syncExecutor;
+
+    public record FolderGrantVO(String grantId, String localDir) {
+    }
+
+    private record DirectoryGrant(String grantId, Path realLocal, Long userId, Instant expiresAt) {
+    }
 
     @Data
     @NoArgsConstructor
@@ -107,6 +129,7 @@ public class DesktopSyncService {
 
     @PostConstruct
     public void start() {
+        initShellSecret();
         loadRules();
         try {
             watchService = FileSystems.getDefault().newWatchService();
@@ -156,27 +179,92 @@ public class DesktopSyncService {
                 .toList();
     }
 
-    public SyncRule addRule(String localDirRaw, String targetDirRaw, UserPrincipal user) {
-        if (localDirRaw == null || localDirRaw.isBlank()) {
-            throw new BizException(10001, "请选择本地同步目录");
+    /**
+     * 为同机运行原生对话框的桌面外壳签发一次性目录授权凭证。
+     * Web 端提交创建同步规则时只认这个 grantId，不再直接接受任意路径字符串。
+     */
+    public FolderGrantVO authorizeDirectory(String localDirRaw, Long boundUserId) {
+        Path realLocal = validateSyncDirectory(localDirRaw);
+        Instant now = Instant.now();
+        directoryGrants.entrySet().removeIf(e -> now.isAfter(e.getValue().expiresAt()));
+        if (directoryGrants.size() >= MAX_PENDING_GRANTS) {
+            String oldestKey = directoryGrants.keySet().iterator().next();
+            directoryGrants.remove(oldestKey);
         }
-        Path localPath = Paths.get(localDirRaw.trim()).toAbsolutePath().normalize();
-        if (!Files.isDirectory(localPath) || Files.isSymbolicLink(localPath)) {
-            throw new BizException(10001, "本地目录不存在或不可作为同步根目录：" + localPath);
+        String grantId = OpaqueToken.generate();
+        directoryGrants.put(grantId, new DirectoryGrant(grantId, realLocal, boundUserId, now.plus(GRANT_TTL)));
+        return new FolderGrantVO(grantId, realLocal.toString());
+    }
+
+    /**
+     * 在非 WebView 外壳（例如独立浏览器访问本机桌面端）时，由服务端本机图形界面弹出原生目录选择器。
+     * 仅允许管理员在本机触发，防止普通注册账号远端/同机唤起操作者窗口或未授权枚举路径。
+     */
+    public FolderGrantVO pickDirectoryWithNativeDialog(UserPrincipal user) {
+        if (user == null || !user.isAdmin()) {
+            throw new BizException(40003, "仅本机管理员可通过浏览器唤起目录授权，或请使用桌面客户端操作");
         }
-        Path realLocal;
+        if (GraphicsEnvironment.isHeadless()) {
+            throw new BizException(40003, "当前运行环境无图形界面，无法打开系统目录选择器");
+        }
+        AtomicReference<Path> selected = new AtomicReference<>();
+        Runnable showPicker = () -> {
+            JFrame parent = new JFrame();
+            parent.setUndecorated(true);
+            parent.setAlwaysOnTop(true);
+            parent.setLocationRelativeTo(null);
+            try {
+                JFileChooser chooser = new JFileChooser();
+                chooser.setDialogTitle("选择要自动备份同步到 FileHub 的本地目录");
+                chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+                chooser.setAcceptAllFileFilterUsed(false);
+                if (chooser.showOpenDialog(parent) == JFileChooser.APPROVE_OPTION
+                        && chooser.getSelectedFile() != null) {
+                    selected.set(chooser.getSelectedFile().toPath());
+                }
+            } finally {
+                parent.dispose();
+            }
+        };
         try {
-            realLocal = localPath.toRealPath();
-        } catch (IOException e) {
-            throw new BizException(10001, "本地目录不可访问：" + e.getMessage());
+            if (SwingUtilities.isEventDispatchThread()) {
+                showPicker.run();
+            } else {
+                SwingUtilities.invokeAndWait(showPicker);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BizException(50000, "目录选择被中断");
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            throw new BizException(50000, "无法打开系统目录选择器：" + (cause == null ? e.getMessage() : cause.getMessage()));
         }
-        if (realLocal.getParent() == null || realLocal.getFileName() == null) {
-            throw new BizException(10001, "不能同步系统磁盘根目录");
+        Path picked = selected.get();
+        if (picked == null) {
+            return new FolderGrantVO(null, null);
         }
-        if (isOverlappingPath(realLocal, dataDir)
-                || isOverlappingPath(realLocal, storageProperties.getRoot())) {
-            throw new BizException(10001, "不能同步 FileHub 自身的数据或存储目录，请另选业务目录");
+        return authorizeDirectory(picked.toString(), user.id());
+    }
+
+    public boolean verifyShellSecret(String candidate) {
+        byte[] expected = this.shellSecretBytes;
+        if (candidate == null || candidate.isBlank() || expected == null) {
+            return false;
         }
+        return MessageDigest.isEqual(expected, candidate.trim().getBytes(StandardCharsets.UTF_8));
+    }
+
+    public SyncRule addRule(String grantId, String targetDirRaw, UserPrincipal user) {
+        if (grantId == null || grantId.isBlank()) {
+            throw new BizException(40003, "请先通过本机系统目录选择器授权同步目录");
+        }
+        DirectoryGrant grant = directoryGrants.remove(grantId.trim());
+        if (grant == null || Instant.now().isAfter(grant.expiresAt())
+                || (grant.userId() != null && !grant.userId().equals(user.id()))) {
+            throw new BizException(40003, "目录未授权或授权已过期，请重新通过系统目录选择器选择");
+        }
+        // 再次校验真实路径，防止授权窗口打开到提交期间目录被替换成符号链接或非法目录
+        Path realLocal = validateSyncDirectory(grant.realLocal().toString());
 
         String targetDir = PathUtil.normalizeDir(targetDirRaw);
         if (targetDir.isEmpty()) {
@@ -206,6 +294,30 @@ public class DesktopSyncService {
             syncExecutor.execute(() -> syncRule(rule.getId()));
         }
         return copyRule(rule);
+    }
+
+    private Path validateSyncDirectory(String localDirRaw) {
+        if (localDirRaw == null || localDirRaw.isBlank()) {
+            throw new BizException(10001, "请选择本地同步目录");
+        }
+        Path localPath = Paths.get(localDirRaw.trim()).toAbsolutePath().normalize();
+        if (!Files.isDirectory(localPath) || Files.isSymbolicLink(localPath)) {
+            throw new BizException(10001, "本地目录不存在或不可作为同步根目录：" + localPath);
+        }
+        Path realLocal;
+        try {
+            realLocal = localPath.toRealPath();
+        } catch (IOException e) {
+            throw new BizException(10001, "本地目录不可访问：" + e.getMessage());
+        }
+        if (realLocal.getParent() == null || realLocal.getFileName() == null) {
+            throw new BizException(10001, "不能同步系统磁盘根目录");
+        }
+        if (isOverlappingPath(realLocal, dataDir)
+                || isOverlappingPath(realLocal, storageProperties.getRoot())) {
+            throw new BizException(10001, "不能同步 FileHub 自身的数据或存储目录，请另选业务目录");
+        }
+        return realLocal;
     }
 
     private static boolean isOverlappingPath(Path candidate, String forbiddenRaw) {
@@ -453,6 +565,25 @@ public class DesktopSyncService {
                 .filter(r -> r.getId().equals(ruleId) && user.id().equals(r.getOwnerId()))
                 .findFirst()
                 .orElseThrow(() -> new BizException(10005, "同步规则不存在"));
+    }
+
+    private Path shellSecretFile() {
+        return Paths.get(dataDir).toAbsolutePath().normalize().resolve("desktop-shell.secret");
+    }
+
+    private void initShellSecret() {
+        String secret = OpaqueToken.generate();
+        this.shellSecretBytes = secret.getBytes(StandardCharsets.UTF_8);
+        Path file = shellSecretFile();
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, secret, StandardCharsets.UTF_8);
+            if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+                Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+            }
+        } catch (UnsupportedOperationException | IOException e) {
+            log.warn("写入桌面外壳授权凭据失败：{}", file, e);
+        }
     }
 
     private Path rulesFile() {

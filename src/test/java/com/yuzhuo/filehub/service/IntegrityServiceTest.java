@@ -75,6 +75,7 @@ class IntegrityServiceTest {
 
         assertEquals(3, resp.checked());
         assertEquals(2, resp.brokenCount());
+        assertEquals(0, resp.unverifiableCount());
         assertFalse(resp.truncated());
         assertTrue(resp.items().stream().anyMatch(i -> i.fileId().equals(ID1)
                 && i.reason().equals("物理文件不存在")));
@@ -163,6 +164,36 @@ class IntegrityServiceTest {
                 .map(IntegrityRepairResponse.Item::fileId)
                 .toList();
         assertEquals(List.of(ID1), repairedIds);
+    }
+
+    @Test
+    @DisplayName("存储读取故障标记为暂时无法验证，不计入损坏，修复时保留数据")
+    void storageFailureIsUnverifiableAndNeverDeletedOnRepair() throws IOException {
+        FileInfo s3Timeout = done(ID1, "timeout.bin", 5, HELLO_HASH, P1);
+        FileInfo readErr = done(ID2, "ioerr.bin", 5, HELLO_HASH, P2);
+
+        when(fileInfoMapper.selectList(any())).thenReturn(List.of(s3Timeout, readErr));
+        when(fileInfoMapper.countDone()).thenReturn(2L);
+        when(storage.exists(P1)).thenThrow(new RuntimeException("S3 timeout"));
+        when(storage.exists(P2)).thenReturn(true);
+        when(storage.size(P2)).thenReturn(5L);
+        when(storage.open(P2)).thenThrow(new IOException("Connection reset"));
+
+        IntegrityScanResponse scan = service.scan(true, 100);
+        assertEquals(0, scan.brokenCount());
+        assertEquals(2, scan.unverifiableCount());
+        assertEquals(2, scan.items().size());
+        assertTrue(scan.items().stream().allMatch(
+                i -> IntegrityScanResponse.VERDICT_UNVERIFIABLE.equals(i.verdict())));
+
+        when(fileInfoMapper.selectOne(any())).thenReturn(s3Timeout, readErr);
+        IntegrityRepairResponse repair = service.repair(
+                new IntegrityRepairRequest(List.of(ID1, ID2)), ADMIN);
+
+        assertEquals(0, repair.repaired());
+        assertEquals(2, repair.failed());
+        assertTrue(repair.items().stream().allMatch(i -> i.reason().contains("暂时无法验证")));
+        verify(fileStorageService, never()).delete(any(), any());
     }
 
     private static FileInfo done(String fileId, String name, long size, String hash, String path) {

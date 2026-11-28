@@ -46,6 +46,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
 /**
@@ -134,6 +135,11 @@ public class FileStorageService {
      * </ol>
      *
      * @param user 当前登录用户；秒传/断点续传都只在有权限的记录里匹配
+     *
+     * <p><b>秒传只对「当前账号自己已有的内容」生效</b>（管理员额外包含历史数据），与 {@link #check} 的可见范围一致。
+     * 只凭 SHA-256 + 大小就能在别人的物理文件上建引用，等于把 hash 当成了读权限凭证：
+     * 掌握某个私有文件摘要的任何账号都能拿到一份可读副本。跨账号的物理去重仍然保留，
+     * 但只在客户端真的上传完所有字节、服务端复算摘要通过之后（{@link #complete} 的合并后去重）才发生。</p>
      */
     public InitUploadResponse init(InitUploadRequest req, UserPrincipal user) {
         validateRelativePath(req);
@@ -152,17 +158,16 @@ public class FileStorageService {
                 // 再套一个读锁挡住「孤儿成品回收」：否则回收任务可能刚数完引用为 0，
                 // 本请求就插入了新引用，随后回收把这份仍被引用的物理文件删掉。
                 locks.read(GC_LOCK, () -> {
-                    FileInfo done = findUsableDone(fileHash, req.fileSize());
+                    FileInfo done = findUsableDoneForOwner(fileHash, req.fileSize(), user);
                     if (done == null) {
                         return null;
                     }
-                    checkQuota(user, req.fileSize());
                     String newFileId = UUID.randomUUID().toString();
                     FileInfo row = newRow(newFileId, req, chunkSize, chunkTotal, user);
                     row.setStatus(FileInfo.STATUS_DONE);
                     // 新记录指向同一份物理文件：磁盘上不再存第二份
                     row.setStoragePath(done.getStoragePath());
-                    fileInfoMapper.insert(row);
+                    allocateAndRun(user, req.fileSize(), () -> fileInfoMapper.insert(row));
                     log.info("秒传命中：{} -> 复用 {}", req.fileName(), done.getStoragePath());
                     return new InitUploadResponse(newFileId, true, chunkSize, chunkTotal, req.fileSize(), List.of());
                 }));
@@ -200,10 +205,11 @@ public class FileStorageService {
         }
 
         // --- 情况 3：全新任务 ---
-        checkQuota(user, req.fileSize());
+        // 上传中的行本身就计入配额：预留与插入在同一个按用户串行化的事务里完成，
+        // 两个并发 init 不会同时通过同一份余额检查。
         String fileId = UUID.randomUUID().toString();
         FileInfo row = newRow(fileId, req, chunkSize, chunkTotal, user);
-        fileInfoMapper.insert(row);
+        allocateAndRun(user, req.fileSize(), () -> fileInfoMapper.insert(row));
         log.info("新建上传任务：{}（{} 字节，{} 片）", fileId, req.fileSize(), chunkTotal);
         return new InitUploadResponse(fileId, false, chunkSize, chunkTotal, req.fileSize(), List.of());
     }
@@ -845,13 +851,7 @@ public class FileStorageService {
                     if (n == 0) {
                         return 0;
                     }
-                    if (trashed.getStoragePath() != null) {
-                        locks.writeVoid(contentKey(trashed.getFileHash(), trashed.getFileSize()), () -> {
-                            if (fileInfoMapper.countByStoragePath(trashed.getStoragePath()) == 0) {
-                                objectStorage.delete(trashed.getStoragePath());
-                            }
-                        });
-                    }
+                    releasePhysicalIfUnreferenced(trashed);
                     return n;
                 });
                 if (deleted > 0) {
@@ -1012,6 +1012,14 @@ public class FileStorageService {
                 result.getTotal(), safePage, safeSize);
     }
 
+    /**
+     * 清空回收站。
+     *
+     * <p>清单是先查出来的，逐项处理期间另一个窗口可能已经把某个文件恢复了。
+     * 所以不能对清单里的 fileId 调通用 {@link #delete}（它会无条件删行），
+     * 而是在文件写锁内做带 {@code status = 2} 条件的删除：恢复成功的行删 0 行、原样保留；
+     * 只有真的删掉了记录，才去清理物理引用。和定时过期清理是同一套条件删除思路。</p>
+     */
     public int emptyTrash(UserPrincipal user) {
         LambdaQueryWrapper<FileInfo> qw = new LambdaQueryWrapper<>();
         applyOwnerScope(qw, user, null);
@@ -1020,13 +1028,30 @@ public class FileStorageService {
         int count = 0;
         for (FileInfo info : trashed) {
             try {
-                delete(info.getFileId(), user);
-                count++;
+                if (purgeTrashed(info.getFileId(), user)) {
+                    count++;
+                }
             } catch (RuntimeException e) {
                 log.warn("清空回收站项失败 fileId={}", info.getFileId(), e);
             }
         }
         return count;
+    }
+
+    /** 彻底删除一条仍在回收站里的记录；已被恢复或已被删除时返回 false，不做任何改动 */
+    private boolean purgeTrashed(String fileId, UserPrincipal user) {
+        LocalDiskStorage.requireSafeId(fileId);
+        return locks.write(fileId, () -> {
+            FileInfo info = findInfo(fileId);
+            if (info == null || !canAccess(info, user) || info.getStatus() != FileInfo.STATUS_TRASH) {
+                return false;
+            }
+            if (fileInfoMapper.deleteTrashById(info.getId()) == 0) {
+                return false;
+            }
+            releasePhysicalIfUnreferenced(info);
+            return true;
+        });
     }
 
     /** 分享转存：利用内容寻址在接收者空间生成新逻辑记录，零数据拷贝 */
@@ -1036,7 +1061,6 @@ public class FileStorageService {
                     if (!isStorageIntact(source)) {
                         throw new BizException(42005, "文件已失效，无法转存");
                     }
-                    checkQuota(receiver, source.getFileSize());
                     String newFileId = UUID.randomUUID().toString();
                     LocalDateTime now = LocalDateTime.now();
                     FileInfo row = new FileInfo();
@@ -1052,7 +1076,7 @@ public class FileStorageService {
                     row.setOwnerId(receiver.id());
                     row.setCreateTime(now);
                     row.setUpdateTime(now);
-                    fileInfoMapper.insert(row);
+                    allocateAndRun(receiver, source.getFileSize(), () -> fileInfoMapper.insert(row));
                     return FileVO.from(row);
                 }));
     }
@@ -1117,46 +1141,67 @@ public class FileStorageService {
             String newFileId = UUID.randomUUID().toString();
             LocalDateTime now = LocalDateTime.now();
 
-            FileInfo inserted = locks.write(contentKey(hash, finalSize), () ->
-                    locks.read(GC_LOCK, () -> {
-                        FileInfo done = findUsableDone(hash, finalSize);
-                        String path;
-                        if (done != null) {
-                            deleteQuietly(mergedFile);
-                            path = done.getStoragePath();
-                        } else {
-                            path = chunkStorage.buildRelativePath(newFileId);
-                            try {
-                                objectStorage.put(path, mergedFile);
-                            } catch (IOException e) {
-                                deleteQuietly(mergedFile);
-                                throw new BizException(20005, "写入存储失败：" + e.getMessage());
-                            }
-                        }
-                        FileInfo row = new FileInfo();
-                        row.setFileId(newFileId);
-                        row.setFileName(fileName);
-                        row.setRelativePath(relativePath == null ? "" : relativePath);
-                        row.setFileSize(finalSize);
-                        row.setFileHash(hash);
-                        row.setChunkSize(chunkSize);
-                        row.setChunkTotal(chunkTotal);
-                        row.setStoragePath(path);
-                        row.setStatus(FileInfo.STATUS_DONE);
-                        row.setOwnerId(user.id());
-                        row.setCreateTime(now);
-                        row.setUpdateTime(now);
-                        fileInfoMapper.insert(row);
-                        return row;
-                    }));
+            String pathLockKey = "path:" + user.id() + ":"
+                    + com.yuzhuo.filehub.util.PathUtil.effectivePath(fileName, relativePath);
+            FileInfo inserted = locks.write(pathLockKey, () -> {
+                List<FileInfo> currentSamePath = findByExactPath(user.id(), fileName, relativePath);
+                long currentReplacedBytes = currentSamePath.stream().mapToLong(FileInfo::getFileSize).sum();
 
-            for (FileInfo old : existingSamePath) {
-                try {
-                    delete(old.getFileId(), user);
-                } catch (RuntimeException e) {
-                    log.warn("覆盖旧文件失败 oldId={}", old.getFileId(), e);
+                FileInfo created = locks.write(contentKey(hash, finalSize), () ->
+                        locks.read(GC_LOCK, () -> {
+                            // 这里已经收完并复算了全部字节，跨账号复用物理文件是安全的（上传后去重）
+                            FileInfo done = findUsableDone(hash, finalSize);
+                            String path;
+                            boolean newlyStored = false;
+                            if (done != null) {
+                                deleteQuietly(mergedFile);
+                                path = done.getStoragePath();
+                            } else {
+                                newlyStored = true;
+                                path = chunkStorage.buildRelativePath(newFileId);
+                                try {
+                                    objectStorage.put(path, mergedFile);
+                                } catch (IOException e) {
+                                    deleteQuietly(mergedFile);
+                                    throw new BizException(20005, "写入存储失败：" + e.getMessage());
+                                }
+                            }
+                            FileInfo row = new FileInfo();
+                            row.setFileId(newFileId);
+                            row.setFileName(fileName);
+                            row.setRelativePath(relativePath == null ? "" : relativePath);
+                            row.setFileSize(finalSize);
+                            row.setFileHash(hash);
+                            row.setChunkSize(chunkSize);
+                            row.setChunkTotal(chunkTotal);
+                            row.setStoragePath(path);
+                            row.setStatus(FileInfo.STATUS_DONE);
+                            row.setOwnerId(user.id());
+                            row.setCreateTime(now);
+                            row.setUpdateTime(now);
+                            try {
+                                // 同路径旧文件稍后会被替换，按当前锁内真实旧占用扣减后原子预留配额
+                                allocateReplacingAndRun(user, finalSize, currentReplacedBytes,
+                                        () -> fileInfoMapper.insert(row));
+                            } catch (RuntimeException e) {
+                                // 刚写入的对象还没有任何引用（内容锁内无人能复用），立即回收
+                                if (newlyStored) {
+                                    objectStorage.delete(path);
+                                }
+                                throw e;
+                            }
+                            return row;
+                        }));
+
+                for (FileInfo old : currentSamePath) {
+                    try {
+                        delete(old.getFileId(), user);
+                    } catch (RuntimeException e) {
+                        log.warn("覆盖旧文件失败 oldId={}", old.getFileId(), e);
+                    }
                 }
-            }
+                return created;
+            });
             return FileVO.from(inserted);
         } catch (IOException e) {
             deleteQuietly(merged);
@@ -1183,6 +1228,25 @@ public class FileStorageService {
     }
 
     /**
+     * 原子地「检查配额 + 写入占用空间的记录」。普通上传、秒传、转存、流式写入都必须走这里，
+     * 否则同一账号的并发请求可以同时通过同一份余额检查。
+     */
+    private <T> T allocateAndRun(UserPrincipal user, long additionalBytes, Supplier<T> action) {
+        if (quotaService == null) {
+            return action.get();
+        }
+        return quotaService.allocate(user, additionalBytes, action);
+    }
+
+    private <T> T allocateReplacingAndRun(UserPrincipal user, long newBytes, long replacedBytes,
+                                          Supplier<T> action) {
+        if (quotaService == null) {
+            return action.get();
+        }
+        return quotaService.allocateReplacing(user, newBytes, replacedBytes, action);
+    }
+
+    /**
      * 删除。因为秒传/去重会让多条逻辑记录共享同一份物理文件，
      * <b>不能看到一条记录就直接删磁盘文件</b>——得先数一下还有没有别人在用。
      */
@@ -1193,21 +1257,31 @@ public class FileStorageService {
             fileInfoMapper.deleteById(info.getId());
 
             if (info.getStatus() == FileInfo.STATUS_DONE || info.getStatus() == FileInfo.STATUS_TRASH) {
-                // 与秒传插入共用内容锁：删除行和数引用之间，不能再插进一条新引用，
-                // 否则会出现「数到 0 就删盘，但新行已经指向这个物理文件」。
-                locks.writeVoid(contentKey(info.getFileHash(), info.getFileSize()), () -> {
-                    int stillReferenced = fileInfoMapper.countByStoragePath(info.getStoragePath());
-                    if (stillReferenced == 0) {
-                        objectStorage.delete(info.getStoragePath());
-                        log.info("最后一个引用已删除，物理文件一并清理：{}", info.getStoragePath());
-                    } else {
-                        log.info("物理文件仍被 {} 条记录引用，予以保留：{}", stillReferenced, info.getStoragePath());
-                    }
-                });
+                releasePhysicalIfUnreferenced(info);
             } else {
                 // 先清元数据再删目录；若数据库失败，保留目录供孤儿清理任务重试。
                 fileChunkMapper.deleteByFileId(fileId);
                 chunkStorage.deleteChunks(fileId);
+            }
+        });
+    }
+
+    /**
+     * 逻辑记录删除之后调用：若已无记录引用该物理文件，则删除物理对象。
+     * 与秒传插入共用内容锁：删除行和数引用之间，不能再插进一条新引用，
+     * 否则会出现「数到 0 就删盘，但新行已经指向这个物理文件」。
+     */
+    private void releasePhysicalIfUnreferenced(FileInfo info) {
+        if (info.getStoragePath() == null) {
+            return;
+        }
+        locks.writeVoid(contentKey(info.getFileHash(), info.getFileSize()), () -> {
+            int stillReferenced = fileInfoMapper.countByStoragePath(info.getStoragePath());
+            if (stillReferenced == 0) {
+                objectStorage.delete(info.getStoragePath());
+                log.info("最后一个引用已删除，物理文件一并清理：{}", info.getStoragePath());
+            } else {
+                log.info("物理文件仍被 {} 条记录引用，予以保留：{}", stillReferenced, info.getStoragePath());
             }
         });
     }

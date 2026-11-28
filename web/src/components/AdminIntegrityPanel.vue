@@ -15,8 +15,14 @@ const result = ref(null)
 const selectedIds = ref([])
 const error = ref('')
 
+const isUnverifiable = (item) => item?.verdict === 'UNVERIFIABLE'
+
+const repairableItems = computed(() =>
+  (result.value?.items || []).filter((i) => !isUnverifiable(i)),
+)
+
 const allSelected = computed(
-  () => !!result.value?.items.length && selectedIds.value.length === result.value.items.length,
+  () => !!repairableItems.value.length && selectedIds.value.length === repairableItems.value.length,
 )
 
 async function runScan(deepScan = false) {
@@ -36,7 +42,7 @@ async function runScan(deepScan = false) {
 
 function toggleAll() {
   if (!result.value) return
-  selectedIds.value = allSelected.value ? [] : result.value.items.map((i) => i.fileId)
+  selectedIds.value = allSelected.value ? [] : repairableItems.value.map((i) => i.fileId)
 }
 
 async function repair() {
@@ -133,6 +139,11 @@ onMounted(() => runScan(false))
         <span>
           已检查 <strong>{{ result.checked }}</strong> 条，发现
           <strong :class="{ bad: result.brokenCount }">{{ result.brokenCount }}</strong> 条问题
+          <template v-if="result.unverifiableCount > 0">
+            ，另有
+            <strong>{{ result.unverifiableCount }}</strong>
+            条暂时无法验证（已保留数据，可重新扫描重试）
+          </template>
         </span>
         <span v-if="result.deep" class="badge">已复算 SHA-256</span>
         <span v-if="result.truncated" class="hint">还有更多记录未检查，可调大条数再扫</span>
@@ -152,6 +163,7 @@ onMounted(() => runScan(false))
                   type="checkbox"
                   aria-label="全选"
                   :checked="allSelected"
+                  :disabled="!repairableItems.length"
                   @change="toggleAll"
                 />
               </th>
@@ -168,6 +180,7 @@ onMounted(() => runScan(false))
                   v-model="selectedIds"
                   type="checkbox"
                   :value="item.fileId"
+                  :disabled="isUnverifiable(item)"
                   :aria-label="`选择 ${item.fileName}`"
                 />
               </td>
@@ -177,7 +190,10 @@ onMounted(() => runScan(false))
               </td>
               <td>{{ item.ownerId ?? '历史数据' }}</td>
               <td class="num">{{ formatBytes(item.fileSize) }}</td>
-              <td class="reason">{{ item.reason }}</td>
+              <td class="reason" :class="{ unverifiable: isUnverifiable(item) }">
+                <span v-if="isUnverifiable(item)" class="verdict-tag">暂时无法验证</span>
+                {{ item.reason }}
+              </td>
             </tr>
           </tbody>
         </table>
@@ -185,7 +201,7 @@ onMounted(() => runScan(false))
 
       <footer class="panel-foot">
         <span v-if="result" class="selected">
-          已选 {{ selectedIds.length }} / {{ result.items.length }} 条
+          已选 {{ selectedIds.length }} / {{ repairableItems.length }} 条可修复
         </span>
         <button
           class="btn btn-danger btn-sm"
@@ -407,6 +423,20 @@ onMounted(() => runScan(false))
 
 .reason {
   color: var(--bad);
+}
+
+.reason.unverifiable {
+  color: var(--muted);
+}
+
+.verdict-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .error {

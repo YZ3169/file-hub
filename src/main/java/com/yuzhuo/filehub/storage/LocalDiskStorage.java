@@ -9,14 +9,17 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
@@ -416,15 +419,24 @@ public class LocalDiskStorage implements StorageBackend {
 
     @Override
     public boolean exists(String relativePath) {
-        return Files.exists(resolveSafe(relativePath));
+        try {
+            Files.readAttributes(resolveSafe(relativePath), BasicFileAttributes.class);
+            return true;
+        } catch (NoSuchFileException e) {
+            return false;
+        } catch (IOException e) {
+            throw new UncheckedIOException("检查本地文件失败：" + relativePath, e);
+        }
     }
 
     @Override
     public long size(String relativePath) {
         try {
             return Files.size(resolveSafe(relativePath));
-        } catch (IOException e) {
+        } catch (NoSuchFileException e) {
             return -1;
+        } catch (IOException e) {
+            throw new UncheckedIOException("读取本地文件大小失败：" + relativePath, e);
         }
     }
 

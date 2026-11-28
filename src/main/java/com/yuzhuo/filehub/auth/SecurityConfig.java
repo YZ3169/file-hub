@@ -105,6 +105,8 @@ public class SecurityConfig {
                             "/actuator/info").permitAll()
                             .requestMatchers("/api/auth/login", "/api/auth/register").permitAll()
                             .requestMatchers("/api/file/config").permitAll()
+                            // 桌面外壳用独立随机凭据 + 回环校验签发本地目录授权，不走用户 Bearer 登录
+                            .requestMatchers(HttpMethod.POST, "/api/desktop/sync/shell-grant").permitAll()
                             // 匿名提取：只放行公共前缀；管理接口 /api/share/** 仍需登录
                             .requestMatchers(HttpMethod.GET, "/api/public/share/*").permitAll()
                             .requestMatchers(HttpMethod.POST, "/api/public/share/*/verify").permitAll()

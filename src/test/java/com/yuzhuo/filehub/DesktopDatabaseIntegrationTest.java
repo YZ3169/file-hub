@@ -15,9 +15,15 @@ import com.yuzhuo.filehub.dto.RegisterRequest;
 import com.yuzhuo.filehub.dto.ShareCreatedResponse;
 import com.yuzhuo.filehub.dto.ShareMetaResponse;
 import com.yuzhuo.filehub.dto.ShareVerifyResponse;
+import com.yuzhuo.filehub.entity.DownloadTicket;
 import com.yuzhuo.filehub.entity.FileInfo;
+import com.yuzhuo.filehub.entity.FileShare;
+import com.yuzhuo.filehub.mapper.DownloadTicketMapper;
 import com.yuzhuo.filehub.mapper.FileInfoMapper;
+import com.yuzhuo.filehub.mapper.FileShareMapper;
+import com.yuzhuo.filehub.mapper.UserAccountMapper;
 import com.yuzhuo.filehub.service.FileStorageService;
+import com.yuzhuo.filehub.service.QuotaService;
 import com.yuzhuo.filehub.service.ShareService;
 import com.yuzhuo.filehub.util.HashUtil;
 import org.junit.jupiter.api.AfterAll;
@@ -38,7 +44,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -103,6 +115,18 @@ class DesktopDatabaseIntegrationTest {
 
     @Autowired
     MockMvc mockMvc;
+
+    @Autowired
+    UserAccountMapper userAccountMapper;
+
+    @Autowired
+    QuotaService quotaService;
+
+    @Autowired
+    FileShareMapper fileShareMapper;
+
+    @Autowired
+    DownloadTicketMapper downloadTicketMapper;
 
     @Test
     @DisplayName("桌面 H2：注册/大小写登录/分片重传/合并/搜索/下载/清理")
@@ -282,6 +306,87 @@ class DesktopDatabaseIntegrationTest {
         assertEquals(4, reset.code().length());
         ShareVerifyResponse afterReset = shareService.verify(permanent.token(), reset.code());
         assertEquals(init.fileId(), afterReset.fileId());
+    }
+
+    @Test
+    @DisplayName("桌面 H2：同账号并发上传严格串行预留配额，且撤销后滞后写入的旧版本票据立即失效")
+    void concurrentQuotaAndVersionedTicketRevocation() throws Exception {
+        AuthResponse registered = authService.register(
+                new RegisterRequest("QuotaRace", "filehub-quota-pass"));
+        UserPrincipal user = new UserPrincipal(
+                registered.user().id(), registered.user().username(), registered.user().role());
+        userAccountMapper.updateQuota(user.id(), 15L, LocalDateTime.now());
+
+        byte[] contentA = "0123456789".getBytes(StandardCharsets.UTF_8);
+        byte[] contentB = "abcdefghij".getBytes(StandardCharsets.UTF_8);
+        String hashA = HashUtil.sha256Hex(contentA);
+        String hashB = HashUtil.sha256Hex(contentB);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            List<Future<Integer>> futures = new ArrayList<>();
+            futures.add(pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    service.init(new InitUploadRequest("a.bin", 10L, hashA), user);
+                    return 0;
+                } catch (BizException e) {
+                    return e.getCode();
+                }
+            }));
+            futures.add(pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    service.init(new InitUploadRequest("b.bin", 10L, hashB), user);
+                    return 0;
+                } catch (BizException e) {
+                    return e.getCode();
+                }
+            }));
+            ready.await();
+            start.countDown();
+
+            int okCount = 0;
+            int rejectedCount = 0;
+            for (Future<Integer> f : futures) {
+                int code = f.get();
+                if (code == 0) {
+                    okCount++;
+                } else if (code == 41001) {
+                    rejectedCount++;
+                }
+            }
+            assertEquals(1, okCount, "配额 15 字节下并发两个 10 字节上传只能放行 1 个");
+            assertEquals(1, rejectedCount, "第二个并发上传必须被 41001 拦截");
+            assertTrue(quotaService.usedBytesFor(user.id()) <= 15L);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // 验证「撤销发生在计数与票据写入之间」：直接落库一张旧版票据，resetCode/cancel 后即使未删行也不能兑换
+        userAccountMapper.updateQuota(user.id(), -1L, LocalDateTime.now());
+        InitUploadResponse uploaded = service.init(
+                new InitUploadRequest("ver.bin", 10L, hashA), user);
+        service.saveChunk(uploaded.fileId(), 0, new ByteArrayInputStream(contentA), hashA, user);
+        service.complete(uploaded.fileId(), user);
+
+        ShareCreatedResponse shareResp = shareService.create(
+                new CreateShareRequest(uploaded.fileId(), 7), user);
+        FileShare shareRow = fileShareMapper.findByToken(shareResp.token());
+        int v0 = DownloadTicketService.versionOf(shareRow.getAuthVersion());
+
+        // 模拟撤销先发生（推进 auth_version），并发线程稍后才把旧版本票据插入 DB
+        shareService.resetCode(shareResp.token(), user);
+        String lateRawTicket = ticketService.issue(
+                uploaded.fileId(), user, shareRow.getId(), v0).ticket();
+
+        assertNull(ticketService.resolve(uploaded.fileId(), lateRawTicket));
+        assertNull(ticketService.resolveForShare(uploaded.fileId(), shareRow.getId(), lateRawTicket));
+        assertTrue(downloadTicketMapper.deleteByShareId(shareRow.getId()) >= 0);
     }
 
     @Test

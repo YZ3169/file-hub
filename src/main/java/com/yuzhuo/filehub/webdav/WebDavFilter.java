@@ -43,20 +43,22 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 标准 WebDAV（RFC 4918）处理器，挂载在 {@code /dav/*}。
+ * 标准 WebDAV（RFC 4918 Class 1）处理器，挂载在 {@code /dav/*}。
  *
- * <p>以 Servlet Filter 形态拦截 {@code /dav} 与 {@code /dav/*}，既能接收所有扩展 HTTP 方法
- * （PROPFIND / MKCOL / MOVE / COPY / LOCK / UNLOCK）与任意大小流式 PUT，
- * 又不会额外引入第二个 Servlet 影响 Spring Security 单 DispatcherServlet 路由。</p>
+ * <p>以 Servlet Filter 形态拦截 {@code /dav} 与 {@code /dav/*}，既能接收扩展 HTTP 方法
+ * （PROPFIND / MKCOL / MOVE / COPY）与任意大小流式 PUT，
+ * 又不会额外引入第二个 Servlet 影响 Spring Security 单 DispatcherServlet 路由。
+ * 当前仅声明 Class 1 能力，不伪造未持久化校验的 Class 2 {@code LOCK / UNLOCK}。</p>
  */
 @Slf4j
 @RequiredArgsConstructor
 public class WebDavFilter extends HttpFilter {
 
+    private static final String ALLOW_METHODS =
+            "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY";
     private static final DateTimeFormatter RFC_1123 =
             DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC);
 
@@ -127,9 +129,10 @@ public class WebDavFilter extends HttpFilter {
                 case "DELETE" -> handleDelete(req, resp, user, relPath);
                 case "MOVE" -> handleMove(req, resp, user, relPath);
                 case "COPY" -> handleCopy(req, resp, user, relPath);
-                case "LOCK" -> handleLock(resp, relPath);
-                case "UNLOCK" -> resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
-                default -> resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+                default -> {
+                    resp.setHeader("Allow", ALLOW_METHODS);
+                    resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+                }
             }
         } catch (BizException e) {
             int status = switch (e.getCode()) {
@@ -143,9 +146,9 @@ public class WebDavFilter extends HttpFilter {
 
     private void handleOptions(HttpServletResponse resp) {
         resp.setStatus(HttpServletResponse.SC_OK);
-        resp.setHeader("DAV", "1, 2");
+        resp.setHeader("DAV", "1");
         resp.setHeader("MS-Author-Via", "DAV");
-        resp.setHeader("Allow", "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, LOCK, UNLOCK");
+        resp.setHeader("Allow", ALLOW_METHODS);
     }
 
     private void handlePropfind(HttpServletRequest req, HttpServletResponse resp,
@@ -442,25 +445,6 @@ public class WebDavFilter extends HttpFilter {
         auditService.record(user, "WEBDAV_COPY", "FILE", copy.fileId(),
                 srcPath + " -> " + dstPath, req.getRemoteAddr());
         resp.setStatus(existingDst != null ? HttpServletResponse.SC_NO_CONTENT : HttpServletResponse.SC_CREATED);
-    }
-
-    private void handleLock(HttpServletResponse resp, String relPath) throws IOException {
-        String token = "urn:uuid:" + UUID.randomUUID();
-        String xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-                + "<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>"
-                + "<D:locktype><D:write/></D:locktype>"
-                + "<D:lockscope><D:exclusive/></D:lockscope>"
-                + "<D:depth>0</D:depth>"
-                + "<D:timeout>Second-600</D:timeout>"
-                + "<D:locktoken><D:href>" + token + "</D:href></D:locktoken>"
-                + "<D:lockroot><D:href>" + escapeXml("/dav/" + relPath) + "</D:href></D:lockroot>"
-                + "</D:activelock></D:lockdiscovery></D:prop>\n";
-        byte[] bytes = xml.getBytes(StandardCharsets.UTF_8);
-        resp.setStatus(HttpServletResponse.SC_OK);
-        resp.setHeader("Lock-Token", "<" + token + ">");
-        resp.setContentType("application/xml; charset=utf-8");
-        resp.setContentLength(bytes.length);
-        resp.getOutputStream().write(bytes);
     }
 
     private UserPrincipal authenticate(HttpServletRequest req, HttpServletResponse resp, String ip)

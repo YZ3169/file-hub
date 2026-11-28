@@ -141,4 +141,37 @@ class WebDavFilterTest {
         assertEquals(429, fourthResp.getStatus());
         assertNotNull(fourthResp.getHeader("Retry-After"));
     }
+
+    @Test
+    @DisplayName("WebDAV 仅声明 Class 1 能力，不广告也不接受伪 LOCK/UNLOCK")
+    void optionsAndLockMethodsReflectClass1Only() throws Exception {
+        MockHttpServletRequest optionsReq = new MockHttpServletRequest("OPTIONS", "/dav/");
+        MockHttpServletResponse optionsResp = new MockHttpServletResponse();
+        filter.doFilter(optionsReq, optionsResp, mock(FilterChain.class));
+        assertEquals(200, optionsResp.getStatus());
+        assertEquals("1", optionsResp.getHeader("DAV"));
+        String allow = optionsResp.getHeader("Allow");
+        assertNotNull(allow);
+        org.junit.jupiter.api.Assertions.assertFalse(allow.contains("LOCK"));
+        org.junit.jupiter.api.Assertions.assertFalse(allow.contains("UNLOCK"));
+
+        UserAccount user = new UserAccount();
+        user.setId(7L);
+        user.setUsername("bob");
+        user.setRole(UserAccount.ROLE_USER);
+        user.setEnabled(1);
+        when(authService.verifyCredentials("bob", "ok")).thenReturn(user);
+        String goodBasic = "Basic " + Base64.getEncoder()
+                .encodeToString("bob:ok".getBytes(StandardCharsets.UTF_8));
+
+        for (String method : List.of("LOCK", "UNLOCK")) {
+            MockHttpServletRequest req = new MockHttpServletRequest(method, "/dav/doc.txt");
+            req.addHeader(HttpHeaders.AUTHORIZATION, goodBasic);
+            req.setRemoteAddr("10.0.0.10");
+            MockHttpServletResponse resp = new MockHttpServletResponse();
+            filter.doFilter(req, resp, mock(FilterChain.class));
+            assertEquals(405, resp.getStatus());
+            assertNotNull(resp.getHeader("Allow"));
+        }
+    }
 }

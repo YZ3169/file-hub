@@ -5,6 +5,7 @@ import {
   addDesktopSync,
   deleteDesktopSync,
   listDesktopSync,
+  pickDesktopSyncFolder,
   runDesktopSync,
   toggleDesktopSync,
 } from '../lib/api'
@@ -15,20 +16,51 @@ const emit = defineEmits(['close'])
 const rules = ref([])
 const loading = ref(true)
 const busy = ref(false)
+const picking = ref(false)
 const localDir = ref('')
+const grantId = ref('')
 const targetDir = ref('desktop-sync')
 const error = ref('')
 const hasNativePicker = Boolean(window.chrome?.webview?.postMessage)
 
 function onWebViewMessage(event) {
   const msg = event?.data
-  if (msg && msg.type === 'pickedFolder' && msg.path) {
-    localDir.value = msg.path
+  if (!msg || msg.type !== 'pickedFolder') return
+  if (msg.error) {
+    error.value = msg.error
+    return
+  }
+  const res = msg.result
+  if (res && res.code === 0 && res.data?.grantId) {
+    grantId.value = res.data.grantId
+    localDir.value = res.data.localDir || ''
+    error.value = ''
+    return
+  }
+  if (res?.msg) {
+    error.value = res.msg
   }
 }
 
-function pickLocalFolder() {
-  window.chrome?.webview?.postMessage({ type: 'pickFolder' })
+async function pickLocalFolder() {
+  if (busy.value || picking.value) return
+  if (hasNativePicker) {
+    window.chrome?.webview?.postMessage({ type: 'pickFolder' })
+    return
+  }
+  picking.value = true
+  error.value = ''
+  try {
+    const picked = await pickDesktopSyncFolder()
+    if (picked?.grantId) {
+      grantId.value = picked.grantId
+      localDir.value = picked.localDir || ''
+    }
+  } catch (e) {
+    error.value = e.message || '打开系统目录选择器失败'
+  } finally {
+    picking.value = false
+  }
 }
 
 async function load() {
@@ -44,11 +76,12 @@ async function load() {
 }
 
 async function addRule() {
-  if (!localDir.value.trim() || busy.value) return
+  if (!grantId.value || busy.value) return
   busy.value = true
   error.value = ''
   try {
-    await addDesktopSync(localDir.value.trim(), targetDir.value.trim())
+    await addDesktopSync(grantId.value, targetDir.value.trim())
+    grantId.value = ''
     localDir.value = ''
     toast('已添加本地目录同步规则并开始首次扫描', 'success')
     await load()
@@ -127,16 +160,17 @@ onBeforeUnmount(() => {
             <input
               v-model="localDir"
               type="text"
-              placeholder="本地目录绝对路径，如 D:\Documents\Notes"
-              required
+              readonly
+              placeholder="请点击右侧按钮，在系统窗口中选择并授权本地目录"
+              @click="pickLocalFolder"
             />
             <button
-              v-if="hasNativePicker"
               class="btn btn-ghost btn-sm"
               type="button"
+              :disabled="busy || picking"
               @click="pickLocalFolder"
             >
-              浏览…
+              {{ picking ? '选择中…' : '选择目录…' }}
             </button>
           </div>
           <div class="row">
@@ -145,7 +179,13 @@ onBeforeUnmount(() => {
               type="text"
               placeholder="远端目标目录（例如 backups/notes）"
             />
-            <button class="btn btn-primary btn-sm" type="submit" :disabled="busy">添加同步</button>
+            <button
+              class="btn btn-primary btn-sm"
+              type="submit"
+              :disabled="busy || picking || !grantId"
+            >
+              添加同步
+            </button>
           </div>
           <p v-if="error" class="error" role="alert">{{ error }}</p>
         </form>

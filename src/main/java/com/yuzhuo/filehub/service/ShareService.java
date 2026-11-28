@@ -149,6 +149,7 @@ public class ShareService {
         share.setDownloadCount(0L);
         share.setMaxDownloads(req.maxDownloads());
         share.setFailedAttempts(0);
+        share.setAuthVersion(0);
         share.setCreateTime(now);
         share.setUpdateTime(now);
         shareMapper.insert(share);
@@ -274,46 +275,15 @@ public class ShareService {
         if (isExpired(share, now)) {
             throw new BizException(42002, "分享已过期");
         }
-        if (isExhausted(share)) {
-            throw new BizException(42009, "该分享提取次数已达上限");
-        }
 
-        if (needCode(share)) {
-            verifyCodeWithLock(share, rawCode, now);
-        }
-
-        // 文件/所有者状态放在验码之后判断，避免只拿链接不用码就能探测文件是否失效
-        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
-        if (file == null) {
-            throw new BizException(42005, "文件已失效，无法下载");
-        }
-        UserAccount owner = userMapper.selectById(share.getOwnerId());
-        if (owner == null || !owner.isActive()) {
-            // 票据兑换时也会拒绝禁用用户，这里提前给出明确结果
-            throw new BizException(42005, "文件已失效，无法下载");
-        }
-
-        // 计数带过期与次数上限兜底：验码期间分享刚好过期/达到上限时不能签发票据
-        if (shareMapper.incrementDownload(share.getId(), LocalDateTime.now()) == 0) {
-            FileShare after = shareMapper.selectById(share.getId());
-            if (after == null || !isActive(after)) {
-                throw new BizException(42001, "分享不存在或已取消");
-            }
-            if (isExpired(after, LocalDateTime.now())) {
-                throw new BizException(42002, "分享已过期");
-            }
-            if (isExhausted(after)) {
-                throw new BizException(42009, "该分享提取次数已达上限");
-            }
-            throw new BizException(42001, "分享不存在或已取消");
-        }
-        DownloadTicketResponse ticket =
-                ticketService.issue(share.getFileId(), UserPrincipal.from(owner), share.getId());
+        AuthorizedShareAccess access = authorizeAndConsume(share, rawCode, now, "文件已失效，无法下载");
+        DownloadTicketResponse ticket = ticketService.issue(
+                share.getFileId(), UserPrincipal.from(access.owner()), share.getId(), access.authVersion());
         log.info("分享提取成功：share={} file={}", token, share.getFileId());
         return new ShareVerifyResponse(
-                file.getFileId(),
-                file.getFileName(),
-                file.getFileSize(),
+                access.file().getFileId(),
+                access.file().getFileName(),
+                access.file().getFileSize(),
                 ticket.url(),
                 ticket.expiresAt(),
                 share.getExpiresAt());
@@ -331,34 +301,87 @@ public class ShareService {
             throw new BizException(42002, "分享已过期");
         }
 
-        boolean verifiedByTicket = false;
+        FileVO copy;
+        FileInfo file = null;
         if (req != null && req.ticket() != null && !req.ticket().isBlank()) {
             UserPrincipal resolved = ticketService.resolveForShare(
                     share.getFileId(), share.getId(), req.ticket());
             if (resolved != null && resolved.id().equals(share.getOwnerId())) {
-                verifiedByTicket = true;
+                // 已凭有效分享票据验证过（且票据在 verify 时已计过一次提取次数），避免重复扣减
+                file = fileStorageService.findDoneForShare(share.getFileId());
+                if (file == null) {
+                    throw new BizException(42005, "文件已失效，无法转存");
+                }
+                copy = fileStorageService.createSharedCopy(file, receiver);
+            } else {
+                copy = saveWithFreshAuthorization(share, req.code(), now, receiver);
+                file = fileStorageService.findDoneForShare(share.getFileId());
             }
-        }
-        if (!verifiedByTicket) {
-            if (isExhausted(share)) {
-                throw new BizException(42009, "该分享提取次数已达上限");
-            }
-            if (needCode(share)) {
-                verifyCodeWithLock(share, req == null ? null : req.code(), now);
-            }
+        } else {
+            copy = saveWithFreshAuthorization(share, req == null ? null : req.code(), now, receiver);
         }
 
-        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
-        if (file == null) {
-            throw new BizException(42005, "文件已失效，无法转存");
-        }
-        FileVO copy = fileStorageService.createSharedCopy(file, receiver);
+        String fileName = file != null ? file.getFileName() : copy.fileName();
         if (auditService != null) {
             auditService.record(receiver, "SHARE_SAVE", "FILE", copy.fileId(),
-                    file.getFileName() + " <- share:" + token, null);
+                    fileName + " <- share:" + token, null);
         }
         log.info("分享转存成功：share={} receiver={} newFile={}", token, receiver.id(), copy.fileId());
         return copy;
+    }
+
+    private FileVO saveWithFreshAuthorization(FileShare share, String rawCode, LocalDateTime now,
+                                              UserPrincipal receiver) {
+        AuthorizedShareAccess access = authorizeAndConsume(share, rawCode, now, "文件已失效，无法转存");
+        try {
+            return fileStorageService.createSharedCopy(access.file(), receiver);
+        } catch (RuntimeException e) {
+            // 接收者配额不足等情况未完成转存，退还刚扣除的提取次数
+            shareMapper.refundDownload(share.getId(), LocalDateTime.now());
+            throw e;
+        }
+    }
+
+    private record AuthorizedShareAccess(FileInfo file, UserAccount owner, int authVersion) {
+    }
+
+    private AuthorizedShareAccess authorizeAndConsume(FileShare share, String rawCode,
+                                                      LocalDateTime now, String invalidMsg) {
+        if (isExhausted(share)) {
+            throw new BizException(42009, "该分享提取次数已达上限");
+        }
+        if (needCode(share)) {
+            verifyCodeWithLock(share, rawCode, now);
+        }
+
+        // 文件/所有者状态放在验码之后判断，避免只拿链接不用码就能探测文件是否失效
+        FileInfo file = fileStorageService.findDoneForShare(share.getFileId());
+        if (file == null) {
+            throw new BizException(42005, invalidMsg);
+        }
+        UserAccount owner = userMapper.selectById(share.getOwnerId());
+        if (owner == null || !owner.isActive()) {
+            // 票据兑换时也会拒绝禁用用户，这里提前给出明确结果
+            throw new BizException(42005, invalidMsg);
+        }
+
+        int authVersion = DownloadTicketService.versionOf(share.getAuthVersion());
+        LocalDateTime consumeAt = LocalDateTime.now();
+        // 计数带过期、取消、版本与次数上限兜底：验码期间分享刚好失效或重置时不能放行
+        if (shareMapper.incrementDownload(share.getId(), authVersion, consumeAt) == 0) {
+            FileShare after = shareMapper.selectById(share.getId());
+            if (after == null || !isActive(after)) {
+                throw new BizException(42001, "分享不存在或已取消");
+            }
+            if (isExpired(after, consumeAt)) {
+                throw new BizException(42002, "分享已过期");
+            }
+            if (isExhausted(after)) {
+                throw new BizException(42009, "该分享提取次数已达上限");
+            }
+            throw new BizException(42001, "分享不存在或已取消");
+        }
+        return new AuthorizedShareAccess(file, owner, authVersion);
     }
 
     private void verifyCodeWithLock(FileShare share, String rawCode, LocalDateTime now) {

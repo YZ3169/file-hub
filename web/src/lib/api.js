@@ -457,11 +457,17 @@ export const updateUserStatus = (userId, enabled) =>
 
 export const listDesktopSync = () => request('/api/desktop/sync')
 
-export const addDesktopSync = (localDir, targetDir) =>
+export const pickDesktopSyncFolder = () =>
+  request('/api/desktop/sync/pick', {
+    method: 'POST',
+    timeout: 300_000,
+  })
+
+export const addDesktopSync = (grantId, targetDir) =>
   request('/api/desktop/sync', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ localDir, targetDir }),
+    body: JSON.stringify({ grantId, targetDir }),
   })
 
 export const toggleDesktopSync = (id, enabled) =>

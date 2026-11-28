@@ -41,11 +41,13 @@ CREATE TABLE IF NOT EXISTS download_ticket
     file_id     VARCHAR(64) NOT NULL,
     user_id     BIGINT      NOT NULL,
     share_id    BIGINT      DEFAULT NULL,
+    share_version INT       DEFAULT NULL,
     expires_at  TIMESTAMP   NOT NULL,
     created_at  TIMESTAMP   NOT NULL,
     CONSTRAINT uk_ticket_hash UNIQUE (ticket_hash)
 );
 ALTER TABLE download_ticket ADD COLUMN IF NOT EXISTS share_id BIGINT DEFAULT NULL;
+ALTER TABLE download_ticket ADD COLUMN IF NOT EXISTS share_version INT DEFAULT NULL;
 CREATE INDEX IF NOT EXISTS idx_ticket_expires ON download_ticket (expires_at);
 CREATE INDEX IF NOT EXISTS idx_ticket_share ON download_ticket (share_id);
 
@@ -105,12 +107,14 @@ CREATE TABLE IF NOT EXISTS file_share
     max_downloads   BIGINT       DEFAULT NULL,
     failed_attempts INT          NOT NULL DEFAULT 0,
     locked_until    TIMESTAMP    DEFAULT NULL,
+    auth_version    INT          NOT NULL DEFAULT 0,
     create_time     TIMESTAMP    NOT NULL,
     update_time     TIMESTAMP    NOT NULL,
     CONSTRAINT uk_share_token UNIQUE (share_token)
 );
 ALTER TABLE file_share ADD COLUMN IF NOT EXISTS require_code TINYINT NOT NULL DEFAULT 1;
 ALTER TABLE file_share ADD COLUMN IF NOT EXISTS max_downloads BIGINT DEFAULT NULL;
+ALTER TABLE file_share ADD COLUMN IF NOT EXISTS auth_version INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_share_owner ON file_share (owner_id, id);
 CREATE INDEX IF NOT EXISTS idx_share_file ON file_share (file_id);
 CREATE INDEX IF NOT EXISTS idx_share_status_expires ON file_share (status, expires_at);

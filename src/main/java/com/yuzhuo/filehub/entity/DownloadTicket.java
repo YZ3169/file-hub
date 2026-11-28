@@ -28,6 +28,9 @@ public class DownloadTicket {
 
     private Long shareId;
 
+    /** 分享票据签发时的 {@code file_share.auth_version}；普通下载票据为 NULL */
+    private Integer shareVersion;
+
     private LocalDateTime expiresAt;
 
     private LocalDateTime createdAt;

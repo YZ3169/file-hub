@@ -2,8 +2,10 @@ package com.yuzhuo.filehub.auth;
 
 import com.yuzhuo.filehub.dto.DownloadTicketResponse;
 import com.yuzhuo.filehub.entity.DownloadTicket;
+import com.yuzhuo.filehub.entity.FileShare;
 import com.yuzhuo.filehub.entity.UserAccount;
 import com.yuzhuo.filehub.mapper.DownloadTicketMapper;
+import com.yuzhuo.filehub.mapper.FileShareMapper;
 import com.yuzhuo.filehub.mapper.UserAccountMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -36,13 +38,16 @@ class DownloadTicketServiceTest {
     @Mock
     UserAccountMapper userMapper;
 
+    @Mock
+    FileShareMapper shareMapper;
+
     DownloadTicketService service;
 
     @BeforeEach
     void setUp() {
         AuthProperties properties = new AuthProperties();
         properties.setTicketTtlMinutes(5);
-        service = new DownloadTicketService(ticketMapper, userMapper, properties);
+        service = new DownloadTicketService(ticketMapper, userMapper, properties, shareMapper);
     }
 
     @Test
@@ -131,8 +136,47 @@ class DownloadTicketServiceTest {
         assertNull(service.resolveForShare(FILE_ID, 10L, raw));
 
         regularTicket.setShareId(10L);
+        regularTicket.setShareVersion(0);
+        FileShare share = new FileShare();
+        share.setId(10L);
+        share.setFileId(FILE_ID);
+        share.setOwnerId(7L);
+        share.setStatus(FileShare.STATUS_ACTIVE);
+        share.setAuthVersion(0);
+        when(shareMapper.selectById(10L)).thenReturn(share);
         when(userMapper.selectById(7L)).thenReturn(account(7L, 1));
         assertEquals(7L, service.resolveForShare(FILE_ID, 10L, raw).id());
+    }
+
+    @Test
+    @DisplayName("授权版本失效：撤销或重置提取码后并发落库的旧版本票据在兑换时被拒绝")
+    void resolveRejectsStaleShareVersionEvenIfNotDeleted() {
+        String raw = "concurrent-tk".repeat(3);
+        DownloadTicket staleTicket = new DownloadTicket();
+        staleTicket.setFileId(FILE_ID);
+        staleTicket.setUserId(7L);
+        staleTicket.setShareId(10L);
+        staleTicket.setShareVersion(0);
+
+        when(ticketMapper.findValid(eq(OpaqueToken.hash(raw)), eq(FILE_ID), any(LocalDateTime.class)))
+                .thenReturn(staleTicket);
+
+        // 1. 提取码重置推进了 authVersion，旧版本票据未赶上 revoke 删除也立即失效
+        FileShare resetShare = new FileShare();
+        resetShare.setId(10L);
+        resetShare.setFileId(FILE_ID);
+        resetShare.setOwnerId(7L);
+        resetShare.setStatus(FileShare.STATUS_ACTIVE);
+        resetShare.setAuthVersion(1);
+        when(shareMapper.selectById(10L)).thenReturn(resetShare);
+
+        assertNull(service.resolve(FILE_ID, raw));
+        assertNull(service.resolveForShare(FILE_ID, 10L, raw));
+
+        // 2. 分享被取消后同样拒绝兑换
+        resetShare.setStatus(FileShare.STATUS_CANCELLED);
+        assertNull(service.resolve(FILE_ID, raw));
+        assertNull(service.resolveForShare(FILE_ID, 10L, raw));
     }
 
     private UserAccount account(long id, int enabled) {

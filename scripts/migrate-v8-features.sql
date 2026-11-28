@@ -141,3 +141,28 @@ SET @idx_ticket_share_sql = IF(@idx_ticket_share_exists = 0,
 PREPARE stmt FROM @idx_ticket_share_sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+-- 8. file_share.auth_version & download_ticket.share_version（防撤销与签发并发漏撤）
+SET @share_ver_exists = (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'file_share' AND column_name = 'auth_version'
+);
+SET @share_ver_sql = IF(@share_ver_exists = 0,
+    'ALTER TABLE `file_share` ADD COLUMN `auth_version` INT NOT NULL DEFAULT 0 COMMENT ''授权版本；取消或重置提取码时递增''',
+    'SELECT ''file_share.auth_version already exists'' AS message'
+);
+PREPARE stmt FROM @share_ver_sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @ticket_ver_exists = (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'download_ticket' AND column_name = 'share_version'
+);
+SET @ticket_ver_sql = IF(@ticket_ver_exists = 0,
+    'ALTER TABLE `download_ticket` ADD COLUMN `share_version` INT DEFAULT NULL COMMENT ''签发时的分享授权版本'' AFTER `share_id`',
+    'SELECT ''download_ticket.share_version already exists'' AS message'
+);
+PREPARE stmt FROM @ticket_ver_sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

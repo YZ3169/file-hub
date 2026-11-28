@@ -51,6 +51,12 @@ public class FileShare {
     /** 锁定截止时间；NULL 或已过期表示未锁定 */
     private LocalDateTime lockedUntil;
 
+    /**
+     * 授权版本。取消分享、重置提取码都会 +1；签发的下载票据记录签发时的版本，
+     * 兑换时版本不一致即失效——不依赖「撤销时把票据删干净」这一时序。
+     */
+    private Integer authVersion;
+
     private LocalDateTime createTime;
 
     private LocalDateTime updateTime;

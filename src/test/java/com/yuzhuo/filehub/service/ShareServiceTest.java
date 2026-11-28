@@ -6,8 +6,10 @@ import com.yuzhuo.filehub.common.BizException;
 import com.yuzhuo.filehub.config.ShareProperties;
 import com.yuzhuo.filehub.dto.CreateShareRequest;
 import com.yuzhuo.filehub.dto.DownloadTicketResponse;
+import com.yuzhuo.filehub.dto.FileVO;
 import com.yuzhuo.filehub.dto.ResetShareCodeResponse;
 import com.yuzhuo.filehub.dto.ShareCreatedResponse;
+import com.yuzhuo.filehub.dto.ShareSaveRequest;
 import com.yuzhuo.filehub.dto.ShareVerifyResponse;
 import com.yuzhuo.filehub.entity.FileInfo;
 import com.yuzhuo.filehub.entity.FileShare;
@@ -183,8 +185,8 @@ class ShareServiceTest {
         when(shareMapper.findByToken(TOKEN)).thenReturn(share);
         when(fileStorageService.findDoneForShare("f1")).thenReturn(file("f1", 1L, FileInfo.STATUS_DONE));
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
-        when(shareMapper.incrementDownload(eq(share.getId()), any())).thenReturn(1);
-        when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
+        when(shareMapper.incrementDownload(eq(share.getId()), eq(0), any())).thenReturn(1);
+        when(ticketService.issue(eq("f1"), any(), eq(10L), eq(0))).thenReturn(
                 new DownloadTicketResponse("t", LocalDateTime.now().plusMinutes(5),
                         "/api/file/f1/download?ticket=t"));
 
@@ -194,7 +196,7 @@ class ShareServiceTest {
         assertEquals("测试.bin", resp.fileName());
         assertEquals("/api/file/f1/download?ticket=t", resp.downloadUrl());
         verify(ticketService).issue(eq("f1"),
-                argThat(p -> p.id() == 1L && !p.isAdmin()), eq(10L));
+                argThat(p -> p.id() == 1L && !p.isAdmin()), eq(10L), eq(0));
     }
 
     @Test
@@ -215,8 +217,8 @@ class ShareServiceTest {
         saved.setId(10L);
         when(shareMapper.findByToken(created.token())).thenReturn(saved);
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
-        when(shareMapper.incrementDownload(eq(10L), any())).thenReturn(1);
-        when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
+        when(shareMapper.incrementDownload(eq(10L), eq(0), any())).thenReturn(1);
+        when(ticketService.issue(eq("f1"), any(), eq(10L), eq(0))).thenReturn(
                 new DownloadTicketResponse("t", LocalDateTime.now().plusMinutes(5),
                         "/api/file/f1/download?ticket=t"));
 
@@ -237,7 +239,7 @@ class ShareServiceTest {
         BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ZZZZ"));
         assertEquals(42003, e.getCode());
         assertTrue(e.getMessage().contains("9"));
-        verify(ticketService, never()).issue(anyString(), any(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any(), anyInt());
     }
 
     @Test
@@ -305,14 +307,14 @@ class ShareServiceTest {
         when(shareMapper.findByToken(TOKEN)).thenReturn(share);
         when(fileStorageService.findDoneForShare("f1")).thenReturn(file("f1", 1L, FileInfo.STATUS_DONE));
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
-        when(shareMapper.incrementDownload(eq(share.getId()), any())).thenReturn(0);
+        when(shareMapper.incrementDownload(eq(share.getId()), eq(0), any())).thenReturn(0);
         FileShare after = shareWithCode("ABCD");
         after.setExpiresAt(LocalDateTime.now().minusSeconds(1));
         when(shareMapper.selectById(share.getId())).thenReturn(after);
 
         BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
         assertEquals(42002, e.getCode());
-        verify(ticketService, never()).issue(anyString(), any(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any(), anyInt());
     }
 
     @Test
@@ -327,10 +329,10 @@ class ShareServiceTest {
                 .thenReturn(file("f1", 1L, FileInfo.STATUS_DONE));
         when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
         // 模拟数据库 WHERE expires_at > now，旧代码传请求开始时间会错误放行。
-        when(shareMapper.incrementDownload(eq(share.getId()), any())).thenAnswer(inv ->
-                expiresAt.isAfter(inv.getArgument(1, LocalDateTime.class)) ? 1 : 0);
+        when(shareMapper.incrementDownload(eq(share.getId()), eq(0), any())).thenAnswer(inv ->
+                expiresAt.isAfter(inv.getArgument(2, LocalDateTime.class)) ? 1 : 0);
         lenient().when(shareMapper.selectById(share.getId())).thenReturn(share);
-        lenient().when(ticketService.issue(eq("f1"), any(), eq(10L))).thenReturn(
+        lenient().when(ticketService.issue(eq("f1"), any(), eq(10L), eq(0))).thenReturn(
                 new DownloadTicketResponse("t", expiresAt.plusMinutes(5), "/download?ticket=t"));
 
         try (MockedStatic<LocalDateTime> clock = mockStatic(LocalDateTime.class, CALLS_REAL_METHODS)) {
@@ -339,7 +341,7 @@ class ShareServiceTest {
             BizException e = assertThrows(BizException.class, () -> service.verify(TOKEN, "ABCD"));
             assertEquals(42002, e.getCode());
         }
-        verify(ticketService, never()).issue(anyString(), any(), any());
+        verify(ticketService, never()).issue(anyString(), any(), any(), anyInt());
     }
 
     @Test
@@ -425,6 +427,66 @@ class ShareServiceTest {
         when(shareMapper.findByToken(TOKEN)).thenReturn(share);
         service.cancel(TOKEN, user);
         verify(ticketService).revokeByShareId(10L);
+    }
+
+    // ---------------- 转存授权与计数 ----------------
+
+    @Test
+    @DisplayName("直接转存：检查分享者启用状态，消费一次提取次数，失败时退还")
+    void directSaveChecksOwnerAndConsumesOrRefundsDownloadCount() {
+        UserPrincipal receiver = new UserPrincipal(2L, "bob", "USER");
+        FileShare share = shareWithCode("ABCD");
+        FileInfo file = file("f1", 1L, FileInfo.STATUS_DONE);
+
+        // 1. 分享者被禁用时拒绝转存且不扣次数
+        when(shareMapper.findByToken(TOKEN)).thenReturn(share);
+        when(fileStorageService.findDoneForShare("f1")).thenReturn(file);
+        UserAccount disabledOwner = activeUser(1L);
+        disabledOwner.setEnabled(0);
+        when(userMapper.selectById(1L)).thenReturn(disabledOwner);
+
+        BizException disabledEx = assertThrows(BizException.class,
+                () -> service.saveToMySpace(TOKEN, new ShareSaveRequest("ABCD", null), receiver));
+        assertEquals(42005, disabledEx.getCode());
+        verify(shareMapper, never()).incrementDownload(anyLong(), anyInt(), any());
+
+        // 2. 分享者启用且转存失败（如接收者配额不足）时先扣次数再退还
+        when(userMapper.selectById(1L)).thenReturn(activeUser(1L));
+        when(shareMapper.incrementDownload(eq(10L), eq(0), any())).thenReturn(1);
+        when(fileStorageService.createSharedCopy(file, receiver))
+                .thenThrow(new BizException(41001, "存储空间不足"));
+
+        BizException quotaEx = assertThrows(BizException.class,
+                () -> service.saveToMySpace(TOKEN, new ShareSaveRequest("ABCD", null), receiver));
+        assertEquals(41001, quotaEx.getCode());
+        verify(shareMapper).incrementDownload(eq(10L), eq(0), any());
+        verify(shareMapper).refundDownload(eq(10L), any());
+
+        // 3. 成功直接转存：扣减 1 次且不退还
+        FileVO copyVo = new FileVO("copy-1", "测试.bin", "", 1024L, "h", 1, LocalDateTime.now());
+        org.mockito.Mockito.doReturn(copyVo).when(fileStorageService).createSharedCopy(file, receiver);
+        FileVO result = service.saveToMySpace(TOKEN, new ShareSaveRequest("ABCD", null), receiver);
+        assertEquals("copy-1", result.fileId());
+    }
+
+    @Test
+    @DisplayName("凭已计数的有效票据转存：即使次数已满也不重复扣减")
+    void saveWithValidShareTicketDoesNotDoubleCount() {
+        UserPrincipal receiver = new UserPrincipal(2L, "bob", "USER");
+        FileShare share = shareWithCode("ABCD");
+        share.setMaxDownloads(1L);
+        share.setDownloadCount(1L);
+        FileInfo file = file("f1", 1L, FileInfo.STATUS_DONE);
+        FileVO copyVo = new FileVO("copy-2", "测试.bin", "", 1024L, "h", 1, LocalDateTime.now());
+
+        when(shareMapper.findByToken(TOKEN)).thenReturn(share);
+        when(ticketService.resolveForShare("f1", 10L, "valid-tk")).thenReturn(user);
+        when(fileStorageService.findDoneForShare("f1")).thenReturn(file);
+        when(fileStorageService.createSharedCopy(file, receiver)).thenReturn(copyVo);
+
+        FileVO result = service.saveToMySpace(TOKEN, new ShareSaveRequest(null, "valid-tk"), receiver);
+        assertEquals("copy-2", result.fileId());
+        verify(shareMapper, never()).incrementDownload(anyLong(), anyInt(), any());
     }
 
     // ---------------- helpers ----------------

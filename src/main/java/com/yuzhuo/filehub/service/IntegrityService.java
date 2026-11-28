@@ -48,35 +48,47 @@ public class IntegrityService {
                 .orderByAsc(FileInfo::getId)
                 .last("LIMIT " + safeLimit));
 
-        Map<String, String> verdicts = new HashMap<>();
-        List<IntegrityScanResponse.IntegrityItem> broken = new ArrayList<>();
+        Map<String, Inspection> verdicts = new HashMap<>();
+        List<IntegrityScanResponse.IntegrityItem> problems = new ArrayList<>();
+        int corrupt = 0;
+        int unverifiable = 0;
         for (FileInfo info : rows) {
             String path = info.getStoragePath();
-            String reason;
+            Inspection result;
             if (path == null) {
-                reason = "缺少 storage_path";
-            } else if (verdicts.containsKey(path)) {
-                // 同一物理文件已经查过：健康则这里必然为 null，损坏则沿用同样的原因
-                reason = verdicts.get(path);
+                result = Inspection.corrupt("缺少 storage_path");
             } else {
-                reason = inspect(info, path, deep);
-                verdicts.put(path, reason);
+                // 同一物理文件只查一次：健康则这里必然健康，损坏/无法验证则沿用同样的结论
+                result = verdicts.computeIfAbsent(path, p -> inspect(info, p, deep));
             }
-            if (reason != null) {
-                broken.add(new IntegrityScanResponse.IntegrityItem(
-                        info.getFileId(), info.getFileName(), info.getOwnerId(),
-                        info.getFileSize(), reason));
+            if (result.verdict() == Verdict.OK) {
+                continue;
             }
+            String label;
+            if (result.verdict() == Verdict.CORRUPT) {
+                corrupt++;
+                label = IntegrityScanResponse.VERDICT_CORRUPT;
+            } else {
+                unverifiable++;
+                label = IntegrityScanResponse.VERDICT_UNVERIFIABLE;
+            }
+            problems.add(new IntegrityScanResponse.IntegrityItem(
+                    info.getFileId(), info.getFileName(), info.getOwnerId(),
+                    info.getFileSize(), result.reason(), label));
         }
         long total = fileInfoMapper.countDone();
-        return new IntegrityScanResponse(deep, rows.size(), broken.size(),
-                total > rows.size(), broken);
+        return new IntegrityScanResponse(deep, rows.size(), corrupt,
+                total > rows.size(), problems, unverifiable);
     }
 
     /**
      * 修复 = 删除逻辑记录（物理文件仍遵守引用计数）。
      * 删除前必须重新检查一遍：管理员看到扫描结果到点「修复」之间，
      * 文件可能被恢复、记录可能被别的请求删掉。不能拿一份过期结果直接删。
+     *
+     * <p><b>只有复检「确认损坏」才删</b>。S3 超时、权限错误、读取中断等只说明「现在读不到」，
+     * 不说明数据坏了；这时删除逻辑记录（甚至最后一个引用对应的物理对象）会把一次短暂故障
+     * 变成永久数据丢失。无法验证的记录一律保留，返回失败原因让管理员稍后重试。</p>
      */
     public IntegrityRepairResponse repair(IntegrityRepairRequest req, UserPrincipal admin) {
         int repaired = 0;
@@ -92,16 +104,19 @@ public class IntegrityService {
                 } else if (info.getStatus() != FileInfo.STATUS_DONE) {
                     problem = "不是已完成文件，未处理";
                 } else {
-                    problem = info.getStoragePath() == null
-                            ? "缺少 storage_path"
+                    Inspection result = info.getStoragePath() == null
+                            ? Inspection.corrupt("缺少 storage_path")
                             : inspect(info, info.getStoragePath(), true);
-                    if (problem == null) {
-                        problem = "文件实际完好，未删除";
-                    } else {
-                        fileStorageService.delete(fileId, admin);
-                        items.add(new IntegrityRepairResponse.Item(fileId, true, null));
-                        repaired++;
-                        continue;
+                    switch (result.verdict()) {
+                        case OK -> problem = "文件实际完好，未删除";
+                        case UNVERIFIABLE -> problem = "暂时无法验证，已保留数据，请稍后重试："
+                                + result.reason();
+                        default -> {
+                            fileStorageService.delete(fileId, admin);
+                            items.add(new IntegrityRepairResponse.Item(fileId, true, null));
+                            repaired++;
+                            continue;
+                        }
                     }
                 }
             } catch (RuntimeException e) {
@@ -116,33 +131,63 @@ public class IntegrityService {
         return new IntegrityRepairResponse(repaired, failed, items);
     }
 
+    enum Verdict {
+        /** 完好 */
+        OK,
+        /** 确认损坏：存储明确回答了「不存在 / 大小不对 / 内容不对」 */
+        CORRUPT,
+        /** 暂时无法验证：读存储时出错，无法得出结论 */
+        UNVERIFIABLE
+    }
+
+    record Inspection(Verdict verdict, String reason) {
+        static final Inspection HEALTHY = new Inspection(Verdict.OK, null);
+
+        static Inspection corrupt(String reason) {
+            return new Inspection(Verdict.CORRUPT, reason);
+        }
+
+        static Inspection unverifiable(String reason) {
+            return new Inspection(Verdict.UNVERIFIABLE, reason);
+        }
+    }
+
     /**
-     * @return null 表示健康；否则是写给管理员看的具体原因
+     * 三态检查：只有存储后端给出了明确答复（对象不存在、长度不符、完整读完后哈希不符）
+     * 才判定为损坏；任何读取异常都只算「暂时无法验证」。
      */
-    private String inspect(FileInfo info, String path, boolean deep) {
+    private Inspection inspect(FileInfo info, String path, boolean deep) {
+        long actual;
         try {
             if (!storage.exists(path)) {
-                return "物理文件不存在";
+                return Inspection.corrupt("物理文件不存在");
             }
-            long expected = info.getFileSize() == null ? -1 : info.getFileSize();
-            long actual = storage.size(path);
-            if (actual != expected) {
-                return "大小不符：索引 " + expected + " 字节，磁盘 " + actual + " 字节";
-            }
-            if (deep) {
-                String actualHash;
-                try (InputStream in = storage.open(path)) {
-                    actualHash = HashUtil.sha256Hex(in);
-                } catch (IOException e) {
-                    return "读取失败：" + e.getMessage();
-                }
-                if (!actualHash.equalsIgnoreCase(info.getFileHash())) {
-                    return "内容哈希不一致";
-                }
-            }
-            return null;
+            actual = storage.size(path);
         } catch (RuntimeException e) {
-            return "检查失败：" + e.getMessage();
+            log.warn("完整性检查无法访问存储：{}", path, e);
+            return Inspection.unverifiable("访问存储失败：" + e.getMessage());
         }
+        if (actual < 0) {
+            // exists 与 size 之间对象消失（S3 HEAD 返回 404）
+            return Inspection.corrupt("物理文件不存在");
+        }
+        long expected = info.getFileSize() == null ? -1 : info.getFileSize();
+        if (actual != expected) {
+            return Inspection.corrupt("大小不符：索引 " + expected + " 字节，磁盘 " + actual + " 字节");
+        }
+        if (!deep) {
+            return Inspection.HEALTHY;
+        }
+        String actualHash;
+        try (InputStream in = storage.open(path)) {
+            actualHash = HashUtil.sha256Hex(in);
+        } catch (IOException | RuntimeException e) {
+            log.warn("完整性检查读取内容失败：{}", path, e);
+            return Inspection.unverifiable("读取失败：" + e.getMessage());
+        }
+        if (!actualHash.equalsIgnoreCase(info.getFileHash())) {
+            return Inspection.corrupt("内容哈希不一致");
+        }
+        return Inspection.HEALTHY;
     }
 }

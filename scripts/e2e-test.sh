@@ -384,18 +384,15 @@ check_eq "10005" "$(jget "$R" "['code']")" "B 不能删除 A 的文件"
 R="$(curl -s -H "Authorization: Bearer $TOKEN_B" "$BASE/api/file/$FILE_ID/download")"
 check_eq "10005" "$(jget "$R" "['code']")" "B 不能用 Bearer 下载 A 的文件"
 
-# 秒传仍可全局复用物理文件，但必须给 B 发一条属于 B 的新记录，不能把 A 的 fileId 给 B
+# 跨账号不允许仅凭 SHA-256 + 大小免传秒传别人的私有文件：必须走正常上传，合并后才能物理去重
 R="$(post_json_as "$TOKEN_B" /api/file/init \
-    "{\"fileName\":\"B-秒传.bin\",\"fileSize\":$BIG_SIZE,\"fileHash\":\"$BIG_HASH\"}")"
+    "{\"fileName\":\"B-不秒传.bin\",\"fileSize\":$BIG_SIZE,\"fileHash\":\"$BIG_HASH\"}")"
 B_ID="$(jget "$R" "['data']['fileId']")"
-check_eq "True" "$(jget "$R" "['data']['instant']")" "B 对同样内容可以秒传"
-if [ -n "$B_ID" ] && [ "$B_ID" != "$FILE_ID" ]; then
-    ok "B 拿到的是自己的 fileId（没有复用 A 的记录）"
-else
-    bad "B 拿到了 A 的 fileId" "B_ID=$B_ID"
-fi
-B_HASH="$(curl -s -H "Authorization: Bearer $TOKEN_B" "$BASE/api/file/$B_ID/download" | sha256sum | cut -d' ' -f1)"
-check_eq "$BIG_HASH" "$B_HASH" "B 可以下载自己的秒传文件，内容正确"
+check_eq "False" "$(jget "$R" "['data']['instant']")" "B 仅凭摘要不能免传秒传 A 的私有文件"
+R="$(api_as "$TOKEN_B" DELETE "/api/file/$B_ID")"
+check_eq "0" "$(jget "$R" "['code']")" "清理 B 的未完成上传任务"
+R="$(api_as "$TOKEN_B" GET "/api/file/list?size=100")"
+check_eq "0" "$(jget "$R" "['data']['total']")" "B 清理后列表仍为空"
 
 if [ -n "${FILE_HUB_ADMIN_PASSWORD:-}" ]; then
     R="$(post_json_as "" /api/auth/login \
@@ -407,12 +404,6 @@ if [ -n "${FILE_HUB_ADMIN_PASSWORD:-}" ]; then
 else
     echo "  ↳ 未设置 FILE_HUB_ADMIN_PASSWORD，跳过管理员可见性用例"
 fi
-
-# 删掉 B 的引用，避免影响后面的物理文件引用计数用例
-R="$(api_as "$TOKEN_B" DELETE "/api/file/$B_ID")"
-check_eq "0" "$(jget "$R" "['code']")" "B 删除自己的秒传记录"
-R="$(api_as "$TOKEN_B" GET "/api/file/list?size=100")"
-check_eq "0" "$(jget "$R" "['data']['total']")" "B 删除后列表重新为空"
 
 # ---------------------------------------------------------------- 2.6 下载票据
 

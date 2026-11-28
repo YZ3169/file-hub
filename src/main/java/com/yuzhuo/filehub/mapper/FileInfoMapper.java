@@ -93,6 +93,10 @@ public interface FileInfoMapper extends BaseMapper<FileInfo> {
     @Update("DELETE FROM file_info WHERE id = #{id} AND status = 2 AND deleted_at < #{cutoff}")
     int deleteExpiredTrashById(@Param("id") Long id, @Param("cutoff") LocalDateTime cutoff);
 
+    /** 清空回收站：只删仍在回收站中的行；期间被恢复（status 已变）的返回 0、原样保留 */
+    @Update("DELETE FROM file_info WHERE id = #{id} AND status = 2")
+    int deleteTrashById(@Param("id") Long id);
+
     @Update("UPDATE file_info SET status = 2, deleted_at = #{now}, update_time = #{now} "
             + "WHERE id = #{id} AND status = 1")
     int moveToTrash(@Param("id") Long id, @Param("now") LocalDateTime now);
